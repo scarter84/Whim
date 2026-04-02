@@ -1,0 +1,220 @@
+import asyncio
+import json
+import threading
+import queue
+import uuid
+import tkinter as tk
+from tkinter import ttk
+import requests
+import os
+import sys
+
+# ------------------ CONFIG ------------------
+DEFAULT_WS_URL = "ws://127.0.0.1:18789"
+DEFAULT_TOKEN = ""
+DEFAULT_XTTS_URL = "http://127.0.0.1:8020/tts"
+
+incoming = queue.Queue()
+outgoing = queue.Queue()
+
+def jdump(obj):
+    return json.dumps(obj, indent=2, ensure_ascii=False)
+
+def new_id(prefix="req"):
+    return f"{prefix}-{uuid.uuid4().hex[:10]}"
+
+class GatewayClient:
+    async def connect(self, ws_url, token, scopes):
+        async with websockets.connect(ws_url) as ws:
+            challenge = json.loads(await ws.recv())
+            incoming.put(("event", challenge))
+            nonce = challenge["payload"]["nonce"]
+            ts = challenge["payload"]["ts"]
+            connect_req = {
+                "type": "req", "id": new_id("connect"), "method": "connect",
+                "params": {
+                    "minProtocol": 3, "maxProtocol": 3,
+                    "client": {"id": "tkui", "version": "0.2.0", "platform": "linux", "mode": "operator"},
+                    "role": "operator", "scopes": scopes,
+                    "auth": {"token": token} if token else {},
+                    "locale": "en-US",
+                    "userAgent": "openclaw-tkui/0.2.0",
+                    "device": {"id": "tkui-local", "publicKey": "", "signature": "", "signedAt": ts, "nonce": nonce},
+                }
+            }
+            await ws.send(json.dumps(connect_req))
+            while True:
+                try:
+                    while True:
+                        msg = outgoing.get_nowait()
+                        await ws.send(json.dumps(msg))
+                except queue.Empty: pass
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=0.1)
+                    packet = json.loads(raw)
+                    incoming.put(("ws", packet))
+                except asyncio.TimeoutError: pass
+
+def start_ws_thread(ws_url, token, scopes):
+    threading.Thread(target=lambda: asyncio.run(GatewayClient().connect(ws_url, token, scopes)), daemon=True).start()
+
+class ModernApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Enoch — DewClaw Operator")
+        self.geometry("1280x800")
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        azure_tcl = os.path.join(script_dir, "azure.tcl")
+        if os.path.exists(azure_tcl):
+            self.tk.call("source", azure_tcl)
+            self.tk.call("set_theme", "dark")
+            print("✅ Azure dark theme loaded!")
+        else:
+            print("⚠️ Azure theme not found - using default")
+
+        self.build_ui()
+        self.after(50, self.pump_incoming)
+
+    def build_ui(self):
+        header = ttk.Frame(self)
+        header.pack(fill="x", padx=12, pady=12)
+        ttk.Label(header, text="🦾 Enoch — DewClaw", font=("Segoe UI", 18, "bold")).pack(side="left", padx=10)
+
+        conn = ttk.Frame(header)
+        conn.pack(side="right", padx=10)
+        ttk.Label(conn, text="WS URL:").pack(side="left")
+        self.ws_url_var = tk.StringVar(value=DEFAULT_WS_URL)
+        ttk.Entry(conn, textvariable=self.ws_url_var, width=35).pack(side="left", padx=5)
+        ttk.Label(conn, text="Token:").pack(side="left", padx=(10,0))
+        self.token_var = tk.StringVar(value=DEFAULT_TOKEN)
+        ttk.Entry(conn, textvariable=self.token_var, width=30, show="•").pack(side="left", padx=5)
+        self.approvals_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(conn, text="Approvals scope", variable=self.approvals_var).pack(side="left", padx=10)
+        ttk.Button(conn, text="🔗 Connect", command=self.on_connect).pack(side="left", padx=8)
+
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=12, pady=8)
+
+        tab_data = [
+            ("chat", "💬 Chat"), ("sessions", "📋 Sessions"), ("presence", "👥 Presence"),
+            ("xtts", "🎤 XTTS Voice"), ("signal", "📡 Signal"), ("discord", "🔊 Discord"), ("events", "📜 Events/Debug")
+        ]
+
+        self.tabs = {}
+        for key, label in tab_data:
+            frame = ttk.Frame(self.nb)
+            self.nb.add(frame, text=label)
+            self.tabs[key] = frame
+
+        self.build_chat()
+        self.build_sessions()
+        self.build_presence()
+        self.build_xtts()
+        self.build_signal()
+        self.build_discord()
+        self.build_events()
+
+    def build_chat(self):
+        self.chat_log = tk.Text(self.tabs["chat"], wrap="word", bg="#1e1e1e", fg="#d4d4d4", font=("Segoe UI", 10))
+        self.chat_log.pack(fill="both", expand=True, padx=12, pady=12)
+        bottom = ttk.Frame(self.tabs["chat"])
+        bottom.pack(fill="x", padx=12, pady=8)
+        self.chat_entry = ttk.Entry(bottom, font=("Segoe UI", 11))
+        self.chat_entry.pack(side="left", fill="x", expand=True, padx=(0,8))
+        ttk.Button(bottom, text="Send", command=self.chat_send).pack(side="left")
+        ttk.Button(bottom, text="Abort", command=self.chat_abort).pack(side="left", padx=8)
+
+    def chat_send(self):
+        text = self.chat_entry.get().strip()
+        if not text: return
+        self.chat_entry.delete(0, "end")
+        req = {"type": "req", "id": new_id("chatSend"), "method": "chat.send", "params": {"text": text, "idempotencyKey": uuid.uuid4().hex}}
+        outgoing.put(req)
+        self.append_chat(f"> {text}\n", "#00ddff")
+
+    def chat_abort(self):
+        outgoing.put({"type": "req", "id": new_id("chatAbort"), "method": "chat.abort", "params": {}})
+        self.append_chat("[🛑 Abort requested]\n", "#ff5555")
+
+    def append_chat(self, text, color="#d4d4d4"):
+        self.chat_log.config(state="normal")
+        self.chat_log.tag_config(color, foreground=color)
+        self.chat_log.insert("end", text, color)
+        self.chat_log.see("end")
+        self.chat_log.config(state="disabled")
+
+    def build_sessions(self):
+        ttk.Button(self.tabs["sessions"], text="🔄 Refresh Sessions", command=self.sessions_list).pack(anchor="w", padx=12, pady=8)
+        self.sessions_box = tk.Text(self.tabs["sessions"], bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 10))
+        self.sessions_box.pack(fill="both", expand=True, padx=12, pady=8)
+
+    def sessions_list(self):
+        outgoing.put({"type": "req", "id": new_id("sessionsList"), "method": "sessions.list", "params": {}})
+
+    def build_presence(self):
+        ttk.Button(self.tabs["presence"], text="🔄 Refresh Presence", command=self.presence_list).pack(anchor="w", padx=12, pady=8)
+        self.presence_box = tk.Text(self.tabs["presence"], bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 10))
+        self.presence_box.pack(fill="both", expand=True, padx=12, pady=8)
+
+    def presence_list(self):
+        outgoing.put({"type": "req", "id": new_id("presence"), "method": "system-presence", "params": {}})
+
+    def build_xtts(self):
+        f = self.tabs["xtts"]
+        ttk.Label(f, text="XTTS URL:").pack(anchor="w", padx=12)
+        self.xtts_url_var = tk.StringVar(value=DEFAULT_XTTS_URL)
+        ttk.Entry(f, textvariable=self.xtts_url_var).pack(fill="x", padx=12, pady=4)
+        ttk.Label(f, text="Text:").pack(anchor="w", padx=12)
+        self.xtts_text_var = tk.StringVar(value="Hello from DewClaw")
+        ttk.Entry(f, textvariable=self.xtts_text_var).pack(fill="x", padx=12, pady=4)
+        ttk.Button(f, text="🔊 Test XTTS", command=self.xtts_test).pack(anchor="w", padx=12, pady=8)
+        self.xtts_out = tk.Text(f, bg="#1e1e1e", fg="#d4d4d4", height=12)
+        self.xtts_out.pack(fill="both", expand=True, padx=12, pady=8)
+
+    def xtts_test(self):
+        url = self.xtts_url_var.get().strip()
+        text = self.xtts_text_var.get().strip()
+        try:
+            r = requests.post(url, json={"text": text}, timeout=15)
+            self.xtts_out.insert("end", f"✅ Status: {r.status_code} | {len(r.content)} bytes\n")
+        except Exception as e:
+            self.xtts_out.insert("end", f"❌ Error: {e}\n")
+
+    def build_signal(self):
+        ttk.Label(self.tabs["signal"], text="Signal integration coming soon…", font=("Segoe UI", 12)).pack(expand=True)
+
+    def build_discord(self):
+        ttk.Label(self.tabs["discord"], text="Discord bridge coming soon…", font=("Segoe UI", 12)).pack(expand=True)
+
+    def build_events(self):
+        self.events_box = tk.Text(self.tabs["events"], bg="#1e1e1e", fg="#a0a0a0", font=("Consolas", 9))
+        self.events_box.pack(fill="both", expand=True, padx=12, pady=12)
+
+    def on_connect(self):
+        scopes = ["operator.read", "operator.write"]
+        if self.approvals_var.get():
+            scopes.append("operator.approvals")
+        start_ws_thread(self.ws_url_var.get().strip(), self.token_var.get().strip(), scopes)
+        self.log_events("🔌 Connecting...")
+
+    def log_events(self, msg):
+        self.events_box.config(state="normal")
+        self.events_box.insert("end", msg + "\n")
+        self.events_box.see("end")
+        self.events_box.config(state="disabled")
+
+    def pump_incoming(self):
+        try:
+            while True:
+                kind, payload = incoming.get_nowait()
+                if kind in ("event", "ws"):
+                    self.log_events(jdump(payload))
+                elif kind == "log":
+                    self.log_events(str(payload))
+        except queue.Empty:
+            pass
+        self.after(50, self.pump_incoming)
+
+if __name__ == "__main__":
+    ModernApp().mainloop()

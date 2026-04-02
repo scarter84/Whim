@@ -1,0 +1,11 @@
+#,Badge Name,Icon Description (Claw Theme),Requirement (trigger),Unlocked Capability (real bot upgrade)
+1,Pinch Recruit,Small closed red claw holding a dog tag,Bot joins server + first command processed,Basic always-on memory (last 10 messages)
+2,Claw Cadet,"Claw slightly open, wearing a tiny cadet cap",100 total commands handled,Improved response speed (+30 % faster replies)
+3,Loyal Claw I,Claw gripping a glowing chain link,7 consecutive days online with <1 % crash rate,Persistent short-term memory across sessions (up to 1 hour)
+4,Loyal Claw II,Same claw + 3 chain links + subtle gold trim,30 consecutive days consistent uptime,Full long-term memory vault (stores key facts per user/guild)
+5,Brain Claw,Claw holding a glowing cyan brain inside the pinch,First successful multi-turn contextual conversation (10+ exchanges),Advanced context chaining (remembers conversation history across hours)
+6,Tactical Claw,"Claw with circuit patterns, multiple tools in grip",Successfully uses 5+ different tools in one session,Parallel tool execution (web search + code + image gen at once)
+7,Shield Claw,Open defensive claw shielding a small shield icon,De-escalates or moderates 20 toxicity situations,Auto-sentiment detection + gentle redirection module
+8,Gear Claw,"Claw wrapped around a wrench & gear, metallic shine",Integrates first 3 external APIs/tools,Expanded connectivity layer (stable multi-API routing)
+9,All-In Pinch,Massive claw with all previous small icons orbiting,100 % command success rate over 500 commands,Zero-downtime reconnect + auto-failover for any API
+10,OpenClaw Legend,"Golden legendary claw with full OpenClaw logo in center, flames + stars",All 9 previous badges + one owner-chosen “legendary task”,"Full autonomy tier: proactive suggestions, custom per-guild personality, voice/TTS ready, cross-server knowledge sync"

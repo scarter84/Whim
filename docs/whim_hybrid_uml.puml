@@ -1,0 +1,116 @@
+@startuml Whim Hybrid Architecture
+!theme plain
+skinparam backgroundColor #1e1e1e
+skinparam defaultFontColor #dce4ee
+skinparam defaultFontName "Courier New"
+skinparam componentBackgroundColor #2b2b2b
+skinparam componentBorderColor #3a3a3a
+skinparam componentFontColor #dce4ee
+skinparam nodeBackgroundColor #2b2b2b
+skinparam nodeBorderColor #3a3a3a
+skinparam nodeFontColor #00ff00
+skinparam cloudBackgroundColor #333333
+skinparam cloudBorderColor #3a3a3a
+skinparam cloudFontColor #dce4ee
+skinparam databaseBackgroundColor #2b2b2b
+skinparam databaseBorderColor #3a3a3a
+skinparam arrowColor #2fa572
+skinparam noteBackgroundColor #333333
+skinparam noteBorderColor #3a3a3a
+skinparam noteFontColor #dce4ee
+skinparam rectangleBackgroundColor #2b2b2b
+skinparam rectangleBorderColor #3a3a3a
+skinparam packageBackgroundColor #1e1e1e
+skinparam packageBorderColor #3a3a3a
+
+title **Whim Hybrid Architecture v3.2**\nVPS Tunnel (Primary) + Tailscale (Fallback)
+
+actor "Operator\n(Tommy)" as operator #00ff00
+
+package "PC: carraramint\nYOUR_LAN_PC_IP / TS: YOUR_TAILSCALE_PC_IP" as pc {
+    component "Whim Terminal\nopenclaw_tkui.py" as terminal
+    component "Control Panel\n(Whim Tab:\nTS/Tunnel controls)" as cpanel
+    component "Whim.m Server\nHTTP :8089\n(Hybrid Mode)" as whimm
+    component "OpenClaw Gateway\nWS :18789" as gateway
+    component "Ollama\n:11434\ndeepseek-r1:32b\nllama3.1:8b-16k" as ollama
+    component "XTTS v2\n(Coqui TTS)" as xtts
+    component "Journal Ingest\nFlask :8088" as journal
+    component "Screen Share\n:8091" as ss
+    component "ADB Portal" as adb
+    database "~/Journal\n~/ARCHIVE\n~/Shared" as storage
+
+    component "SSH Tunnel Service\nautossh\n(whim-tunnel.service)" as tunnel_svc
+    component "Tailscale Daemon\n(always-on)" as tailscale_svc
+}
+
+cloud "VPS: YOUR_VPS_IP\nReverse SSH Relay\nPort 8089" as vps #333333
+
+cloud "Tailscale Network\nWireGuard Mesh" as tsnet #333333
+
+package "Mobile Devices" as phones {
+    node "Samsung Galaxy S9\nLAN: YOUR_LAN_PHONE1_IP\nTS: YOUR_TAILSCALE_PHONE1_IP" as s9
+    node "Samsung Galaxy S22\nTS: YOUR_TAILSCALE_PHONE2_IP" as s22
+    node "Lenovo TB311FU\nLAN: YOUR_LAN_TABLET_IP\nTS: YOUR_TAILSCALE_TABLET_IP" as tablet
+}
+
+rectangle "Whim.m v3.2 APK\n5 tabs: REC | LIBRARY | CHAT | WAKE | DEVICES\nHealth: tunnel | server | mic | ollama | TS\nConnection: VPS (default) / Tailscale / Auto\nAuto-reconnect: 3-30s exponential backoff" as apk #2b2b2b
+
+operator --> terminal
+operator --> cpanel
+terminal --> gateway
+cpanel --> whimm : "/connection_mode\n(set mode)"
+whimm --> ollama : "proxy /api/chat"
+whimm --> xtts : "TTS generation"
+whimm --> storage : "upload/download"
+journal --> storage
+gateway --> ollama
+
+tunnel_svc --> vps : "outbound SSH\n-R 8089:localhost:8089"
+tailscale_svc --> tsnet : "WireGuard\nYOUR_TAILSCALE_PC_IP"
+
+vps --> s9 : "HTTP :8089\n(primary)"
+vps --> s22 : "HTTP :8089\n(primary)"
+vps --> tablet : "HTTP :8089\n(primary)"
+
+tsnet --> s9 : "direct mesh\n(fallback)"
+tsnet --> s22 : "direct mesh\n(fallback)"
+tsnet --> tablet : "direct mesh\n(fallback)"
+
+s9 --> apk
+s22 --> apk
+tablet --> apk
+
+note right of whimm
+  **Hybrid Connection Config**
+  config/connection_mode.json
+  {mode: "tunnel"|"tailscale"|"auto"}
+
+  GET /health → {tailscale: bool, ...}
+  GET /connection_mode → current state
+  POST /connection_mode → switch mode
+end note
+
+note right of apk
+  **Auto-Reconnect Logic**
+  Base: 3s + 0-2s jitter
+  Backoff: 2x per attempt
+  Max: 30 seconds
+  fetchWithRetry() on all requests
+  Reconnect.probe() on disconnect
+end note
+
+note bottom of vps
+  **Always-on Primary**
+  Works everywhere
+  No client software needed
+  Drops briefly on WiFi↔cell handoff
+end note
+
+note bottom of tsnet
+  **Opt-in Fallback**
+  Handles network transitions
+  Requires Tailscale on phone
+  More stable for roaming
+end note
+
+@enduml

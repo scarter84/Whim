@@ -1,0 +1,95 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║              WHIM HYBRID ARCHITECTURE v3.2                         ║
+║         VPS Tunnel (Primary) + Tailscale (Fallback)                ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+                         OPERATOR (Tommy)
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PC: carraramint  (LAN: YOUR_LAN_PC_IP / TS: YOUR_TAILSCALE_PC_IP)         │
+│                                                                     │
+│  ┌─────────────────┐   ┌──────────────────┐   ┌─────────────────┐  │
+│  │ Whim Terminal    │   │ Control Panel    │   │ OpenClaw GW     │  │
+│  │ openclaw_tkui.py │   │ (Whim Tab:       │   │ WS :18789       │  │
+│  │ • 16 Module Tabs │   │  TS/Tunnel ctrl  │   │ deepseek-r1:32b │  │
+│  │ • Voice Engine   │   │  Live status)    │   │ llama3.1:8b-16k │  │
+│  │ • Tray Icon      │   │                  │   │                 │  │
+│  └────────┬─────────┘   └────────┬─────────┘   └────────┬────────┘  │
+│           │                      │                       │           │
+│  ┌────────┴──────────────────────────────────────────────┘           │
+│  │  VOICE ENGINE TAB                                                │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────────┐         │
+│  │  │ Whim-Scope   │ │ Col A: Gain  │ │ Col B: "Hey Whim"│         │
+│  │  │ Live FFT     │ │ HPF/AGC/PEQ  │ │ Sensitivity/VAD  │         │
+│  │  │ 300-8kHz     │ │ Spectral Sub │ │ Trigger Delay    │         │
+│  │  │ Ghost Bar    │ │ Noise Floor  │ │ Intelli Band     │         │
+│  │  │ 1-3kHz Band  │ │              │ │                  │         │
+│  │  └──────────────┘ └──────────────┘ └──────────────────┘         │
+│  └──────────────────────────────────────────────────────────────┘   │
+│           │                      │                       │           │
+│           ▼                      ▼                       ▼           │
+│  ┌─────────────────────────────────────────────────────────────┐     │
+│  │           Whim.m Server (HTTP :8089) — HYBRID MODE          │     │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐  │     │
+│  │  │ /health      │ │ /connection  │ │ /api/chat          │  │     │
+│  │  │ tailscale:   │ │ _mode        │ │ → Ollama :11434    │  │     │
+│  │  │ bool         │ │ GET/POST     │ │   (streaming)      │  │     │
+│  │  │ conn_mode:   │ │ tunnel/ts/   │ ├────────────────────┤  │     │
+│  │  │ str          │ │ auto         │ │ /api/tts           │  │     │
+│  │  └──────────────┘ └──────────────┘ │ → XTTS v2 (Coqui)  │  │     │
+│  │                                     └────────────────────┘  │     │
+│  └─────────────────────────────────────────────────────────────┘     │
+│           │                                     │                    │
+│  ┌────────┴──────────┐              ┌───────────┴──────────┐        │
+│  │ SSH Tunnel Service │              │ Tailscale Daemon     │        │
+│  │ autossh            │              │ (always-on)          │        │
+│  │ whim-tunnel.service│              │ YOUR_TAILSCALE_PC_IP         │        │
+│  │ -R 8089:localhost  │              │ WireGuard mesh       │        │
+│  └────────┬───────────┘              └───────────┬──────────┘        │
+│           │                                      │                   │
+│  Storage: ~/Journal  ~/ARCHIVE  ~/Shared  ~/voices                  │
+└───────────┼──────────────────────────────────────┼───────────────────┘
+            │                                      │
+            │  outbound SSH                        │  WireGuard
+            │                                      │
+            ▼                                      ▼
+┌───────────────────────┐          ┌────────────────────────────┐
+│  VPS: YOUR_VPS_IP │          │  Tailscale Network         │
+│  Reverse SSH Relay    │          │  ┌──────────────────────┐  │
+│  Port 8089            │          │  │ PC:     YOUR_TAILSCALE_PC_IP │  │
+│  SSH key auth only    │          │  │ S9:     YOUR_TAILSCALE_PHONE1_IP  │  │
+│  ★ PRIMARY (default)  │          │  │ S22:    YOUR_TAILSCALE_PHONE2_IP  │  │
+│                       │          │  │ Tablet: YOUR_TS_TAB.  │  │
+│  Works everywhere     │          │  │         124          │  │
+│  No client needed     │          │  └──────────────────────┘  │
+└──────┬───────┬────────┘          │  ★ FALLBACK (opt-in)      │
+       │       │                   │  Handles WiFi↔cell        │
+       │       │                   │  handoffs natively         │
+       │       │                   └──────┬────────┬────────────┘
+       │       │                          │        │
+       ▼       ▼            ▼             ▼        ▼
+  ┌──────────┐ ┌──────────┐ ┌──────────────────────────┐
+  │ Galaxy   │ │ Galaxy   │ │ Lenovo TB311FU            │
+  │ S9       │ │ S22      │ │ (Tablet)                  │
+  │ LAN:.198 │ │ TS:      │ │ LAN:.112                  │
+  │ TS:.x.x │ │ .x.x │ │ TS:.x.x               │
+  └────┬─────┘ └────┬─────┘ └─────────────┬────────────┘
+       │             │                     │
+       └─────────────┼─────────────────────┘
+                     ▼
+  ╔═══════════════════════════════════════════════════════╗
+  ║  Whim.m v3.2 APK / PWA                               ║
+  ║                                                       ║
+  ║  Tabs: REC │ LIBRARY │ CHAT │ WAKE │ DEVICES          ║
+  ║                                                       ║
+  ║  Health Bar: tunnel │ server │ mic │ ollama │ TS       ║
+  ║  Connection: [VPS ▼] dropdown (VPS/Tailscale/Auto)    ║
+  ║                                                       ║
+  ║  Auto-Reconnect:                                      ║
+  ║    Base: 3s + 0-2s jitter                             ║
+  ║    Backoff: ×2 per attempt → max 30s                  ║
+  ║    fetchWithRetry() on all HTTP requests              ║
+  ║    Visible "Connection lost" banner on disconnect     ║
+  ╚═══════════════════════════════════════════════════════╝

@@ -1,0 +1,200 @@
+@startuml Whim Infrastructure & Network
+!theme plain
+skinparam backgroundColor #1e1e1e
+skinparam defaultFontColor #dce4ee
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam arrowColor #888888
+skinparam noteBackgroundColor #333333
+skinparam noteBorderColor #3a3a3a
+skinparam noteFontColor #dce4ee
+skinparam packageBackgroundColor #2b2b2b
+skinparam packageBorderColor #3a3a3a
+skinparam componentBackgroundColor #333333
+skinparam componentBorderColor #14507a
+skinparam actorBorderColor #14507a
+skinparam databaseBackgroundColor #333333
+skinparam databaseBorderColor #14507a
+skinparam cloudBackgroundColor #2b2b2b
+skinparam cloudBorderColor #3a3a3a
+skinparam rectangleBackgroundColor #333333
+skinparam rectangleBorderColor #3a3a3a
+
+title **Whim** — System Architecture & Network Topology
+
+' ============================================================
+'  ACTORS
+' ============================================================
+actor "Tommy\n(Operator)" as User
+
+' ============================================================
+'  PC — "Carrara" (carraramint) — YOUR_LAN_PC_IP
+' ============================================================
+package "PC: carraramint\nYOUR_LAN_PC_IP" as PC {
+
+    package "Whim Terminal (Tkinter)" as WhimDesktop {
+        component "openclaw_tkui.py\n(Main UI)" as TKUI
+        component "Apps Panel\nopenclaw_tkui_apps.py" as TKApps
+        component "OpenClaw Panel\nopenclaw_tkui_openclaw.py" as TKOclaw
+    }
+
+    package "OpenClaw AI Gateway" as OpenClaw {
+        component "WebSocket Server\nws://127.0.0.1:18789" as OCWS
+        component "Ollama\nhttp://127.0.0.1:11434\ndeepseek-r1:32b" as Ollama
+    }
+
+    package "Whim.m Server v3.1" as WhimMServer {
+        component "whim_m_v2.1.py\nHTTP :8089\n(5-Tab Mobile App)" as WhimM
+        component "/api/tts\nXTTS Voice Endpoint" as TTSEndpoint
+        component "/library\nFile Sharing" as LibEndpoint
+        component "/audio\nPlayback Stream" as AudioEndpoint
+    }
+
+    package "Services" as Services {
+        component "Journal Ingest\n(Flask :8088)" as Ingest
+        component "Screenshot Server\n:8091" as SSServer
+        component "XTTS v2\n(Coqui TTS)" as XTTS
+    }
+
+    package "Messaging" as Messaging {
+        component "Signal Desktop\n+ signal-cli" as Signal
+        component "Discord Client\n+ Bot Token" as Discord
+    }
+
+    package "SSH Tunnel" as TunnelService {
+        component "autossh\nwhim-tunnel.service\nssh -R 8089:localhost:8089" as AutoSSH
+    }
+
+    component "ADB Portal\nwhim_adb_portal.py" as ADBPortal
+
+    database "~/Journal" as JournalDir
+    database "~/ARCHIVE" as ArchiveDir
+    database "~/TableReads" as TableReads
+    database "~/Shared" as SharedDir
+    database "~/voices" as VoicesDir
+    database "~/xtts_tts_cache" as TTSCache
+}
+
+' ============================================================
+'  VPS — REVERSE SSH TUNNEL
+' ============================================================
+cloud "VPS: YOUR_VPS_IP\nReverse SSH Tunnel\nPort 8089 forwarded" as VPS {
+}
+
+' ============================================================
+'  MOBILE DEVICES
+' ============================================================
+package "Samsung Galaxy S9\nYOUR_LAN_PHONE1_IP" as S9 {
+    component "Whim.m v3.1 APK\n(WebView + Wake Word)" as S9Rec
+    component "Wake Word Service\n\"Hey Whim\"" as S9Wake
+    component "SpeechRecognizer\n(Voice Input)" as S9Speech
+}
+
+package "Samsung Galaxy S22" as S22 {
+    component "Whim.m v3.1 APK\n(WebView + Wake Word)" as S22Rec
+    component "Wake Word Service\n\"Hey Whim\"" as S22Wake
+}
+
+package "Lenovo TB311FU (Tablet)\nYOUR_LAN_TABLET_IP" as Tablet {
+    component "Whim.m v3.1 APK\n(Tablet build + Wake Word)" as TabRec
+    component "Wake Word Service\n\"Hey Whim\"" as TabWake
+}
+
+' ============================================================
+'  RELATIONSHIPS — Desktop internal
+' ============================================================
+User --> TKUI : operates
+TKUI --> TKApps : tabs
+TKUI --> TKOclaw : tabs
+TKUI --> OCWS : JSON-RPC\nws://127.0.0.1:18789
+OCWS --> Ollama : LLM inference
+TKUI --> WhimM : launches
+TKUI --> Ingest : launches
+TKUI --> SSServer : launches
+TKUI --> XTTS : TTS calls\n(miniconda3/xtts)
+TKUI --> VoicesDir : AVR LAB saves\nactive_voice.json
+TKUI --> Signal : controls
+TKUI --> Discord : controls
+Ingest --> JournalDir : saves files
+TTSEndpoint --> XTTS : voice cloning\nrequest
+TTSEndpoint --> VoicesDir : reads active\nvoice ref
+TTSEndpoint --> TTSCache : writes WAV
+LibEndpoint --> SharedDir : read/write\nshared files
+AudioEndpoint --> JournalDir : streams audio
+WhimM --> Ollama : /api/chat proxy
+ADBPortal --> S9 : adb push/install
+ADBPortal --> Tablet : adb push/install
+
+' ============================================================
+'  RELATIONSHIPS — Reverse SSH Tunnel
+' ============================================================
+AutoSSH --> VPS : outbound SSH\n(ssh -R 8089:localhost:8089)
+VPS --> WhimM : forwards :8089\nthrough tunnel
+
+' ============================================================
+'  RELATIONSHIPS — Mobile to PC via VPS tunnel
+' ============================================================
+S9Rec --> VPS : HTTP\nhttp://YOUR_VPS_IP:8089
+S22Rec --> VPS : HTTP\nhttp://YOUR_VPS_IP:8089
+TabRec --> VPS : HTTP\nhttp://YOUR_VPS_IP:8089
+
+' ============================================================
+'  RELATIONSHIPS — Mobile wake word & voice
+' ============================================================
+S9Wake --> S9Speech : triggers on\n"Hey Whim"
+S9Speech --> S9Rec : sends transcript\nto chat
+S22Wake --> S22Rec : triggers on\n"Hey Whim"
+TabWake --> TabRec : triggers on\n"Hey Whim"
+
+' ============================================================
+'  RELATIONSHIPS — Recorder & library data flow
+' ============================================================
+S9Rec ..> WhimM : "audio uploads\n+ library files"
+S22Rec ..> WhimM : "audio uploads\n+ library files"
+TabRec ..> WhimM : "audio uploads\n+ library files"
+WhimM --> JournalDir : saves recordings
+S9Rec ..> TTSEndpoint : "TTS requests\n(cloned voice)"
+S9Rec ..> AudioEndpoint : "playback\nstreaming"
+S9Rec ..> LibEndpoint : "file sharing"
+
+' ============================================================
+'  NOTES
+' ============================================================
+note right of TunnelService
+  systemd service: whim-tunnel.service
+  autossh -M 0 -N -R 8089:localhost:8089
+  root@YOUR_VPS_IP
+  ServerAliveInterval 30
+  Auto-reconnects on failure
+end note
+
+note bottom of OpenClaw
+  openclaw.json config
+  Gateway auth: token
+  Channels: Signal, Discord
+  Models: deepseek-r1:32b
+end note
+
+note bottom of WhimMServer
+  v3.1 — 5-Tab mobile app
+  Tabs: REC, LIBRARY, CHAT (Whim.ai), WAKE, DEVICES
+  Wake word: "Hey Whim"
+  AI chat: Whim.ai (llama + OpenClaw)
+  Voice chat via XTTS cloned voice
+  Device-to-device chat
+  File library: ~/Shared
+  Audio playback: ~/Journal streams
+  Health bar: tunnel / server / mic / ollama dots
+end note
+
+note right of VPS
+  Vultr VPS (YOUR_VPS_IP)
+  SSH key auth only (no passwords)
+  ufw: ports 22 + 8089
+  GatewayPorts yes
+  Replaces Tailscale mesh VPN
+end note
+
+@enduml

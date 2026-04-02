@@ -1726,6 +1726,7 @@ class ModernApp(tk.Tk):
             ("library", "LIBRARY"),
             ("archive", "ARCHIVE"),
             ("persona", "PERSONA"),
+            ("geof", "GEOF"),
             ("sync", "SYNC"),
             ("settings", "SETTINGS"),
         ]
@@ -1786,6 +1787,7 @@ class ModernApp(tk.Tk):
         self.build_archive()
         self.build_ss()
         self.build_persona()
+        self.build_geof()
         self.build_sync()
         self.build_settings()
 
@@ -11907,6 +11909,489 @@ camFlipBtn.addEventListener('click',()=>{
             self._ac_stop()
         win.destroy()
         self._ac_win = None
+
+    # ==================== GEOF TAB ====================
+
+    _GEOF_FENCE_PATH = os.path.join(
+        os.path.expanduser("~"), ".openclaw", "fence_config.json")
+    _GEOF_PINS_PATH = os.path.join(
+        os.path.expanduser("~"), ".openclaw", "geof_pins.json")
+    _GEOF_HEARTBEAT_INTERVAL = 20 * 60  # 20 minutes in seconds
+
+    def build_geof(self):
+        f = self.tabs["geof"]
+        self._geof_collars = {}
+        self._geof_fence_vertices = []
+        self._geof_pins = []
+        self._geof_map_drag = None
+        self._geof_map_center = (36.35, -93.2)  # Ozarks default
+        self._geof_map_zoom = 12
+        self._geof_heartbeat_active = False
+        self._geof_lora_bridge_proc = None
+
+        # -- Header --
+        header = tk.Frame(f, bg=TH["bg"])
+        header.pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(header, text="GEOF \u2014 GEOFENCE TRACKER",
+                 font=TH["font_title"], fg=TH["green"], bg=TH["bg"]).pack(side="left")
+        self._geof_status_lbl = tk.Label(
+            header, text="OFFLINE", font=(_FONTS["mono"], 9),
+            fg=TH["red"], bg=TH["bg"])
+        self._geof_status_lbl.pack(side="right", padx=8)
+
+        # -- Toolbar --
+        toolbar = tk.Frame(f, bg=TH["bg"])
+        toolbar.pack(fill="x", padx=12, pady=(6, 4))
+
+        self._btn(toolbar, "Sync Pins", self._geof_sync_pins).pack(side="left", padx=2)
+        self._btn(toolbar, "Load Fence", self._geof_load_fence).pack(side="left", padx=2)
+        self._btn(toolbar, "Save Fence", self._geof_save_fence).pack(side="left", padx=2)
+        self._btn(toolbar, "Clear Pins", self._geof_clear_pins).pack(side="left", padx=2)
+
+        tk.Frame(toolbar, bg=TH["border_hi"], width=1).pack(
+            side="left", fill="y", padx=8, pady=2)
+
+        self._btn(toolbar, "Start Bridge", self._geof_start_bridge).pack(side="left", padx=2)
+        self._btn(toolbar, "Stop Bridge", self._geof_stop_bridge).pack(side="left", padx=2)
+
+        tk.Frame(toolbar, bg=TH["border_hi"], width=1).pack(
+            side="left", fill="y", padx=8, pady=2)
+
+        self._btn(toolbar, "Start Heartbeat", self._geof_start_heartbeat).pack(
+            side="left", padx=2)
+        self._btn(toolbar, "Stop Heartbeat", self._geof_stop_heartbeat).pack(
+            side="left", padx=2)
+
+        self._geof_hb_lbl = tk.Label(
+            toolbar, text="", font=TH["font_xs"], fg=TH["fg_dim"], bg=TH["bg"])
+        self._geof_hb_lbl.pack(side="right", padx=8)
+
+        # -- Main paned area: map (left) + collar table (right) --
+        pane = ttk.PanedWindow(f, orient="horizontal")
+        pane.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        # === LEFT: Map canvas ===
+        map_frame = tk.Frame(pane, bg=TH["input"])
+        self._geof_canvas = tk.Canvas(
+            map_frame, bg=TH["input"], highlightthickness=0, cursor="crosshair")
+        self._geof_canvas.pack(fill="both", expand=True)
+        self._geof_canvas.bind("<Button-1>", self._geof_canvas_click)
+        self._geof_canvas.bind("<B1-Motion>", self._geof_canvas_drag)
+        self._geof_canvas.bind("<ButtonRelease-1>", self._geof_canvas_release)
+        self._geof_canvas.bind("<MouseWheel>", self._geof_canvas_scroll)
+        self._geof_canvas.bind("<Button-4>", lambda e: self._geof_zoom(1))
+        self._geof_canvas.bind("<Button-5>", lambda e: self._geof_zoom(-1))
+        self._geof_canvas.bind("<Configure>", lambda e: self._geof_redraw())
+
+        map_info = tk.Frame(map_frame, bg=TH["card"])
+        map_info.pack(fill="x")
+        self._geof_coord_lbl = tk.Label(
+            map_info, text="Center: 36.35, -93.20  Zoom: 12",
+            font=TH["font_xs"], fg=TH["fg2"], bg=TH["card"])
+        self._geof_coord_lbl.pack(side="left", padx=8, pady=2)
+        self._geof_pin_count_lbl = tk.Label(
+            map_info, text="Pins: 0  Collars: 0",
+            font=TH["font_xs"], fg=TH["fg2"], bg=TH["card"])
+        self._geof_pin_count_lbl.pack(side="right", padx=8, pady=2)
+
+        pane.add(map_frame, weight=3)
+
+        # === RIGHT: Collar status table + detail ===
+        right = tk.Frame(pane, bg=TH["bg"])
+
+        tk.Label(right, text="COLLAR STATUS", font=TH["font_title"],
+                 fg=TH["green"], bg=TH["bg"]).pack(anchor="w", padx=8, pady=(4, 2))
+
+        cols = ("id", "name", "status", "battery", "lat", "lon", "last_seen")
+        col_w = {"id": 40, "name": 80, "status": 65, "battery": 50,
+                 "lat": 80, "lon": 80, "last_seen": 110}
+        tree_frame = tk.Frame(right, bg=TH["bg"])
+        tree_frame.pack(fill="both", expand=True, padx=4)
+
+        self._geof_tree = ttk.Treeview(
+            tree_frame, columns=cols, show="headings", selectmode="browse")
+        for c in cols:
+            self._geof_tree.heading(c, text=c.upper())
+            self._geof_tree.column(c, width=col_w.get(c, 70), anchor="center",
+                                    minwidth=30)
+        tree_sb = self._scrollbar(tree_frame, command=self._geof_tree.yview)
+        self._geof_tree.configure(yscrollcommand=tree_sb.set)
+        self._geof_tree.pack(side="left", fill="both", expand=True)
+        tree_sb.pack(side="right", fill="y")
+
+        self._geof_tree.tag_configure("OK", foreground=TH["fg"])
+        self._geof_tree.tag_configure("STALE", foreground="#e0a030")
+        self._geof_tree.tag_configure("OFFLINE", foreground=TH["red"])
+        self._geof_tree.tag_configure("ALERT", foreground="#ff3333")
+
+        # -- Detail panel --
+        detail = tk.Frame(right, bg=TH["card"], bd=0, highlightthickness=1,
+                          highlightbackground=TH["border"])
+        detail.pack(fill="x", padx=4, pady=(4, 4))
+
+        tk.Label(detail, text="DETAIL", font=TH["font_xs"],
+                 fg=TH["fg_dim"], bg=TH["card"]).pack(anchor="w", padx=8, pady=(4, 0))
+        self._geof_detail_text = self._text_widget(detail, height=6, wrap="word")
+        self._geof_detail_text.pack(fill="x", padx=8, pady=4)
+        self._geof_detail_text.insert("1.0", "Select a collar to view details.")
+        self._geof_detail_text.config(state="disabled")
+
+        self._geof_tree.bind("<<TreeviewSelect>>", self._geof_on_collar_select)
+
+        # -- Log panel --
+        log_frame = tk.Frame(right, bg=TH["card"], bd=0, highlightthickness=1,
+                             highlightbackground=TH["border"])
+        log_frame.pack(fill="x", padx=4, pady=(0, 4))
+        tk.Label(log_frame, text="LORA LOG", font=TH["font_xs"],
+                 fg=TH["fg_dim"], bg=TH["card"]).pack(anchor="w", padx=8, pady=(4, 0))
+        self._geof_log = self._text_widget(log_frame, height=5, wrap="word")
+        self._geof_log.pack(fill="x", padx=8, pady=4)
+        self._geof_log.config(state="disabled")
+
+        pane.add(right, weight=2)
+
+        self._geof_load_fence()
+        self._geof_load_pins()
+
+    # -- GeoF map helpers --
+
+    def _geof_latlon_to_xy(self, lat, lon):
+        cw = self._geof_canvas.winfo_width() or 800
+        ch = self._geof_canvas.winfo_height() or 600
+        clat, clon = self._geof_map_center
+        scale = 2 ** self._geof_map_zoom * 2.0
+        x = cw / 2 + (lon - clon) * scale
+        y = ch / 2 - (lat - clat) * scale
+        return x, y
+
+    def _geof_xy_to_latlon(self, x, y):
+        cw = self._geof_canvas.winfo_width() or 800
+        ch = self._geof_canvas.winfo_height() or 600
+        clat, clon = self._geof_map_center
+        scale = 2 ** self._geof_map_zoom * 2.0
+        lon = clon + (x - cw / 2) / scale
+        lat = clat - (y - ch / 2) / scale
+        return lat, lon
+
+    def _geof_redraw(self):
+        c = self._geof_canvas
+        c.delete("all")
+        cw = c.winfo_width() or 800
+        ch = c.winfo_height() or 600
+
+        # Grid lines
+        for gx in range(0, cw, 80):
+            c.create_line(gx, 0, gx, ch, fill="#1a1a18", dash=(2, 4))
+        for gy in range(0, ch, 80):
+            c.create_line(0, gy, cw, gy, fill="#1a1a18", dash=(2, 4))
+
+        # Fence polygon
+        if len(self._geof_fence_vertices) >= 3:
+            pts = []
+            for v in self._geof_fence_vertices:
+                pts.extend(self._geof_latlon_to_xy(v[0], v[1]))
+            c.create_polygon(pts, outline="#e8793a", fill="", width=2,
+                             dash=(6, 3), tags="fence")
+
+        # Pins
+        for i, pin in enumerate(self._geof_pins):
+            x, y = self._geof_latlon_to_xy(pin["lat"], pin["lon"])
+            c.create_oval(x - 5, y - 5, x + 5, y + 5,
+                          fill="#e8793a", outline="#f5e6d3", tags="pin")
+            c.create_text(x, y - 10, text=str(i + 1),
+                          fill="#f5e6d3", font=(_FONTS["mono"], 7))
+
+        # Collars
+        for cid, collar in self._geof_collars.items():
+            x, y = self._geof_latlon_to_xy(collar["lat"], collar["lon"])
+            color_map = {"OK": "#2fa572", "STALE": "#e0a030",
+                         "OFFLINE": TH["red"], "ALERT": "#ff3333"}
+            color = color_map.get(collar.get("status", "OFFLINE"), TH["red"])
+            c.create_rectangle(x - 6, y - 6, x + 6, y + 6,
+                               fill=color, outline="#f5e6d3", tags="collar")
+            c.create_text(x, y - 12, text=collar.get("name", cid),
+                          fill="#f5e6d3", font=(_FONTS["mono"], 7))
+
+        # Update info labels
+        clat, clon = self._geof_map_center
+        self._geof_coord_lbl.config(
+            text=f"Center: {clat:.4f}, {clon:.4f}  Zoom: {self._geof_map_zoom}")
+        self._geof_pin_count_lbl.config(
+            text=f"Pins: {len(self._geof_pins)}  Collars: {len(self._geof_collars)}")
+
+    def _geof_canvas_click(self, event):
+        self._geof_map_drag = (event.x, event.y)
+
+    def _geof_canvas_drag(self, event):
+        if self._geof_map_drag is None:
+            return
+        dx = event.x - self._geof_map_drag[0]
+        dy = event.y - self._geof_map_drag[1]
+        self._geof_map_drag = (event.x, event.y)
+        scale = 2 ** self._geof_map_zoom * 2.0
+        clat, clon = self._geof_map_center
+        clon -= dx / scale
+        clat += dy / scale
+        self._geof_map_center = (clat, clon)
+        self._geof_redraw()
+
+    def _geof_canvas_release(self, event):
+        self._geof_map_drag = None
+
+    def _geof_canvas_scroll(self, event):
+        if event.delta > 0:
+            self._geof_zoom(1)
+        else:
+            self._geof_zoom(-1)
+
+    def _geof_zoom(self, direction):
+        self._geof_map_zoom = max(1, min(20, self._geof_map_zoom + direction))
+        self._geof_redraw()
+
+    # -- GeoF pin / fence management --
+
+    def _geof_sync_pins(self):
+        path = filedialog.askopenfilename(
+            title="Select GPS Pins JSON",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r") as fp:
+                data = json.load(fp)
+            if isinstance(data, list):
+                pins = data
+            elif isinstance(data, dict) and "pins" in data:
+                pins = data["pins"]
+            else:
+                pins = []
+            self._geof_pins = []
+            for p in pins:
+                lat = p.get("lat") or p.get("latitude")
+                lon = p.get("lon") or p.get("lng") or p.get("longitude")
+                if lat is not None and lon is not None:
+                    self._geof_pins.append({
+                        "lat": float(lat), "lon": float(lon),
+                        "label": p.get("label", "")})
+            # Auto-build fence from pins
+            if len(self._geof_pins) >= 3:
+                self._geof_fence_vertices = [
+                    (p["lat"], p["lon"]) for p in self._geof_pins]
+            self._geof_save_pins()
+            self._geof_redraw()
+            self._geof_log_msg(
+                f"Synced {len(self._geof_pins)} pins from {os.path.basename(path)}")
+        except Exception as ex:
+            self._geof_log_msg(f"Pin sync error: {ex}")
+
+    def _geof_load_fence(self):
+        if os.path.isfile(self._GEOF_FENCE_PATH):
+            try:
+                with open(self._GEOF_FENCE_PATH, "r") as fp:
+                    data = json.load(fp)
+                verts = data.get("vertices", [])
+                self._geof_fence_vertices = [(v[0], v[1]) for v in verts]
+                self._geof_collars = {}
+                for collar in data.get("collars", []):
+                    cid = collar.get("id", str(len(self._geof_collars)))
+                    self._geof_collars[cid] = collar
+                self._geof_redraw()
+                self._geof_refresh_collar_tree()
+                self._geof_log_msg("Fence config loaded.")
+            except Exception as ex:
+                self._geof_log_msg(f"Load fence error: {ex}")
+
+    def _geof_save_fence(self):
+        os.makedirs(os.path.dirname(self._GEOF_FENCE_PATH), exist_ok=True)
+        data = {
+            "vertices": list(self._geof_fence_vertices),
+            "collars": list(self._geof_collars.values()),
+        }
+        try:
+            with open(self._GEOF_FENCE_PATH, "w") as fp:
+                json.dump(data, fp, indent=2)
+            self._geof_log_msg("Fence config saved.")
+        except Exception as ex:
+            self._geof_log_msg(f"Save fence error: {ex}")
+
+    def _geof_clear_pins(self):
+        self._geof_pins = []
+        self._geof_fence_vertices = []
+        self._geof_save_pins()
+        self._geof_redraw()
+        self._geof_log_msg("Pins and fence cleared.")
+
+    def _geof_load_pins(self):
+        if os.path.isfile(self._GEOF_PINS_PATH):
+            try:
+                with open(self._GEOF_PINS_PATH, "r") as fp:
+                    self._geof_pins = json.load(fp)
+                self._geof_redraw()
+            except Exception:
+                pass
+
+    def _geof_save_pins(self):
+        os.makedirs(os.path.dirname(self._GEOF_PINS_PATH), exist_ok=True)
+        try:
+            with open(self._GEOF_PINS_PATH, "w") as fp:
+                json.dump(self._geof_pins, fp, indent=2)
+        except Exception:
+            pass
+
+    # -- GeoF collar table --
+
+    def _geof_refresh_collar_tree(self):
+        self._geof_tree.delete(*self._geof_tree.get_children())
+        now = time.time()
+        for cid, col in self._geof_collars.items():
+            last = col.get("last_seen", 0)
+            age = now - last if last else float("inf")
+            if col.get("status") == "ALERT":
+                tag = "ALERT"
+            elif age > self._GEOF_HEARTBEAT_INTERVAL * 2:
+                tag = "OFFLINE"
+                col["status"] = "OFFLINE"
+            elif age > self._GEOF_HEARTBEAT_INTERVAL:
+                tag = "STALE"
+                col["status"] = "STALE"
+            else:
+                tag = "OK"
+                col["status"] = "OK"
+            seen_str = datetime.fromtimestamp(last).strftime(
+                "%H:%M:%S") if last else "never"
+            self._geof_tree.insert("", "end", iid=cid, values=(
+                cid, col.get("name", ""), col.get("status", ""),
+                f'{col.get("battery", 0)}%',
+                f'{col.get("lat", 0):.5f}', f'{col.get("lon", 0):.5f}',
+                seen_str), tags=(tag,))
+
+    def _geof_on_collar_select(self, event):
+        sel = self._geof_tree.selection()
+        if not sel:
+            return
+        cid = sel[0]
+        collar = self._geof_collars.get(cid, {})
+        self._geof_detail_text.config(state="normal")
+        self._geof_detail_text.delete("1.0", "end")
+        lines = [
+            f"Collar ID:  {cid}",
+            f"Name:       {collar.get('name', '')}",
+            f"Status:     {collar.get('status', 'UNKNOWN')}",
+            f"Battery:    {collar.get('battery', 0)}%",
+            f"Position:   {collar.get('lat', 0):.6f}, {collar.get('lon', 0):.6f}",
+            f"Last Seen:  {datetime.fromtimestamp(collar.get('last_seen', 0)).strftime('%Y-%m-%d %H:%M:%S') if collar.get('last_seen') else 'never'}",
+        ]
+        self._geof_detail_text.insert("1.0", "\n".join(lines))
+        self._geof_detail_text.config(state="disabled")
+
+    # -- GeoF LoRa bridge --
+
+    def _geof_start_bridge(self):
+        bridge_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "services", "lora_bridge.py")
+        if not os.path.isfile(bridge_path):
+            self._geof_log_msg("lora_bridge.py not found in services/")
+            return
+        if self._geof_lora_bridge_proc is not None:
+            self._geof_log_msg("Bridge already running.")
+            return
+        try:
+            self._geof_lora_bridge_proc = subprocess.Popen(
+                [sys.executable, bridge_path, "--fence", self._GEOF_FENCE_PATH],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self._geof_status_lbl.config(text="BRIDGE ONLINE", fg=TH["green"])
+            self._geof_log_msg("LoRa bridge started.")
+            threading.Thread(target=self._geof_bridge_reader, daemon=True).start()
+        except Exception as ex:
+            self._geof_log_msg(f"Bridge start error: {ex}")
+
+    def _geof_stop_bridge(self):
+        if self._geof_lora_bridge_proc is None:
+            return
+        try:
+            self._geof_lora_bridge_proc.terminate()
+        except Exception:
+            pass
+        self._geof_lora_bridge_proc = None
+        self._geof_status_lbl.config(text="OFFLINE", fg=TH["red"])
+        self._geof_log_msg("LoRa bridge stopped.")
+
+    def _geof_bridge_reader(self):
+        proc = self._geof_lora_bridge_proc
+        if proc is None:
+            return
+        for line in iter(proc.stdout.readline, b""):
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            self.after(0, self._geof_process_bridge_line, text)
+        self.after(0, self._geof_stop_bridge)
+
+    def _geof_process_bridge_line(self, line):
+        self._geof_log_msg(line)
+        try:
+            pkt = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return
+        cid = pkt.get("collar_id")
+        if not cid:
+            return
+        if cid not in self._geof_collars:
+            self._geof_collars[cid] = {"id": cid, "name": pkt.get("name", cid)}
+        collar = self._geof_collars[cid]
+        collar["lat"] = pkt.get("lat", collar.get("lat", 0))
+        collar["lon"] = pkt.get("lon", collar.get("lon", 0))
+        collar["battery"] = pkt.get("battery", collar.get("battery", 0))
+        collar["last_seen"] = time.time()
+        if pkt.get("alert") == "OUTSIDE_FENCE":
+            collar["status"] = "ALERT"
+            self._geof_log_msg(f"*** ALERT: Collar {cid} OUTSIDE fence! ***")
+        self._geof_refresh_collar_tree()
+        self._geof_redraw()
+
+    # -- GeoF heartbeat monitor --
+
+    def _geof_start_heartbeat(self):
+        if self._geof_heartbeat_active:
+            return
+        self._geof_heartbeat_active = True
+        self._geof_hb_lbl.config(text="Heartbeat: ACTIVE", fg=TH["green"])
+        self._geof_log_msg("Heartbeat monitor started (20 min interval).")
+        self._geof_heartbeat_tick()
+
+    def _geof_stop_heartbeat(self):
+        self._geof_heartbeat_active = False
+        self._geof_hb_lbl.config(text="Heartbeat: OFF", fg=TH["fg_dim"])
+        self._geof_log_msg("Heartbeat monitor stopped.")
+
+    def _geof_heartbeat_tick(self):
+        if not self._geof_heartbeat_active:
+            return
+        now = time.time()
+        alerts = []
+        for cid, collar in self._geof_collars.items():
+            last = collar.get("last_seen", 0)
+            age = now - last if last else float("inf")
+            if age > self._GEOF_HEARTBEAT_INTERVAL * 2:
+                collar["status"] = "OFFLINE"
+                alerts.append(f"{collar.get('name', cid)}: OFFLINE")
+            elif age > self._GEOF_HEARTBEAT_INTERVAL:
+                collar["status"] = "STALE"
+                alerts.append(f"{collar.get('name', cid)}: STALE")
+        if alerts:
+            self._geof_log_msg("Heartbeat check: " + ", ".join(alerts))
+        self._geof_refresh_collar_tree()
+        self._geof_redraw()
+        self.after(self._GEOF_HEARTBEAT_INTERVAL * 1000, self._geof_heartbeat_tick)
+
+    # -- GeoF logging --
+
+    def _geof_log_msg(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._geof_log.config(state="normal")
+        self._geof_log.insert("end", f"[{ts}] {msg}\n")
+        self._geof_log.see("end")
+        self._geof_log.config(state="disabled")
 
     # ==================== SYNC TAB ====================
     def build_sync(self):

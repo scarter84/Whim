@@ -1,0 +1,20 @@
+{
+  "vps_host": "",
+  "vps_tunnel_port": 8089,
+  "tailscale_ip": "",
+  "devices": [
+    {"name": "localhost", "ip": "127.0.0.1", "label": "PC", "adb_model": null}
+  ],
+  "default_models": [
+    "llama3.1:8b-16k",
+    "llama3.1:8b",
+    "deepseek-r1:32b"
+  ],
+  "ollama_host": "http://127.0.0.1:11434",
+  "ws_url": "ws://127.0.0.1:18789",
+  "ws_token": "",
+  "ingest_port": 8088,
+  "ss_port": 8091,
+  "signal_desktop_bin": "",
+  "discord_desktop_bin": ""
+}

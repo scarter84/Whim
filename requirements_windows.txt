@@ -1,0 +1,23 @@
+# Whim Terminal — Windows 11 Dependencies
+# Install: pip install -r requirements_windows.txt
+
+# GUI (Tkinter is bundled with Python on Windows)
+Pillow>=10.0
+pystray>=0.19
+
+# QR Code generation (device pairing)
+qrcode[pil]>=7.4
+
+# Audio
+sounddevice>=0.4
+numpy>=1.24
+
+# Networking
+websockets>=12.0
+aiohttp>=3.9
+
+# Optional: Screen capture
+mss>=9.0
+
+# Optional: TTS (requires separate Coqui XTTS setup)
+# TTS>=0.22

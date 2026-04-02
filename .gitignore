@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+dist/
+build/
 
 # ── AI Model Weights (install separately via scripts/setup_models.sh) ──
 *.pth
@@ -52,6 +54,15 @@ screenshots/
 config/openclaw.json
 config/device_locations.json
 config/connection_mode.json
+whim_config.json
+openclaw.json
+whim_settings.json
+whim_sync.json
+whim_sync_state.json
+st_favorites.json
+voice_engine.json
+whim_sessions.json
+whim_log_queries.json
 
 # ── User data directories ──
 Journal/
@@ -61,6 +72,9 @@ TableReads/
 voices/
 Shared/
 Incoming/
+
+# ── SSL certs ──
+*.pem
 
 # ── OS / editor ──
 .DS_Store
@@ -77,3 +91,6 @@ mobile/tailscale.apk
 # ── Logs ──
 *.log
 cmd_reports.jsonl
+
+# ── Backup files ──
+*.bak

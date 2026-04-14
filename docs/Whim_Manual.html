@@ -529,7 +529,10 @@ table code {
   <p style="color: var(--fg-dim); font-size: 14px; margin-top: 8px;">
     The Unified Desktop &amp; Mobile Ecosystem for Voice, AI, Connectivity, and Automation
   </p>
-  <div class="version-badge">v0.3.0 &mdash; March 2026 &mdash; CARRARA Mint &mdash; Hybrid Connection</div>
+  <div class="version-badge">v0.3.4 &mdash; April 2026 &mdash; CARRARA Mint &mdash; Hybrid Connection</div>
+  <p style="margin-top: 16px;">
+    <a href="https://youtu.be/73ZdY070zMQ" target="_blank" style="color: var(--green); font-size: 15px; font-weight: 500;">&#9654; Watch the Whim Overview Video on YouTube</a>
+  </p>
 </header>
 
 <!-- ==================== TABLE OF CONTENTS ==================== -->
@@ -594,42 +597,46 @@ table code {
     </div>
     <div class="toc-item">
       <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">15</span>
-      <a href="#archive">Archive Tab Editor</a>
+      <a href="#nodeflow">NodeFlow &mdash; Visual Node Editor</a>
     </div>
     <div class="toc-item">
       <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">16</span>
-      <a href="#screenshare">Screen Share System</a>
+      <a href="#archive">Archive Tab Editor</a>
     </div>
     <div class="toc-item">
       <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">17</span>
-      <a href="#adb">ADB Portal &amp; Emulator</a>
+      <a href="#screenshare">Screen Share System</a>
     </div>
     <div class="toc-item">
       <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">18</span>
-      <a href="#gateway">OpenClaw Gateway</a>
+      <a href="#adb">ADB Portal &amp; Emulator</a>
     </div>
     <div class="toc-item">
       <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">19</span>
-      <a href="#settingstab">Settings Tab</a>
+      <a href="#gateway">OpenClaw Gateway</a>
     </div>
     <div class="toc-item">
       <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">20</span>
-      <a href="#audiocapture">Audio Capture Tool</a>
+      <a href="#settingstab">Settings Tab</a>
     </div>
     <div class="toc-item">
       <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">21</span>
-      <a href="#tech">Technical Stack &amp; Config</a>
+      <a href="#audiocapture">Audio Capture Tool</a>
     </div>
     <div class="toc-item">
       <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">22</span>
-      <a href="#desktop-env">Desktop Environment Customizations</a>
+      <a href="#tech">Technical Stack &amp; Config</a>
     </div>
     <div class="toc-item">
       <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">23</span>
-      <a href="#windows11">Windows 11 Support</a>
+      <a href="#desktop-env">Desktop Environment Customizations</a>
     </div>
     <div class="toc-item">
       <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">24</span>
+      <a href="#windows11">Windows 11 Support</a>
+    </div>
+    <div class="toc-item">
+      <span class="page-num"><img class="flame-sm" src="manual_assets/fire.png" alt="">25</span>
       <a href="#sync">Multi-Terminal Sync</a>
     </div>
   </div>
@@ -659,7 +666,7 @@ table code {
     </div>
     <div class="feature-card">
       <div class="fc-title">Mobile Companion</div>
-      <div class="fc-desc">Whim.m v3.1 provides a five-tab mobile experience (REC, LIBRARY, CHAT, WAKE, DEVICES) with voice recording, AI chat, wake word commands, cross-device file sharing, and inter-device messaging &mdash; accessible over LAN or VPS reverse SSH tunnel.</div>
+      <div class="fc-desc">Whim.m v3.4 provides a five-tab mobile experience (REC, LIBRARY, CHAT, WAKE, DEVICES) with voice recording, AI chat, wake word commands, cross-device file sharing, and inter-device messaging &mdash; accessible over LAN or VPS reverse SSH tunnel.</div>
     </div>
     <div class="feature-card">
       <div class="fc-title">Local-First AI</div>
@@ -832,6 +839,7 @@ table code {
       <tr><td><span class="badge badge-orange">SIGNAL</span></td><td>signal</td><td>Signal messenger integration for sending/receiving messages, managing contacts, and viewing conversation history.</td></tr>
       <tr><td><span class="badge badge-orange">TRV CIPHER</span></td><td>hearmeout</td><td>Audio transcription workstation with spectrogram, playback transport, Whisper transcription, ODT export, and scrub tools.</td></tr>
       <tr><td><span class="badge badge-green">GEOF</span></td><td>geof</td><td>Geofence tracker with canvas map, collar status table, LoRa bridge integration, 20-minute heartbeat monitor, and fence pin management for livestock tracking.</td></tr>
+      <tr><td><span class="badge badge-orange">NODEFLOW</span></td><td>nodeflow</td><td>Visual node-based flow editor showing active droids, LLM reasoning, OpenClaw telemetry, and data flow connections with drag-and-drop canvas, auto-poll, and node inspector.</td></tr>
       <tr><td><span class="badge badge-yellow">ARCHIVE</span></td><td>archive</td><td>Rich text editor with formatting toolbar, font selection, alignment, bullet lists, find/replace, word count, and file browser.</td></tr>
       <tr><td><span class="badge badge-yellow">DISCORD</span></td><td>discord</td><td>Discord bot management with desktop launch/stop, OpenClaw bot config, action toggles, and channel management.</td></tr>
       <tr><td><span class="badge badge-red">RYVENCORE</span></td><td>ryvencore</td><td>Visual node-based programming environment (RyvenCore integration).</td></tr>
@@ -964,7 +972,7 @@ table code {
   </div>
 
   <p>
-    Whim.m v3.2 is a full-featured mobile companion app served as a native APK or Progressive Web App (PWA) from either the desktop Whim app or a standalone Python server. It provides voice recording, AI chat (via Ollama proxy), wake word voice commands, a cross-device file library, and inter-device messaging &mdash; all organized into five dedicated bottom navigation tabs: <strong>REC</strong>, <strong>LIBRARY</strong>, <strong>CHAT</strong>, <strong>WAKE</strong>, and <strong>DEVICES</strong>. The app uses a hybrid connection strategy: VPS tunnel by default with Tailscale as an opt-in fallback, switchable from a dropdown in the mobile UI or from the desktop Control Panel.
+    Whim.m v3.4 is a full-featured mobile companion app served as a native APK or Progressive Web App (PWA) from either the desktop Whim app or a standalone Python server. It provides voice recording, AI chat (via Ollama proxy), wake word voice commands, a cross-device file library, and inter-device messaging &mdash; all organized into five dedicated bottom navigation tabs: <strong>REC</strong>, <strong>LIBRARY</strong>, <strong>CHAT</strong>, <strong>WAKE</strong>, and <strong>DEVICES</strong>. The app uses a hybrid connection strategy: VPS tunnel by default with Tailscale as an opt-in fallback, switchable from a dropdown in the mobile UI or from the desktop Control Panel.
   </p>
 
   <h3>v3.2 &mdash; Four-Tab Navigation</h3>
@@ -972,7 +980,7 @@ table code {
   <div class="phone-screenshot-row">
     <div class="screenshot-container">
       <img src="manual_assets/phone_rec_tab.jpg" alt="Whim.m REC Tab">
-      <div class="screenshot-caption">REC tab &mdash; Whim.m v3.2 with record button, EXPORT TO WHIM, file list with play buttons, and status bar showing server/nic/ollama indicators</div>
+      <div class="screenshot-caption">REC tab &mdash; Whim.m v3.4 with record button, EXPORT TO WHIM, file list with play buttons, and status bar showing server/nic/ollama indicators</div>
     </div>
     <div class="screenshot-container">
       <img src="manual_assets/phone_library_tab.jpg" alt="Whim.m Library Tab">
@@ -1124,8 +1132,8 @@ whim-cmd {"action":"open_maps","params":{}}</div>
   <table>
     <thead><tr><th>File</th><th>Size</th><th>Description</th></tr></thead>
     <tbody>
-      <tr><td>whim_m_v3.1_phone.apk</td><td>~61 KB</td><td>WebView wrapper for phones (connects via VPS tunnel)</td></tr>
-      <tr><td>whim_m_v3.1_tablet.apk</td><td>~61 KB</td><td>WebView wrapper for tablet (connects via VPS tunnel)</td></tr>
+      <tr><td>whim_m_v3.4_phone.apk</td><td>~61 KB</td><td>WebView wrapper for phones (connects via VPS tunnel)</td></tr>
+      <tr><td>whim_m_v3.4_tablet.apk</td><td>~61 KB</td><td>WebView wrapper for tablet (connects via VPS tunnel)</td></tr>
     </tbody>
   </table>
 </section>
@@ -1785,11 +1793,104 @@ C002,36.341000,-93.195000,62,Cow-2,OUTSIDE_FENCE</div>
   </div>
 </section>
 
-<!-- ==================== 13 ARCHIVE ==================== -->
-<section class="section" id="archive">
+<!-- ==================== NODEFLOW ==================== -->
+<section class="section" id="nodeflow">
   <div class="section-header">
     <img class="flame-sm" src="manual_assets/fire.png" alt="">
     <span class="sec-num">15</span>
+    <h2>NodeFlow &mdash; Visual Node Editor</h2>
+  </div>
+  <p>
+    The NodeFlow tab is a visual node-based flow editor that maps the real-time data pipeline inside Whim. It renders each active component &mdash; User Input, Whim Brain (LLM), Opus Droid, OpenClaw Telemetry, and Wisp/GPS &mdash; as draggable nodes on an infinite canvas, with dashed edges showing how data flows between them.
+  </p>
+
+  <div class="screenshot-container">
+    <img src="manual_assets/nodeflow.png" alt="NodeFlow Desktop Tab">
+  </div>
+
+  <div class="screenshot-row">
+    <div class="screenshot-container">
+      <img src="manual_assets/nodeflow2.png" alt="NodeFlow — Full Graph with Wisp/GPS Node">
+      <div class="screenshot-caption">Full node graph showing all five default nodes connected with dashed edge lines and the Wisp/GPS endpoint visible</div>
+    </div>
+    <div class="screenshot-container">
+      <img src="manual_assets/node3.png" alt="NodeFlow — Node Inspector Detail">
+      <div class="screenshot-caption">Selecting the Wisp/GPS node populates the Node Inspector with type, position, description, and upstream connections</div>
+    </div>
+  </div>
+
+  <h3>Architecture</h3>
+  <div class="conn-diagram">
+    <span class="node">User Input</span>
+    <span class="arrow">&rarr;</span>
+    <span class="node">Whim Brain (LLM)</span>
+    <span class="arrow">&rarr;</span>
+    <span class="node">Opus Droid</span>
+    <span class="arrow">&rarr;</span>
+    <span class="node">Wisp / GPS</span>
+  </div>
+  <div class="conn-diagram" style="margin-top: 4px;">
+    <span style="visibility:hidden" class="node">User Input</span>
+    <span style="visibility:hidden" class="arrow">&rarr;</span>
+    <span class="node">Whim Brain (LLM)</span>
+    <span class="arrow">&rarr;</span>
+    <span class="node">OpenClaw Telemetry</span>
+    <span class="arrow">&rarr;</span>
+    <span class="node">Wisp / GPS</span>
+  </div>
+
+  <h3>Default Nodes</h3>
+  <table>
+    <thead><tr><th>Node</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><strong>User Input</strong></td><td>input</td><td>Prompt and command entry point for the pipeline</td></tr>
+      <tr><td><strong>Whim Brain (LLM)</strong></td><td>brain</td><td>Local Ollama model handling reasoning, tool calls, and token streaming</td></tr>
+      <tr><td><strong>Opus Droid</strong></td><td>droid</td><td>Code execution, syntax analysis, and active path highlighting</td></tr>
+      <tr><td><strong>OpenClaw Telemetry</strong></td><td>openclaw</td><td>Hardware telemetry: RSSI, battery level, heartbeat status</td></tr>
+      <tr><td><strong>Wisp / GPS</strong></td><td>wisp</td><td>GPS coordinates, geofence status, and LoRa packet data</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Layout</h3>
+  <table>
+    <thead><tr><th>Panel</th><th>Content</th></tr></thead>
+    <tbody>
+      <tr><td>Header</td><td>Title, Refresh / Auto-Poll / Reset View buttons, idle/active status indicator</td></tr>
+      <tr><td>Canvas (left, 75%)</td><td>Infinite dark canvas with grid lines, color-coded draggable nodes, dashed edge connections, zoom (scroll wheel), and pan (right-click drag)</td></tr>
+      <tr><td>Node Inspector (right top)</td><td>Detail card showing the selected node&rsquo;s label, type, metadata, and connection list</td></tr>
+      <tr><td>Flow Log (right bottom)</td><td>Timestamped event log with color-coded severity (info, ok, warn, err)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Interaction</h3>
+  <ul>
+    <li><strong>Drag Nodes</strong> &mdash; Click and drag any node to reposition it on the canvas; edges redraw automatically</li>
+    <li><strong>Select Node</strong> &mdash; Click a node to populate the Node Inspector with its details</li>
+    <li><strong>Zoom</strong> &mdash; Scroll wheel zooms in/out on the canvas</li>
+    <li><strong>Pan</strong> &mdash; Right-click (or middle-click) drag to pan the viewport</li>
+    <li><strong>Refresh</strong> &mdash; Re-query all node states from the running system</li>
+    <li><strong>Auto-Poll</strong> &mdash; Toggle continuous polling to keep node data live</li>
+    <li><strong>Reset View</strong> &mdash; Snap zoom and pan back to the default viewport</li>
+  </ul>
+
+  <h3>Node Color Scheme</h3>
+  <table>
+    <thead><tr><th>Type</th><th>Border Color</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><strong>brain</strong></td><td style="color:#9b59b6">Purple</td><td>LLM reasoning engine</td></tr>
+      <tr><td><strong>droid</strong></td><td style="color:#27ae60">Green</td><td>Code execution agents</td></tr>
+      <tr><td><strong>openclaw</strong></td><td style="color:#e8793a">Orange</td><td>Hardware telemetry sources</td></tr>
+      <tr><td><strong>wisp</strong></td><td style="color:#2980b9">Blue</td><td>GPS and geofence endpoints</td></tr>
+      <tr><td><strong>input</strong></td><td style="color:#8a7a6a">Tan</td><td>User entry points</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ==================== ARCHIVE ==================== -->
+<section class="section" id="archive">
+  <div class="section-header">
+    <img class="flame-sm" src="manual_assets/fire.png" alt="">
+    <span class="sec-num">16</span>
     <h2>Archive Tab Editor</h2>
   </div>
   <p>
@@ -2501,7 +2602,7 @@ scripts/
   <img src="manual_assets/fire.png" style="width: 24px; height: 24px; vertical-align: middle; margin-right: 8px; opacity: 0.6;">
   <strong>Whim</strong> &mdash; Complete Manual v1.4 &mdash; April 2026<br>
   <span style="color: var(--fg-muted); font-size: 11px;">
-    Built on CARRARA &bull; Python &bull; Tkinter &bull; Ollama &bull; SSH Tunnel + Tailscale Hybrid &bull; OpenClaw &bull; Windows 11 + Linux &bull; Multi-Terminal Sync &bull; GeoF + LoRa + ESP32
+    Built on CARRARA &bull; Python &bull; Tkinter &bull; Ollama &bull; SSH Tunnel + Tailscale Hybrid &bull; OpenClaw &bull; Windows 11 + Linux &bull; Multi-Terminal Sync &bull; GeoF + LoRa + ESP32 &bull; NodeFlow
   </span>
 </footer>
 

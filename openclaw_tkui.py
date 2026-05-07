@@ -2664,6 +2664,11 @@ class ModernApp(tk.Tk):
         self._brain_pages_lbl = tk.Label(bf, text="", bg=TH["card"],
                                          fg=TH["fg2"], font=(_FONTS["mono"], 8))
         self._brain_pages_lbl.pack(side="left", padx=(4, 0))
+        self._brain_health_tooltip = None
+        self._brain_health_detail = ""
+        for w in (self._brain_health_canvas, self._brain_health_lbl, self._brain_pages_lbl):
+            w.bind("<Enter>", self._brain_health_show_tip)
+            w.bind("<Leave>", self._brain_health_hide_tip)
         self.after(2000, self._brain_health_poll)
 
         self._device_poll_running = True
@@ -3160,9 +3165,15 @@ class ModernApp(tk.Tk):
                          ("Copy MD", self._whimai_copy_md),
                          ("Print", self._whimai_print),
                          ("Send to Page", self._whimai_send_to_page),
-                         ("Send to Brain", self._whimai_send_to_brain),
                          ("Make Task", self._whimai_make_task)]:
             self._btn(afford_row, lbl, cmd).pack(side="left", padx=2)
+        brain_btn_frame = tk.Frame(afford_row, bg=TH["bg"])
+        brain_btn_frame.pack(side="left", padx=2)
+        self._btn(brain_btn_frame, "\U0001f9e0 Brain", self._whimai_send_to_brain).pack(side="left")
+        brain_drop = tk.Label(brain_btn_frame, text="\u25bc", bg=TH["btn"], fg=TH["fg"],
+                              font=(_FONTS["mono"], 7), padx=3, pady=2, cursor="hand2")
+        brain_drop.pack(side="left")
+        brain_drop.bind("<Button-1>", self._whimai_brain_type_menu)
         self._speak_toggle_btn = self._btn(afford_row, "SPEAK", self._toggle_auto_speak)
         self._speak_toggle_btn.pack(side="left", padx=2)
         self._export_mp3_btn = self._btn(afford_row, "Export MP3", self._export_tts_mp3)
@@ -6276,7 +6287,26 @@ class ModernApp(tk.Tk):
         })
         self.whimai_status_var.set("Sent to page")
 
-    def _whimai_send_to_brain(self):
+    _BRAIN_PAGE_TYPES = {
+        "note":    {"dir": "notes",     "type": "note",    "tags": ["whimai", "chat-capture"]},
+        "daily":   {"dir": "summaries", "type": "summary", "tags": ["daily", "journal"]},
+        "project": {"dir": "projects",  "type": "project", "tags": ["project"]},
+        "device":  {"dir": "devices",   "type": "device",  "tags": ["device", "hardware"]},
+        "person":  {"dir": "people",    "type": "person",  "tags": ["person", "contact"]},
+        "concept": {"dir": "concepts",  "type": "concept", "tags": ["concept", "idea"]},
+    }
+
+    def _whimai_brain_type_menu(self, event):
+        menu = tk.Menu(self, tearoff=0, bg=TH["card"], fg=TH["fg"],
+                       activebackground=TH["select_bg"], activeforeground=TH["fg"],
+                       font=(_FONTS["mono"], 9), bd=1, relief="flat")
+        for ptype, info in self._BRAIN_PAGE_TYPES.items():
+            menu.add_command(label=f"{info['dir']}/  ({ptype})",
+                             command=lambda t=ptype: self._whimai_send_to_brain(page_type=t))
+        menu.tk_popup(event.widget.winfo_rootx(),
+                      event.widget.winfo_rooty() + event.widget.winfo_height())
+
+    def _whimai_send_to_brain(self, page_type="note"):
         if not self._whimai_chat_history:
             self.whimai_status_var.set("No chat to save")
             return
@@ -6288,10 +6318,17 @@ class ModernApp(tk.Tk):
         if not last_ai:
             self.whimai_status_var.set("No AI response to save")
             return
+        type_info = self._BRAIN_PAGE_TYPES.get(page_type, self._BRAIN_PAGE_TYPES["note"])
         import tkinter.simpledialog as sd
+        from datetime import datetime, date
+        if page_type == "daily":
+            default_slug = f"{type_info['dir']}/daily-{date.today().isoformat()}"
+        else:
+            default_slug = f"{type_info['dir']}/"
         slug = sd.askstring(
-            "Save to Brain",
-            "Brain page slug (e.g. notes/my-topic):",
+            f"Save to Brain ({page_type})",
+            f"Page slug:",
+            initialvalue=default_slug,
             parent=self)
         if not slug:
             return
@@ -6301,12 +6338,12 @@ class ModernApp(tk.Tk):
             if msg.get("role") == "user" and msg.get("content", "").strip():
                 last_user = msg["content"]
                 break
-        from datetime import datetime
+        tags_str = ", ".join(type_info["tags"])
         page_content = (
             f"---\n"
             f"title: \"{slug.rsplit('/', 1)[-1].replace('-', ' ').title()}\"\n"
-            f"type: note\n"
-            f"tags: [whimai, chat-capture]\n"
+            f"type: {type_info['type']}\n"
+            f"tags: [{tags_str}]\n"
             f"source: whim-terminal\n"
             f"captured: {datetime.now().isoformat()}\n"
             f"---\n\n"
@@ -6323,10 +6360,11 @@ class ModernApp(tk.Tk):
                     text=True, cwd=self._GBRAIN_DIR)
                 out, err = proc.communicate(input=page_content, timeout=15)
                 if proc.returncode == 0:
-                    self.after(0, lambda: self.whimai_status_var.set(f"Saved to brain: {slug}"))
+                    self.after(0, lambda: self.whimai_status_var.set(
+                        f"Saved to brain: {slug} ({page_type})"))
                     self.after(0, self._brain_health_poll)
                 else:
-                    self.after(0, lambda: self.whimai_status_var.set(f"Brain save failed"))
+                    self.after(0, lambda: self.whimai_status_var.set("Brain save failed"))
             except Exception as ex:
                 self.after(0, lambda: self.whimai_status_var.set(f"Brain error: {ex}"))
         threading.Thread(target=_save, daemon=True).start()
@@ -6622,23 +6660,46 @@ class ModernApp(tk.Tk):
 
     def _brain_health_poll(self):
         def _check():
+            from datetime import datetime
             rc, out, _ = self._gbrain_exec(["stats"], timeout=8)
             if rc == 0:
-                pages = 0
+                stats = {"pages": 0, "chunks": 0, "embedded": 0,
+                         "links": 0, "tags": 0, "timeline": 0}
                 for line in out.splitlines():
-                    if "Pages:" in line:
-                        try:
-                            pages = int(line.split(":")[1].strip())
-                        except Exception:
-                            pass
-                        break
-                self.after(0, lambda: self._brain_health_update(True, pages))
+                    for key in stats:
+                        if line.strip().lower().startswith(key.capitalize() + ":") or \
+                           line.strip().lower().startswith(key + ":"):
+                            try:
+                                stats[key] = int(line.split(":")[1].strip())
+                            except Exception:
+                                pass
+                ts = datetime.now().strftime("%H:%M:%S")
+                detail = (
+                    f"GBrain Health\n"
+                    f"{'='*28}\n"
+                    f"Pages:    {stats['pages']}\n"
+                    f"Chunks:   {stats['chunks']}\n"
+                    f"Embedded: {stats['embedded']}\n"
+                    f"Links:    {stats['links']}\n"
+                    f"Tags:     {stats['tags']}\n"
+                    f"Timeline: {stats['timeline']}\n"
+                    f"{'='*28}\n"
+                    f"Last poll: {ts}\n"
+                    f"Engine: PGLite (local)")
+                droid_w = "ON" if getattr(self, "_brain_droid_write_var", None) and self._brain_droid_write_var.get() else "OFF"
+                auto_e = "ON" if getattr(self, "_brain_auto_enrich_var", None) and self._brain_auto_enrich_var.get() else "OFF"
+                auto_s = "ON" if getattr(self, "_brain_auto_summary_var", None) and self._brain_auto_summary_var.get() else "OFF"
+                detail += f"\nDroid writes: {droid_w}\nAuto-enrich: {auto_e}\nAuto-summary: {auto_s}"
+                self.after(0, lambda: self._brain_health_update(
+                    True, stats["pages"], detail))
             else:
-                self.after(0, lambda: self._brain_health_update(False, 0))
+                self.after(0, lambda: self._brain_health_update(
+                    False, 0, "GBrain offline or not installed"))
         threading.Thread(target=_check, daemon=True).start()
         self.after(30000, self._brain_health_poll)
 
-    def _brain_health_update(self, ok, pages):
+    def _brain_health_update(self, ok, pages, detail=""):
+        self._brain_health_detail = detail
         if ok:
             self._brain_health_canvas.itemconfigure(self._brain_health_dot, fill="#2fa572")
             self._brain_health_lbl.config(fg=TH["fg"])
@@ -6647,6 +6708,28 @@ class ModernApp(tk.Tk):
             self._brain_health_canvas.itemconfigure(self._brain_health_dot, fill="#8a7a6a")
             self._brain_health_lbl.config(fg=TH["fg2"])
             self._brain_pages_lbl.config(text="offline", fg=TH["fg_dim"])
+
+    def _brain_health_show_tip(self, event):
+        if self._brain_health_tooltip:
+            return
+        text = self._brain_health_detail or "Polling..."
+        tw = tk.Toplevel(self)
+        tw.wm_overrideredirect(True)
+        tw.wm_attributes("-topmost", True)
+        x = event.widget.winfo_rootx() + 12
+        y = event.widget.winfo_rooty() + event.widget.winfo_height() + 4
+        tw.wm_geometry(f"+{x}+{y}")
+        frame = tk.Frame(tw, bg="#1a1a1a", bd=1, relief="solid",
+                         highlightthickness=1, highlightbackground="#3a3a3a")
+        frame.pack()
+        tk.Label(frame, text=text, bg="#1a1a1a", fg="#dce4ee",
+                 font=(_FONTS["mono"], 8), justify="left", padx=8, pady=6).pack()
+        self._brain_health_tooltip = tw
+
+    def _brain_health_hide_tip(self, event):
+        if self._brain_health_tooltip:
+            self._brain_health_tooltip.destroy()
+            self._brain_health_tooltip = None
 
     def _whimai_start_telemetry_poll(self):
         if self._whimai_telemetry_polling:
@@ -21296,9 +21379,31 @@ camFlipBtn.addEventListener('click',()=>{
         graph_hdr.pack(fill="x")
         tk.Label(graph_hdr, text="BACKLINK GRAPH", bg=TH["card"], fg="#8a7a6a",
                  font=(_FONTS["mono"], 8, "bold"), padx=8, pady=3).pack(side="left")
+        self._brain_graph_view_var = tk.StringVar(value="radial")
+        for vl, vv in [("Radial", "radial"), ("List", "list")]:
+            tk.Radiobutton(graph_hdr, text=vl, variable=self._brain_graph_view_var,
+                           value=vv, bg=TH["card"], fg=TH["fg"],
+                           selectcolor=TH["input"], activebackground=TH["card"],
+                           activeforeground=TH["fg"], font=(_FONTS["mono"], 7),
+                           highlightthickness=0, indicatoron=0, padx=6, pady=1,
+                           command=self._brain_redraw_graph).pack(side="left", padx=2)
         self._brain_graph_canvas = tk.Canvas(graph_frame, bg=TH["input"],
                                              highlightthickness=0, bd=1, relief="flat")
         self._brain_graph_canvas.pack(fill="both", expand=True, pady=(2, 0))
+        self._brain_graph_zoom = 1.0
+        self._brain_graph_pan_x = 0
+        self._brain_graph_pan_y = 0
+        self._brain_graph_drag_start = None
+        self._brain_graph_center_slug = ""
+        self._brain_graph_backlink_slugs = []
+        self._brain_graph_canvas.bind("<ButtonPress-2>", self._brain_graph_pan_start)
+        self._brain_graph_canvas.bind("<B2-Motion>", self._brain_graph_pan_move)
+        self._brain_graph_canvas.bind("<Button-4>",
+            lambda e: self._brain_graph_zoom_step(1.15))
+        self._brain_graph_canvas.bind("<Button-5>",
+            lambda e: self._brain_graph_zoom_step(0.87))
+        self._brain_graph_canvas.bind("<MouseWheel>",
+            lambda e: self._brain_graph_zoom_step(1.15 if e.delta > 0 else 0.87))
 
         self._brain_ent_slugs = []
 
@@ -21707,40 +21812,167 @@ camFlipBtn.addEventListener('click',()=>{
         threading.Thread(target=_load, daemon=True).start()
 
     def _brain_draw_backlink_graph(self, center_slug, backlink_slugs):
+        self._brain_graph_center_slug = center_slug
+        self._brain_graph_backlink_slugs = backlink_slugs
+        self._brain_graph_zoom = 1.0
+        self._brain_graph_pan_x = 0
+        self._brain_graph_pan_y = 0
+        self._brain_render_graph()
+
+    def _brain_redraw_graph(self):
+        self._brain_render_graph()
+
+    def _brain_graph_zoom_step(self, factor):
+        self._brain_graph_zoom = max(0.3, min(3.0, self._brain_graph_zoom * factor))
+        self._brain_render_graph()
+
+    def _brain_graph_pan_start(self, event):
+        self._brain_graph_drag_start = (event.x, event.y)
+
+    def _brain_graph_pan_move(self, event):
+        if self._brain_graph_drag_start:
+            dx = event.x - self._brain_graph_drag_start[0]
+            dy = event.y - self._brain_graph_drag_start[1]
+            self._brain_graph_pan_x += dx
+            self._brain_graph_pan_y += dy
+            self._brain_graph_drag_start = (event.x, event.y)
+            self._brain_render_graph()
+
+    def _brain_node_color(self, slug):
+        if "people" in slug:
+            return "#e8793a"
+        if "companies" in slug:
+            return "#4a7aff"
+        if "devices" in slug:
+            return "#e0a030"
+        if "projects" in slug:
+            return "#2fa572"
+        if "concepts" in slug:
+            return "#40e0d0"
+        if "locations" in slug:
+            return "#c4382a"
+        return "#aaaaaa"
+
+    def _brain_render_graph(self):
         c = self._brain_graph_canvas
         c.delete("all")
+        center_slug = self._brain_graph_center_slug
+        backlink_slugs = self._brain_graph_backlink_slugs
+        if not center_slug:
+            return
+        view = self._brain_graph_view_var.get()
         c.update_idletasks()
         w = max(c.winfo_width(), 300)
         h = max(c.winfo_height(), 180)
-        cx, cy = w // 2, h // 2
+
+        if view == "list":
+            self._brain_render_list_view(c, w, h, center_slug, backlink_slugs)
+            return
+
+        z = self._brain_graph_zoom
+        ox = self._brain_graph_pan_x
+        oy = self._brain_graph_pan_y
+        cx, cy = w // 2 + ox, h // 2 + oy
+        r_center = int(28 * z)
         center_name = center_slug.rsplit("/", 1)[-1].replace("-", " ").title()
-        c.create_oval(cx - 28, cy - 28, cx + 28, cy + 28,
+        c.create_oval(cx - r_center, cy - r_center, cx + r_center, cy + r_center,
                       fill="#1a3a2a", outline="#2fa572", width=2)
-        c.create_text(cx, cy, text=center_name[:16], fill="#2fa572",
-                      font=(_FONTS["mono"], 8, "bold"), width=50)
+        center_id = c.create_text(cx, cy, text=center_name[:18], fill="#2fa572",
+                      font=(_FONTS["mono"], max(7, int(8 * z)), "bold"),
+                      width=int(55 * z))
+        c.tag_bind(center_id, "<Button-1>",
+                   lambda e, s=center_slug: self._brain_graph_click(s))
         if not backlink_slugs:
-            c.create_text(cx, cy + 50, text="(no backlinks)",
+            c.create_text(cx, cy + int(50 * z), text="(no backlinks)",
                           fill=TH["fg_dim"], font=(_FONTS["mono"], 8))
             return
         import math
         count = len(backlink_slugs)
-        radius = min(w, h) * 0.35
-        for i, bl_slug in enumerate(backlink_slugs[:12]):
-            angle = (2 * math.pi * i / min(count, 12)) - math.pi / 2
+        radius = min(w, h) * 0.35 * z
+        r_node = int(20 * z)
+        for i, bl_slug in enumerate(backlink_slugs[:16]):
+            angle = (2 * math.pi * i / min(count, 16)) - math.pi / 2
             nx = cx + int(radius * math.cos(angle))
             ny = cy + int(radius * math.sin(angle))
             c.create_line(cx, cy, nx, ny, fill="#3a3a3a", width=1, dash=(3, 3))
-            node_color = "#e8793a" if "people" in bl_slug else \
-                         "#4a7aff" if "companies" in bl_slug else \
-                         "#e0a030" if "devices" in bl_slug else "#aaaaaa"
-            c.create_oval(nx - 18, ny - 18, nx + 18, ny + 18,
-                          fill=TH["input"], outline=node_color, width=1)
+            node_color = self._brain_node_color(bl_slug)
+            oval_id = c.create_oval(nx - r_node, ny - r_node, nx + r_node, ny + r_node,
+                          fill=TH["input"], outline=node_color, width=max(1, int(z)))
             name = bl_slug.rsplit("/", 1)[-1].replace("-", " ").title()
-            c.create_text(nx, ny, text=name[:12], fill=node_color,
-                          font=(_FONTS["mono"], 7), width=34)
-        if count > 12:
-            c.create_text(cx, h - 12, text=f"+{count - 12} more",
+            text_id = c.create_text(nx, ny, text=name[:14], fill=node_color,
+                          font=(_FONTS["mono"], max(6, int(7 * z))),
+                          width=int(38 * z))
+            for item_id in (oval_id, text_id):
+                c.tag_bind(item_id, "<Button-1>",
+                           lambda e, s=bl_slug: self._brain_graph_click(s))
+                c.tag_bind(item_id, "<Enter>",
+                           lambda e, oid=oval_id: c.itemconfigure(oid, width=3))
+                c.tag_bind(item_id, "<Leave>",
+                           lambda e, oid=oval_id: c.itemconfigure(oid, width=max(1, int(z))))
+        if count > 16:
+            c.create_text(cx, h - 12, text=f"+{count - 16} more",
                           fill=TH["fg_dim"], font=(_FONTS["mono"], 7))
+
+    def _brain_render_list_view(self, c, w, h, center_slug, backlink_slugs):
+        y = 10
+        center_name = center_slug.rsplit("/", 1)[-1].replace("-", " ").title()
+        c.create_rectangle(8, y, w - 8, y + 22, fill="#1a3a2a", outline="#2fa572")
+        tid = c.create_text(w // 2, y + 11, text=f"\u25c6 {center_name}",
+                     fill="#2fa572", font=(_FONTS["mono"], 9, "bold"))
+        c.tag_bind(tid, "<Button-1>",
+                   lambda e, s=center_slug: self._brain_graph_click(s))
+        y += 30
+        if not backlink_slugs:
+            c.create_text(w // 2, y + 10, text="(no backlinks)",
+                          fill=TH["fg_dim"], font=(_FONTS["mono"], 8))
+            return
+        for bl_slug in backlink_slugs[:20]:
+            node_color = self._brain_node_color(bl_slug)
+            name = bl_slug.rsplit("/", 1)[-1].replace("-", " ").title()
+            c.create_text(20, y + 3, text="\u2190", fill="#3a3a3a",
+                          font=(_FONTS["mono"], 9), anchor="w")
+            c.create_oval(36, y, 48, y + 12, fill=TH["input"],
+                          outline=node_color, width=1)
+            tid = c.create_text(54, y + 3, text=f"{name}  ({bl_slug})",
+                         fill=node_color, font=(_FONTS["mono"], 8), anchor="w")
+            c.tag_bind(tid, "<Button-1>",
+                       lambda e, s=bl_slug: self._brain_graph_click(s))
+            c.tag_bind(tid, "<Enter>",
+                       lambda e, i=tid: c.itemconfigure(i, font=(_FONTS["mono"], 8, "underline")))
+            c.tag_bind(tid, "<Leave>",
+                       lambda e, i=tid: c.itemconfigure(i, font=(_FONTS["mono"], 8)))
+            y += 18
+        if len(backlink_slugs) > 20:
+            c.create_text(54, y + 3, text=f"+{len(backlink_slugs) - 20} more",
+                          fill=TH["fg_dim"], font=(_FONTS["mono"], 7), anchor="w")
+
+    def _brain_graph_click(self, slug):
+        if slug in self._brain_ent_slugs:
+            idx = self._brain_ent_slugs.index(slug)
+            self._brain_ent_listbox.selection_clear(0, "end")
+            self._brain_ent_listbox.selection_set(idx)
+            self._brain_ent_listbox.see(idx)
+            self._brain_ent_listbox.event_generate("<<ListboxSelect>>")
+        else:
+            self._brain_ent_status.config(text=f"Loading {slug}...", fg=TH["yellow"])
+            def _load():
+                rc, page, err = self._gbrain_exec(["get", slug])
+                parts = [page if rc == 0 else f"Error: {err[:200]}"]
+                backlink_slugs = []
+                rc2, bl, _ = self._gbrain_exec(["backlinks", slug])
+                if rc2 == 0 and bl.strip():
+                    parts.append(f"\n{'='*50}\nBACKLINKS\n{'='*50}\n{bl}")
+                    for line in bl.splitlines():
+                        line = line.strip()
+                        if line and not line.startswith(("(", "-", "=")):
+                            token = line.split()[0] if " " in line else line
+                            if "/" in token or token.replace("-", "").isalnum():
+                                backlink_slugs.append(token)
+                result = "\n".join(parts)
+                self.after(0, lambda: self._brain_set_widget(self._brain_ent_detail, result))
+                self.after(0, lambda: self._brain_ent_status.config(text="", fg=TH["green"]))
+                self.after(0, lambda: self._brain_draw_backlink_graph(slug, backlink_slugs))
+            threading.Thread(target=_load, daemon=True).start()
 
     # ── Operations helpers ──────────────────────────────────────────
 

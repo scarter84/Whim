@@ -2646,6 +2646,26 @@ class ModernApp(tk.Tk):
             el.pack(side="left")
             self._eco_widgets[eco_id] = {"canvas": ec, "dot": ed}
 
+        # Brain Health indicator
+        sep2 = tk.Frame(self._device_bar, bg=TH["border_hi"], width=1)
+        sep2.pack(side="left", fill="y", padx=(8, 8), pady=4)
+        bf = tk.Frame(self._device_bar, bg=TH["card"])
+        bf.pack(side="left", padx=(0, 10), pady=4)
+        self._brain_health_canvas = tk.Canvas(bf, width=10, height=10,
+                                              bg=TH["card"], highlightthickness=0)
+        self._brain_health_canvas.pack(side="left", padx=(0, 3))
+        self._brain_health_dot = self._brain_health_canvas.create_oval(
+            1, 1, 9, 9, fill="#8a7a6a", outline="")
+        self._brain_health_lbl = tk.Label(bf, text="Brain", bg=TH["card"],
+                                          fg=TH["fg"], font=(_FONTS["mono"], 9))
+        self._brain_health_lbl.pack(side="left")
+        self._brain_health_lbl.bind("<Button-1>", lambda e: self._switch_tab("brain"))
+        self._brain_health_canvas.bind("<Button-1>", lambda e: self._switch_tab("brain"))
+        self._brain_pages_lbl = tk.Label(bf, text="", bg=TH["card"],
+                                         fg=TH["fg2"], font=(_FONTS["mono"], 8))
+        self._brain_pages_lbl.pack(side="left", padx=(4, 0))
+        self.after(2000, self._brain_health_poll)
+
         self._device_poll_running = True
         threading.Thread(target=self._poll_device_status, daemon=True).start()
 
@@ -3140,6 +3160,7 @@ class ModernApp(tk.Tk):
                          ("Copy MD", self._whimai_copy_md),
                          ("Print", self._whimai_print),
                          ("Send to Page", self._whimai_send_to_page),
+                         ("Send to Brain", self._whimai_send_to_brain),
                          ("Make Task", self._whimai_make_task)]:
             self._btn(afford_row, lbl, cmd).pack(side="left", padx=2)
         self._speak_toggle_btn = self._btn(afford_row, "SPEAK", self._toggle_auto_speak)
@@ -6255,6 +6276,61 @@ class ModernApp(tk.Tk):
         })
         self.whimai_status_var.set("Sent to page")
 
+    def _whimai_send_to_brain(self):
+        if not self._whimai_chat_history:
+            self.whimai_status_var.set("No chat to save")
+            return
+        last_ai = ""
+        for msg in reversed(self._whimai_chat_history):
+            if msg.get("role") == "assistant" and msg.get("content", "").strip():
+                last_ai = msg["content"]
+                break
+        if not last_ai:
+            self.whimai_status_var.set("No AI response to save")
+            return
+        import tkinter.simpledialog as sd
+        slug = sd.askstring(
+            "Save to Brain",
+            "Brain page slug (e.g. notes/my-topic):",
+            parent=self)
+        if not slug:
+            return
+        self.whimai_status_var.set(f"Saving to brain: {slug}...")
+        last_user = ""
+        for msg in reversed(self._whimai_chat_history):
+            if msg.get("role") == "user" and msg.get("content", "").strip():
+                last_user = msg["content"]
+                break
+        from datetime import datetime
+        page_content = (
+            f"---\n"
+            f"title: \"{slug.rsplit('/', 1)[-1].replace('-', ' ').title()}\"\n"
+            f"type: note\n"
+            f"tags: [whimai, chat-capture]\n"
+            f"source: whim-terminal\n"
+            f"captured: {datetime.now().isoformat()}\n"
+            f"---\n\n"
+        )
+        if last_user:
+            page_content += f"## Prompt\n{last_user}\n\n"
+        page_content += f"## Response\n{last_ai}\n"
+        def _save():
+            import subprocess as _sp
+            try:
+                proc = _sp.Popen(
+                    [self._GBRAIN_BUN, "run", self._GBRAIN_CLI, "put", slug],
+                    stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE,
+                    text=True, cwd=self._GBRAIN_DIR)
+                out, err = proc.communicate(input=page_content, timeout=15)
+                if proc.returncode == 0:
+                    self.after(0, lambda: self.whimai_status_var.set(f"Saved to brain: {slug}"))
+                    self.after(0, self._brain_health_poll)
+                else:
+                    self.after(0, lambda: self.whimai_status_var.set(f"Brain save failed"))
+            except Exception as ex:
+                self.after(0, lambda: self.whimai_status_var.set(f"Brain error: {ex}"))
+        threading.Thread(target=_save, daemon=True).start()
+
     def _whimai_make_task(self):
         if not self._whimai_chat_history:
             return
@@ -6543,6 +6619,34 @@ class ModernApp(tk.Tk):
             self._hw_vram_lbl.config(text="VRAM --", fg=TH["fg2"])
         if model_name:
             self._hw_model_lbl.config(text=model_name)
+
+    def _brain_health_poll(self):
+        def _check():
+            rc, out, _ = self._gbrain_exec(["stats"], timeout=8)
+            if rc == 0:
+                pages = 0
+                for line in out.splitlines():
+                    if "Pages:" in line:
+                        try:
+                            pages = int(line.split(":")[1].strip())
+                        except Exception:
+                            pass
+                        break
+                self.after(0, lambda: self._brain_health_update(True, pages))
+            else:
+                self.after(0, lambda: self._brain_health_update(False, 0))
+        threading.Thread(target=_check, daemon=True).start()
+        self.after(30000, self._brain_health_poll)
+
+    def _brain_health_update(self, ok, pages):
+        if ok:
+            self._brain_health_canvas.itemconfigure(self._brain_health_dot, fill="#2fa572")
+            self._brain_health_lbl.config(fg=TH["fg"])
+            self._brain_pages_lbl.config(text=f"{pages}pg", fg=TH["fg2"])
+        else:
+            self._brain_health_canvas.itemconfigure(self._brain_health_dot, fill="#8a7a6a")
+            self._brain_health_lbl.config(fg=TH["fg2"])
+            self._brain_pages_lbl.config(text="offline", fg=TH["fg_dim"])
 
     def _whimai_start_telemetry_poll(self):
         if self._whimai_telemetry_polling:
@@ -21170,14 +21274,31 @@ camFlipBtn.addEventListener('click',()=>{
 
         detail_frame = tk.Frame(paned, bg=TH["bg"])
         paned.add(detail_frame)
-        self._brain_ent_detail = tk.Text(detail_frame, bg=TH["input"], fg=TH["fg"],
+
+        detail_paned = tk.PanedWindow(detail_frame, orient="vertical", bg=TH["bg"],
+                                      sashwidth=4, sashrelief="flat")
+        detail_paned.pack(fill="both", expand=True)
+
+        text_frame = tk.Frame(detail_paned, bg=TH["bg"])
+        detail_paned.add(text_frame, height=250)
+        self._brain_ent_detail = tk.Text(text_frame, bg=TH["input"], fg=TH["fg"],
                                          font=(_FONTS["mono"], 9),
                                          relief="flat", bd=1, highlightthickness=0,
                                          state="disabled", wrap="word")
-        det_scroll = self._scrollbar(detail_frame, command=self._brain_ent_detail.yview)
+        det_scroll = self._scrollbar(text_frame, command=self._brain_ent_detail.yview)
         self._brain_ent_detail.configure(yscrollcommand=det_scroll.set)
         det_scroll.pack(side="right", fill="y")
         self._brain_ent_detail.pack(fill="both", expand=True)
+
+        graph_frame = tk.Frame(detail_paned, bg=TH["bg"])
+        detail_paned.add(graph_frame)
+        graph_hdr = tk.Frame(graph_frame, bg=TH["card"])
+        graph_hdr.pack(fill="x")
+        tk.Label(graph_hdr, text="BACKLINK GRAPH", bg=TH["card"], fg="#8a7a6a",
+                 font=(_FONTS["mono"], 8, "bold"), padx=8, pady=3).pack(side="left")
+        self._brain_graph_canvas = tk.Canvas(graph_frame, bg=TH["input"],
+                                             highlightthickness=0, bd=1, relief="flat")
+        self._brain_graph_canvas.pack(fill="both", expand=True, pady=(2, 0))
 
         self._brain_ent_slugs = []
 
@@ -21569,13 +21690,57 @@ camFlipBtn.addEventListener('click',()=>{
         def _load():
             rc, page, err = self._gbrain_exec(["get", slug])
             parts = [page if rc == 0 else f"Error loading: {err[:200]}"]
+            backlink_slugs = []
             rc2, bl, _ = self._gbrain_exec(["backlinks", slug])
             if rc2 == 0 and bl.strip():
                 parts.append(f"\n{'='*50}\nBACKLINKS\n{'='*50}\n{bl}")
+                for line in bl.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("(") and not line.startswith("-") and not line.startswith("="):
+                        token = line.split()[0] if " " in line else line
+                        if "/" in token or token.replace("-", "").isalnum():
+                            backlink_slugs.append(token)
             result = "\n".join(parts)
             self.after(0, lambda: self._brain_set_widget(self._brain_ent_detail, result))
             self.after(0, lambda: self._brain_ent_status.config(text="", fg=TH["green"]))
+            self.after(0, lambda: self._brain_draw_backlink_graph(slug, backlink_slugs))
         threading.Thread(target=_load, daemon=True).start()
+
+    def _brain_draw_backlink_graph(self, center_slug, backlink_slugs):
+        c = self._brain_graph_canvas
+        c.delete("all")
+        c.update_idletasks()
+        w = max(c.winfo_width(), 300)
+        h = max(c.winfo_height(), 180)
+        cx, cy = w // 2, h // 2
+        center_name = center_slug.rsplit("/", 1)[-1].replace("-", " ").title()
+        c.create_oval(cx - 28, cy - 28, cx + 28, cy + 28,
+                      fill="#1a3a2a", outline="#2fa572", width=2)
+        c.create_text(cx, cy, text=center_name[:16], fill="#2fa572",
+                      font=(_FONTS["mono"], 8, "bold"), width=50)
+        if not backlink_slugs:
+            c.create_text(cx, cy + 50, text="(no backlinks)",
+                          fill=TH["fg_dim"], font=(_FONTS["mono"], 8))
+            return
+        import math
+        count = len(backlink_slugs)
+        radius = min(w, h) * 0.35
+        for i, bl_slug in enumerate(backlink_slugs[:12]):
+            angle = (2 * math.pi * i / min(count, 12)) - math.pi / 2
+            nx = cx + int(radius * math.cos(angle))
+            ny = cy + int(radius * math.sin(angle))
+            c.create_line(cx, cy, nx, ny, fill="#3a3a3a", width=1, dash=(3, 3))
+            node_color = "#e8793a" if "people" in bl_slug else \
+                         "#4a7aff" if "companies" in bl_slug else \
+                         "#e0a030" if "devices" in bl_slug else "#aaaaaa"
+            c.create_oval(nx - 18, ny - 18, nx + 18, ny + 18,
+                          fill=TH["input"], outline=node_color, width=1)
+            name = bl_slug.rsplit("/", 1)[-1].replace("-", " ").title()
+            c.create_text(nx, ny, text=name[:12], fill=node_color,
+                          font=(_FONTS["mono"], 7), width=34)
+        if count > 12:
+            c.create_text(cx, h - 12, text=f"+{count - 12} more",
+                          fill=TH["fg_dim"], font=(_FONTS["mono"], 7))
 
     # ── Operations helpers ──────────────────────────────────────────
 

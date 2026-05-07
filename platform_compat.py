@@ -15,6 +15,10 @@ IS_LINUX = sys.platform.startswith("linux")
 
 HOME = os.path.expanduser("~")
 
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_WHIM_ROOT = os.path.dirname(_APP_DIR)
+_ASSETS_DIR = os.path.join(_WHIM_ROOT, "assets")
+
 
 # ── Path Defaults ──
 
@@ -36,8 +40,9 @@ def default_paths():
             "whim_settings":     os.path.join(openclaw_dir, "whim_settings.json"),
             "voice_engine_cfg":  os.path.join(openclaw_dir, "voice_engine.json"),
             "sessions_store":    os.path.join(openclaw_dir, "whim_sessions.json"),
-            "whim_icon":         os.path.join(openclaw_dir, "Whim.png"),
-            "fonts_dir":         os.path.join(openclaw_dir, "WhimUI", "fonts"),
+            "whim_icon":         os.path.join(_ASSETS_DIR, "Whim.png"),
+            "fonts_dir":         os.path.join(_ASSETS_DIR, "fonts"),
+            "icons_dir":         os.path.join(_ASSETS_DIR, "icons"),
             "journal_dir":       os.path.join(HOME, "Documents", "Whim", "Journal"),
             "archive_dir":       os.path.join(HOME, "Documents", "Whim", "ARCHIVE"),
             "transcript_dir":    os.path.join(HOME, "Documents", "Whim", "TRANSCRIPT"),
@@ -65,8 +70,9 @@ def default_paths():
             "whim_settings":     os.path.join(openclaw_dir, "whim_settings.json"),
             "voice_engine_cfg":  os.path.join(openclaw_dir, "voice_engine.json"),
             "sessions_store":    os.path.join(openclaw_dir, "whim_sessions.json"),
-            "whim_icon":         os.path.join(openclaw_dir, "Whim.png"),
-            "fonts_dir":         os.path.join(openclaw_dir, "WhimUI", "fonts"),
+            "whim_icon":         os.path.join(_ASSETS_DIR, "Whim.png"),
+            "fonts_dir":         os.path.join(_ASSETS_DIR, "fonts"),
+            "icons_dir":         os.path.join(_ASSETS_DIR, "icons"),
             "journal_dir":       os.path.join(HOME, "Documents", "Whim", "Journal"),
             "archive_dir":       os.path.join(HOME, "Documents", "Whim", "ARCHIVE"),
             "transcript_dir":    os.path.join(HOME, "Documents", "Whim", "TRANSCRIPT"),
@@ -94,8 +100,9 @@ def default_paths():
             "whim_settings":     os.path.join(openclaw_dir, "whim_settings.json"),
             "voice_engine_cfg":  os.path.join(openclaw_dir, "voice_engine.json"),
             "sessions_store":    os.path.join(openclaw_dir, "whim_sessions.json"),
-            "whim_icon":         os.path.join(openclaw_dir, "Whim.png"),
-            "fonts_dir":         os.path.join(openclaw_dir, "WhimUI", "fonts"),
+            "whim_icon":         os.path.join(_ASSETS_DIR, "Whim.png"),
+            "fonts_dir":         os.path.join(_ASSETS_DIR, "fonts"),
+            "icons_dir":         os.path.join(_ASSETS_DIR, "icons"),
             "journal_dir":       os.path.expanduser("~/Journal"),
             "archive_dir":       os.path.expanduser("~/ARCHIVE"),
             "transcript_dir":    os.path.expanduser("~/TRANSCRIPT"),
@@ -376,18 +383,19 @@ def kill_process(name):
 
 def play_audio(path):
     if IS_MAC:
-        subprocess.Popen(["afplay", path],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return subprocess.Popen(["afplay", path],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     elif IS_WINDOWS:
         try:
             import winsound
             winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return None
         except Exception:
-            subprocess.Popen(["ffplay", "-autoexit", "-nodisp", path],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return subprocess.Popen(["ffplay", "-autoexit", "-nodisp", path],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        subprocess.Popen(["ffplay", "-autoexit", "-nodisp", path],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return subprocess.Popen(["ffplay", "-autoexit", "-nodisp", path],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def has_ffmpeg():
@@ -457,7 +465,7 @@ def platform_fonts():
         return {
             "ui":    "Segoe UI",
             "mono":  "Consolas",
-            "title": "Segoe UI",
+            "title": "28 Days Later",
             "emoji": "Noto Color Emoji",
         }
 

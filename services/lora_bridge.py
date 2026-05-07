@@ -34,6 +34,19 @@ def load_fence(path):
     return [(v[0], v[1]) for v in data.get("vertices", [])]
 
 
+def load_collar_names(path):
+    """Load collar name mappings from the fence config file."""
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return {c["id"]: c.get("name", c["id"])
+                for c in data.get("collars", [])}
+    except (json.JSONDecodeError, IOError, KeyError):
+        return {}
+
+
 def point_in_polygon(lat, lon, polygon):
     """Ray-casting algorithm for point-in-polygon."""
     n = len(polygon)
@@ -181,11 +194,13 @@ class SimulatedListener:
     def run(self):
         import random
         emit({"info": "Simulated LoRa bridge active"})
+        saved_names = load_collar_names(self.fence_path)
         collars = []
         for i in range(self.count):
+            cid = f"C{i+1:03d}"
             collars.append({
-                "collar_id": f"C{i+1:03d}",
-                "name": f"Cow-{i+1}",
+                "collar_id": cid,
+                "name": saved_names.get(cid, f"Animal-{i+1}"),
                 "lat": 36.35 + random.uniform(-0.01, 0.01),
                 "lon": -93.20 + random.uniform(-0.01, 0.01),
                 "battery": random.randint(60, 100),

@@ -7,7 +7,7 @@ import queue
 import uuid
 import tkinter as tk
 import tkinter.font as tkFont
-from tkinter import ttk, filedialog, colorchooser, messagebox
+from tkinter import ttk, filedialog, colorchooser, messagebox, simpledialog
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import io
@@ -21,6 +21,12 @@ import fnmatch
 import pystray
 import base64
 import time
+import webbrowser
+import tempfile
+try:
+    import websockets
+except ImportError:
+    websockets = None
 try:
     import pystay
 except ImportError:
@@ -41,7 +47,84 @@ from platform_compat import (
     disk_usage_gb, platform_fonts, configure_dpi, list_audio_monitor_sources,
     start_audio_capture,
 )
+from whim_model_router import route_stream as _route_stream, check_ollama as _check_ollama
+from whim_ai_bridge import (
+    match_intent, proxy_match, get_latest_audio, get_latest_trv, get_latest_upload,
+    PLAYBACK_PRIORITY_PROMPT,
+    INTENT_PLAY_LAST_AUDIO, INTENT_PLAY_TRV, INTENT_WHAT_WAS_TRV,
+    INTENT_ARC_SPEAK, INTENT_ARC_READ, INTENT_ARC_LIST, INTENT_ARC_SEARCH,
+    INTENT_LAST_PHONE_NOTES, INTENT_LAST_TRV_RECORDING,
+    PROXY_INTENT_AUDIO, PROXY_INTENT_ARCHIVE,
+)
 from whim_config import CONFIG as _USER_CFG
+from opentailor import ToolRegistry, PresetArchitect, SafetyGate
+
+# -- Load distilled agent execution logic (persists across reboots) --------
+_AGENT_LOGIC_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "skills", "whim_agent_logic.json")
+_AGENT_LOGIC_PROMPT = ""
+try:
+    with open(_AGENT_LOGIC_PATH, "r", encoding="utf-8") as _alf:
+        _agent_logic = json.loads(_alf.read())
+    _el = _agent_logic.get("execution_logic", {})
+    _s1 = _el.get("step_1_classify", {})
+    _s2 = _el.get("step_2_resolve", {})
+    _s3 = _el.get("step_3_converse", {})
+    _ct = _s2.get("command_table", {})
+    _lines = [
+        "\n\n## EXECUTION LOGIC (3-Step Gate)",
+        f"**Overview:** {_el.get('overview', '')}",
+        "",
+        f"### Step 1 — {_s1.get('name', 'CLASSIFY')}",
+        f"{_s1.get('description', '')}",
+        f"Rule: {_s1.get('rule', '')}",
+        "",
+        f"### Step 2 — {_s2.get('name', 'RESOLVE')}",
+        f"{_s2.get('description', '')}",
+    ]
+    for category, mapping in _ct.items():
+        if isinstance(mapping, dict):
+            cmds = [f"{k}={v}" for k, v in mapping.items() if k != "decision_logic"]
+            logic = mapping.get("decision_logic", "")
+            _lines.append(f"- **{category}**: {', '.join(cmds)}. {logic}")
+    _lines += [
+        f"Rule: {_s2.get('rule', '')}",
+        "",
+        f"### Step 3 — {_s3.get('name', 'CONVERSE')}",
+        f"{_s3.get('description', '')}",
+    ]
+    for g in _s3.get("guidelines", []):
+        _lines.append(f"- {g}")
+    _ec = _agent_logic.get("edge_cases", {})
+    if _ec:
+        _lines.append("\n### Edge Cases")
+        for k, v in _ec.items():
+            _lines.append(f"- **{k}**: {v}")
+    _AGENT_LOGIC_PROMPT = "\n".join(_lines)
+except Exception:
+    pass
+try:
+    from geof_map_embed import TileMapRenderer
+    _HAS_MAP_EMBED = True
+except ImportError:
+    _HAS_MAP_EMBED = False
+
+try:
+    from avatar_server import start_in_thread as _avatar_start, stream_audio_visemes as _avatar_stream
+    _HAS_AVATAR = True
+except ImportError:
+    _HAS_AVATAR = False
+    def _avatar_start(*a, **kw): pass
+    def _avatar_stream(*a, **kw): pass
+
+from freshtail import FreshTail, TAIL_PROFILES
+
+try:
+    from speech_pipeline import SpeechPipeline
+    _HAS_SPEECH = True
+except ImportError:
+    _HAS_SPEECH = False
+    SpeechPipeline = None
 
 _PLAT_PATHS = PATHS
 _FONTS = platform_fonts()
@@ -73,17 +156,67 @@ WHIM_FONTS_DIR = _PLAT_PATHS.get("fonts_dir", "")
 SESSIONS_STORE = _PLAT_PATHS.get("sessions_store", "")
 VOICE_ENGINE_CONFIG = _PLAT_PATHS.get("voice_engine_cfg", "")
 WHIM_SETTINGS_FILE = _PLAT_PATHS.get("whim_settings", "")
+THEME_STATE_FILE = os.path.join(os.path.dirname(WHIM_SETTINGS_FILE), "theme_state.json") if WHIM_SETTINGS_FILE else ""
+USER_GUIDE_COMMENTS_FILE = os.path.join(os.path.dirname(WHIM_SETTINGS_FILE), "user_guide_comments.json") if WHIM_SETTINGS_FILE else ""
 WHIM_M_SCRIPT = ""
 WHIM_M_DEVICE_DIR = ""
 
+# ── OpenFang kernel integration ─────────────────────────────────
+KICKBACKS_DIR = os.path.join(ARCHIVE_DIR, "kickbacks")
+OPENFANG_STATE_FILE = os.path.join(KICKBACKS_DIR, ".kernel_state")
+
 DEFAULT_MODELS = _USER_CFG.get("default_models", [
+    "deepseek-r1:32b",
     "llama3.1:8b-16k",
     "llama3.1:8b",
-    "deepseek-r1:32b",
 ])
 AUDIO_CAPTURE_DIR = _PLAT_PATHS.get("audio_capture_dir", os.path.expanduser("~/Journal/audio_captures"))
 PERSONA_DIR = _PLAT_PATHS.get("persona_dir", "")
 PERSONA_CONFIG = _PLAT_PATHS.get("persona_config", "")
+
+# ── Model awareness manifest ───────────────────────────────────
+MODEL_STRENGTHS = {
+    "deepseek-r1":  "deep reasoning, logic, math, and complex analysis",
+    "llama3.1":     "creative writing, general chat, and conversational tasks",
+    "qwen3-coder":  "instruction following, code generation, and tool use",
+}
+
+class WhimEnvironment:
+    """Tracks available models and builds a dynamic system-prompt manifest."""
+
+    def __init__(self, ollama_url="http://localhost:11434"):
+        self.ollama_url = ollama_url
+        self.available_models = list(DEFAULT_MODELS)
+        self.current_model = DEFAULT_MODELS[0] if DEFAULT_MODELS else ""
+
+    def refresh_models(self, model_names):
+        if model_names:
+            self.available_models = list(model_names)
+
+    def set_current(self, model_name):
+        self.current_model = model_name
+
+    def _strength_for(self, model_name):
+        for key, desc in MODEL_STRENGTHS.items():
+            if key in model_name:
+                return desc
+        return "general-purpose assistant"
+
+    def build_manifest(self):
+        siblings = []
+        for m in self.available_models:
+            tag = " (active)" if m == self.current_model else ""
+            siblings.append(f"  - {m}: {self._strength_for(m)}{tag}")
+        roster = "\n".join(siblings)
+        return (
+            f"You are currently running as {self.current_model} inside the Whim Terminal.\n"
+            f"Your specialty: {self._strength_for(self.current_model)}.\n"
+            f"There are {len(self.available_models)} LLMs assigned to this terminal:\n"
+            f"{roster}\n"
+            "You may suggest switching to a sibling model when a task better suits "
+            "its strengths (e.g. 'This looks like a reasoning task — consider switching "
+            "to deepseek-r1:32b')."
+        )
 
 _WHIM_ICON_B64 = ""
 _whim_icon_path = _PLAT_PATHS.get("whim_icon", "")
@@ -156,6 +289,7 @@ def _tunnel_tray_label(tunnel_up, whim_up):
 
 incoming = queue.Queue()
 outgoing = queue.Queue()
+_ws_connected = threading.Event()
 
 # ==================== DARK THEME PALETTE ====================
 TH = {
@@ -183,8 +317,52 @@ TH = {
     "font_hero":   (_FONTS["ui"], 18, "bold"),
 }
 
+THEME_PALETTES = {
+    "Dark (Whim)": {
+        "bg": "#141210", "card": "#2a2420", "input": "#0c0a08",
+        "border": "#2a2420", "border_hi": "#8a7a6a",
+        "btn": "#e8793a", "btn_hover": "#c4382a", "btn_border": "#8a7a6a",
+        "fg": "#f5e6d3", "fg2": "#8a7a6a", "fg_dim": "#8a7a6a",
+        "green": "#e8793a", "red": "#c4382a", "yellow": "#e8793a",
+        "blue_text": "#e8793a", "select_bg": "#c4382a",
+    },
+    "Midnight": {
+        "bg": "#0b0e17", "card": "#141828", "input": "#080b12",
+        "border": "#141828", "border_hi": "#3a4a6a",
+        "btn": "#4a7aff", "btn_hover": "#3358cc", "btn_border": "#3a4a6a",
+        "fg": "#d0d8e8", "fg2": "#5a6a8a", "fg_dim": "#5a6a8a",
+        "green": "#4a7aff", "red": "#e04050", "yellow": "#c8a030",
+        "blue_text": "#6a9eff", "select_bg": "#2a3a6a",
+    },
+    "Solarized Dark": {
+        "bg": "#002b36", "card": "#073642", "input": "#00212b",
+        "border": "#073642", "border_hi": "#586e75",
+        "btn": "#b58900", "btn_hover": "#cb4b16", "btn_border": "#586e75",
+        "fg": "#eee8d5", "fg2": "#839496", "fg_dim": "#657b83",
+        "green": "#859900", "red": "#dc322f", "yellow": "#b58900",
+        "blue_text": "#268bd2", "select_bg": "#073642",
+    },
+}
+
+def _apply_theme_to_th(theme_name):
+    palette = THEME_PALETTES.get(theme_name)
+    if not palette:
+        return
+    for key, val in palette.items():
+        TH[key] = val
+
+if os.path.isfile(WHIM_SETTINGS_FILE):
+    try:
+        with open(WHIM_SETTINGS_FILE) as _f:
+            _startup_theme = json.load(_f).get("theme", "Dark (Whim)")
+        _apply_theme_to_th(_startup_theme)
+    except Exception:
+        pass
+
 
 class ToggleSwitch(tk.Canvas):
+    _SUPERSAMPLE = 4
+
     def __init__(self, parent, text="", variable=None, width=50, height=24,
                  on_color=TH["green"], off_color="#8a7a6a", bg=None, font=TH["font_sm"], **kw):
         try:
@@ -196,11 +374,13 @@ class ToggleSwitch(tk.Canvas):
                          highlightthickness=0, bd=0, **kw)
         self._sw = width
         self._sh = height
+        self._bg_color = bg
         self._on_color = on_color
         self._off_color = off_color
         self._var = variable or tk.BooleanVar(value=False)
         self._text = text
         self._font = font
+        self._photo = None
         self._draw()
         self.bind("<Button-1>", self._toggle)
         self.config(cursor="hand2")
@@ -208,14 +388,40 @@ class ToggleSwitch(tk.Canvas):
     def _draw(self):
         self.delete("all")
         on = self._var.get()
-        r = self._sh // 2
+        ss = self._SUPERSAMPLE
+        w, h = self._sw * ss, self._sh * ss
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
         fill = self._on_color if on else self._off_color
-        self.create_oval(0, 0, self._sh, self._sh, fill=fill, outline="")
-        self.create_oval(self._sw - self._sh, 0, self._sw, self._sh, fill=fill, outline="")
-        self.create_rectangle(r, 0, self._sw - r, self._sh, fill=fill, outline="")
-        knob_x = self._sw - self._sh + 2 if on else 2
-        self.create_oval(knob_x, 2, knob_x + self._sh - 4, self._sh - 2,
-                         fill="#ffffff", outline="")
+        r = h // 2
+        draw.ellipse([0, 0, h, h], fill=fill)
+        draw.ellipse([w - h, 0, w, h], fill=fill)
+        draw.rectangle([r, 0, w - r, h], fill=fill)
+        pad = 2 * ss
+        knob_r = (h - 2 * pad) // 2
+        if on:
+            cx = w - pad - knob_r
+        else:
+            cx = pad + knob_r
+        cy = h // 2
+        shadow_off = max(1, ss // 2)
+        draw.ellipse([cx - knob_r + shadow_off, cy - knob_r + shadow_off,
+                      cx + knob_r + shadow_off, cy + knob_r + shadow_off],
+                     fill=(0, 0, 0, 40))
+        draw.ellipse([cx - knob_r, cy - knob_r, cx + knob_r, cy + knob_r],
+                     fill="#ffffff")
+        img = img.resize((self._sw, self._sh), Image.LANCZOS)
+        bg_img = Image.new("RGBA", (self._sw, self._sh), self._hex_to_rgba(self._bg_color))
+        bg_img.paste(img, (0, 0), img)
+        self._photo = ImageTk.PhotoImage(bg_img.convert("RGB"))
+        self.create_image(0, 0, anchor="nw", image=self._photo)
+
+    @staticmethod
+    def _hex_to_rgba(hex_color):
+        hex_color = hex_color.lstrip("#")
+        if len(hex_color) == 6:
+            return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4)) + (255,)
+        return (20, 18, 16, 255)
 
     def _toggle(self, event=None):
         self._var.set(not self._var.get())
@@ -298,35 +504,39 @@ def new_id(prefix="req"):
 
 class GatewayClient:
     async def connect(self, ws_url, token, scopes):
-        async with websockets.connect(ws_url) as ws:
-            challenge = json.loads(await ws.recv())
-            incoming.put(("event", challenge))
-            nonce = challenge["payload"]["nonce"]
-            ts = challenge["payload"]["ts"]
-            connect_req = {
-                "type": "req", "id": new_id("connect"), "method": "connect",
-                "params": {
-                    "minProtocol": 3, "maxProtocol": 3,
-                    "client": {"id": "tkui", "version": "0.2.0", "platform": "linux", "mode": "operator"},
-                    "role": "operator", "scopes": scopes,
-                    "auth": {"token": token} if token else {},
-                    "locale": "en-US",
-                    "userAgent": "whim/0.2.0",
-                    "device": {"id": "tkui-local", "publicKey": "", "signature": "", "signedAt": ts, "nonce": nonce},
+        try:
+            async with websockets.connect(ws_url) as ws:
+                challenge = json.loads(await ws.recv())
+                incoming.put(("event", challenge))
+                nonce = challenge["payload"]["nonce"]
+                ts = challenge["payload"]["ts"]
+                connect_req = {
+                    "type": "req", "id": new_id("connect"), "method": "connect",
+                    "params": {
+                        "minProtocol": 3, "maxProtocol": 3,
+                        "client": {"id": "tkui", "version": "0.2.0", "platform": "linux", "mode": "operator"},
+                        "role": "operator", "scopes": scopes,
+                        "auth": {"token": token} if token else {},
+                        "locale": "en-US",
+                        "userAgent": "whim/0.2.0",
+                        "device": {"id": "tkui-local", "publicKey": "", "signature": "", "signedAt": ts, "nonce": nonce},
+                    }
                 }
-            }
-            await ws.send(json.dumps(connect_req))
-            while True:
-                try:
-                    while True:
-                        msg = outgoing.get_nowait()
-                        await ws.send(json.dumps(msg))
-                except queue.Empty: pass
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=0.1)
-                    packet = json.loads(raw)
-                    incoming.put(("ws", packet))
-                except asyncio.TimeoutError: pass
+                await ws.send(json.dumps(connect_req))
+                _ws_connected.set()
+                while True:
+                    try:
+                        while True:
+                            msg = outgoing.get_nowait()
+                            await ws.send(json.dumps(msg))
+                    except queue.Empty: pass
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=0.1)
+                        packet = json.loads(raw)
+                        incoming.put(("ws", packet))
+                    except asyncio.TimeoutError: pass
+        finally:
+            _ws_connected.clear()
 
 def start_ws_thread(ws_url, token, scopes):
     threading.Thread(target=lambda: asyncio.run(GatewayClient().connect(ws_url, token, scopes)), daemon=True).start()
@@ -355,6 +565,9 @@ MOBILE_UPLOAD_HTML = r"""<!DOCTYPE html>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#1e1e1e">
 <link rel="manifest" href="/manifest.json">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,600;1,600&display=swap" rel="stylesheet">
 <title>Whim.m</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
@@ -433,18 +646,68 @@ input[type=file]{display:none}
 .ai-sub{color:#555;font-size:11px;margin:2px 0 0}
 .ai-chat{flex:1;width:100%;max-width:420px;background:#111111;border:1px solid #3a3a3a;
   border-radius:10px;overflow-y:auto;padding:12px;margin-bottom:12px;min-height:200px}
-.ai-msg{margin-bottom:10px;line-height:1.5;font-size:14px;word-wrap:break-word;white-space:pre-wrap}
+.ai-msg{margin-bottom:10px;line-height:1.5;font-size:14px;word-wrap:break-word;white-space:pre-wrap;font-family:'Montserrat',sans-serif;font-weight:600}
 .ai-msg.user{color:#00ff00}
 .ai-msg.assistant{color:#e08030}
+.ai-msg.assistant em,.ai-msg.assistant i{font-style:italic}
 .ai-msg .msg-prefix{font-weight:700;font-size:11px;opacity:.6;display:block;margin-bottom:2px}
 .ai-input-wrap{width:100%;max-width:420px;display:flex;gap:8px;padding-bottom:env(safe-area-inset-bottom)}
 .ai-input{flex:1;padding:12px;background:#2b2b2b;color:#dce4ee;border:1px solid #3a3a3a;
-  border-radius:10px;font-size:15px;outline:none;font-family:inherit}
+  border-radius:10px;font-size:15px;outline:none;font-family:'Montserrat',sans-serif;font-weight:600}
 .ai-input:focus{border-color:#00ff00}
 .ai-send{padding:12px 20px;background:#2fa572;color:#fff;border:none;border-radius:10px;
   font-size:15px;font-weight:600;cursor:pointer}
 .ai-send:active{background:#248a5e}
 .ai-send:disabled{background:#333;color:#555;cursor:default}
+.geof-fab{position:fixed;top:8px;right:104px;z-index:300;width:38px;height:38px;border-radius:50%;
+  background:#2b2b2b;border:1.5px solid #3a3a3a;cursor:pointer;display:flex;align-items:center;
+  justify-content:center;transition:all .2s;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+.geof-fab:active{transform:scale(0.92)}
+.geof-fab.active{border-color:#e8793a;background:#2a1a0a}
+.geof-fab svg{width:18px;height:18px}
+.geof-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:#1e1e1e;z-index:250;
+  display:flex;flex-direction:column;align-items:center;padding:12px 16px max(12px,env(safe-area-inset-bottom));
+  transform:translateX(100%);transition:transform .3s cubic-bezier(.4,0,.2,1)}
+.geof-overlay.open{transform:translateX(0)}
+.geof-close{position:absolute;top:10px;left:12px;background:none;border:none;color:#888;
+  font-size:28px;cursor:pointer;padding:4px 10px;z-index:260}
+.geof-close:active{color:#fff}
+.geof-title{color:#e8793a;font-size:20px;font-family:'Courier New',monospace;margin:44px 0 4px;letter-spacing:1px}
+.geof-sub{color:#555;font-size:11px;margin-bottom:16px}
+.geof-capture-btn{width:100%;max-width:360px;padding:16px;border:none;border-radius:10px;
+  font-size:17px;font-weight:600;cursor:pointer;background:#e8793a;color:#fff;transition:all .2s;
+  margin-bottom:12px}
+.geof-capture-btn:active{background:#c5622c}
+.geof-capture-btn:disabled{background:#333;color:#555;cursor:default}
+.geof-capture-btn.capturing{animation:pulse-geof 1.5s infinite}
+@keyframes pulse-geof{0%,100%{box-shadow:0 0 0 0 rgba(232,121,58,0.4)}50%{box-shadow:0 0 0 12px rgba(232,121,58,0)}}
+.geof-label-row{width:100%;max-width:360px;display:flex;gap:8px;margin-bottom:12px}
+.geof-label-input{flex:1;padding:10px;background:#2b2b2b;color:#dce4ee;border:1px solid #3a3a3a;
+  border-radius:8px;font-size:14px;outline:none}
+.geof-label-input:focus{border-color:#e8793a}
+.geof-sync-btn{width:100%;max-width:360px;padding:14px;border:none;border-radius:10px;
+  font-size:15px;font-weight:600;cursor:pointer;background:#2fa572;color:#fff;transition:all .2s;
+  margin-bottom:12px}
+.geof-sync-btn:active{background:#248a5e}
+.geof-sync-btn:disabled{background:#333;color:#555;cursor:default}
+.geof-status{text-align:center;padding:8px 12px;border-radius:8px;font-size:13px;margin-bottom:12px;
+  max-width:360px;width:100%;display:none}
+.geof-status.ok{display:block;background:#1a3a2a;color:#2fa572}
+.geof-status.err{display:block;background:#3a1a1a;color:#d94040}
+.geof-status.warn{display:block;background:#3a2a0a;color:#e0a030}
+.geof-status.info{display:block;background:#1a2a3a;color:#14a0ff}
+.geof-points{width:100%;max-width:360px;flex:1;overflow-y:auto}
+.geof-points h2{color:#555;font-size:11px;text-transform:uppercase;letter-spacing:2px;margin-bottom:8px}
+.geof-pt{background:#2b2b2b;border:1px solid #3a3a3a;border-radius:8px;padding:10px 12px;
+  margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+.geof-pt.buffered{border-color:#e0a030;border-style:dashed}
+.geof-pt .gp-info{font-size:13px;color:#aaa;word-break:break-all}
+.geof-pt .gp-label{font-size:11px;color:#e8793a;font-weight:600}
+.geof-pt .gp-coords{font-size:11px;color:#666;font-family:'Courier New',monospace}
+.geof-pt .gp-del{background:none;border:none;color:#d94040;font-size:16px;cursor:pointer;padding:4px 8px}
+.geof-accuracy{font-size:12px;color:#555;font-family:'Courier New',monospace;margin-bottom:8px;
+  max-width:360px;text-align:center}
+.geof-count{font-size:12px;color:#888;text-align:center;margin-bottom:8px}
 </style></head><body>
 
 <div class="health-bar" id="healthBar">
@@ -456,6 +719,11 @@ input[type=file]{display:none}
 <div class="ss-fab" id="ssFab" title="Screen Share">
 <svg viewBox="0 0 24 24" fill="none" stroke="#14507a" stroke-width="2">
 <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+</div>
+
+<div class="geof-fab" id="geofFab" title="GeoF Walk">
+<svg viewBox="0 0 24 24" fill="none" stroke="#e8793a" stroke-width="2">
+<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/></svg>
 </div>
 
 <div class="ai-fab" id="aiFab" title="Whim.ai">
@@ -506,6 +774,21 @@ input[type=file]{display:none}
 <input type="text" class="ai-input" id="aiInput" placeholder="Ask anything..." autocomplete="off">
 <button class="ai-send" id="aiSend">Send</button>
 </div>
+</div>
+
+<div class="geof-overlay" id="geofOverlay">
+<button class="geof-close" id="geofClose">&larr;</button>
+<h1 class="geof-title">GEOF WALK</h1>
+<p class="geof-sub">capture boundary points with phone GPS</p>
+<div class="geof-accuracy" id="geofAccuracy"></div>
+<div class="geof-label-row">
+<input type="text" class="geof-label-input" id="geofLabel" placeholder="Point label (e.g. NW corner)" autocomplete="off">
+</div>
+<button class="geof-capture-btn" id="geofCapture">CAPTURE GPS POINT</button>
+<button class="geof-sync-btn" id="geofSync" disabled>SYNC TO WHIM</button>
+<div class="geof-status" id="geofStatus"></div>
+<div class="geof-count" id="geofCount"></div>
+<div class="geof-points" id="geofPoints"></div>
 </div>
 
 <script>
@@ -726,6 +1009,116 @@ async function sendAiMsg(){
 }
 aiSend.addEventListener('click',sendAiMsg);
 aiInput.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendAiMsg()}});
+
+// --- GeoF Walk ---
+const geofFab=document.getElementById('geofFab'),geofOverlay=document.getElementById('geofOverlay'),
+  geofClose=document.getElementById('geofClose'),geofCapture=document.getElementById('geofCapture'),
+  geofSync=document.getElementById('geofSync'),geofStatus=document.getElementById('geofStatus'),
+  geofLabel=document.getElementById('geofLabel'),geofPointsEl=document.getElementById('geofPoints'),
+  geofCount=document.getElementById('geofCount'),geofAccuracy=document.getElementById('geofAccuracy');
+
+const GEOF_BUFFER_KEY='whim_geof_buffer';
+let geofBuffer=JSON.parse(localStorage.getItem(GEOF_BUFFER_KEY)||'[]');
+let geofServerPts=[];
+let geofCapturing=false;
+
+geofFab.addEventListener('click',()=>{geofOverlay.classList.add('open');geofFab.classList.add('active');
+  geofLoadServerPoints();geofRenderPoints()});
+geofClose.addEventListener('click',()=>{geofOverlay.classList.remove('open');geofFab.classList.remove('active')});
+
+function geofShowStatus(msg,cls){
+  geofStatus.textContent=msg;geofStatus.className='geof-status '+cls;
+  if(cls!=='info')setTimeout(()=>{geofStatus.style.display='none';geofStatus.className='geof-status'},5000);
+}
+
+function geofSaveBuffer(){localStorage.setItem(GEOF_BUFFER_KEY,JSON.stringify(geofBuffer))}
+
+geofCapture.addEventListener('click',()=>{
+  if(geofCapturing)return;
+  if(!navigator.geolocation){geofShowStatus('Geolocation not supported by this browser','err');return}
+  geofCapturing=true;geofCapture.disabled=true;geofCapture.classList.add('capturing');
+  geofCapture.textContent='ACQUIRING GPS...';
+  geofAccuracy.textContent='Waiting for satellite fix...';
+  navigator.geolocation.getCurrentPosition(
+    pos=>{
+      const lat=pos.coords.latitude,lon=pos.coords.longitude,acc=pos.coords.accuracy;
+      const label=geofLabel.value.trim()||('P'+(geofBuffer.length+geofServerPts.length+1));
+      geofBuffer.push({lat,lon,label,accuracy:acc,ts:Date.now()});
+      geofSaveBuffer();
+      geofAccuracy.textContent='Last fix: \u00b1'+acc.toFixed(1)+'m';
+      geofShowStatus('Captured '+label+' ('+lat.toFixed(6)+', '+lon.toFixed(6)+')','ok');
+      geofLabel.value='';geofCapturing=false;geofCapture.disabled=false;
+      geofCapture.classList.remove('capturing');geofCapture.textContent='CAPTURE GPS POINT';
+      geofSync.disabled=geofBuffer.length===0;geofRenderPoints();
+    },
+    err=>{
+      geofCapturing=false;geofCapture.disabled=false;
+      geofCapture.classList.remove('capturing');geofCapture.textContent='CAPTURE GPS POINT';
+      if(err.code===1)geofShowStatus('Permission Denied: Enable location in phone Settings > Apps > Whim.m > Permissions','err');
+      else if(err.code===2)geofShowStatus('Position Unavailable: Move outdoors or wait for GPS fix','err');
+      else if(err.code===3)geofShowStatus('GPS Timeout: Try again in an open area','err');
+      else geofShowStatus('GPS Error: '+err.message,'err');
+    },
+    {enableHighAccuracy:true,timeout:30000,maximumAge:0}
+  );
+});
+
+geofSync.addEventListener('click',async()=>{
+  if(!geofBuffer.length)return;
+  geofSync.disabled=true;geofSync.textContent='SYNCING...';
+  const points=geofBuffer.map(p=>({lat:p.lat,lon:p.lon,label:p.label}));
+  try{
+    const resp=await fetch('/api/geof/boundary',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({points})});
+    if(!resp.ok)throw new Error('Server error '+resp.status);
+    const data=await resp.json();
+    geofShowStatus('Synced '+data.added+' points ('+data.total_vertices+' total vertices)','ok');
+    geofBuffer=[];geofSaveBuffer();
+    geofLoadServerPoints();
+  }catch(e){
+    geofShowStatus('Sync failed: '+e.message+'. Points saved locally.','err');
+  }
+  geofSync.disabled=geofBuffer.length===0;geofSync.textContent='SYNC TO WHIM';
+  geofRenderPoints();
+});
+
+async function geofLoadServerPoints(){
+  try{
+    const r=await fetch('/api/geof/boundary',{method:'GET',signal:AbortSignal.timeout(5000)});
+    if(r.ok){const d=await r.json();geofServerPts=d.points||[];geofRenderPoints()}
+  }catch(e){geofShowStatus('Could not load fence points from terminal','warn')}
+}
+
+function geofRenderPoints(){
+  const total=geofServerPts.length+geofBuffer.length;
+  geofCount.textContent=total+' point'+(total!==1?'s':'')+' ('+geofBuffer.length+' buffered, '+geofServerPts.length+' synced)';
+  geofSync.disabled=geofBuffer.length===0;
+  let html='';
+  if(geofBuffer.length){
+    html+='<h2>Buffered (not yet synced)</h2>';
+    geofBuffer.forEach((p,i)=>{
+      html+='<div class="geof-pt buffered"><div class="gp-info"><div class="gp-label">'+
+        (p.label||'P'+(i+1))+'</div><div class="gp-coords">'+p.lat.toFixed(6)+', '+p.lon.toFixed(6)+
+        ' (\u00b1'+(p.accuracy||0).toFixed(0)+'m)</div></div>'+
+        '<button class="gp-del" onclick="geofDelBuffer('+i+')">\u2715</button></div>';
+    });
+  }
+  if(geofServerPts.length){
+    html+='<h2>Synced to Terminal</h2>';
+    geofServerPts.forEach(p=>{
+      html+='<div class="geof-pt"><div class="gp-info"><div class="gp-label">'+
+        (p.label||'P'+(p.index+1))+'</div><div class="gp-coords">'+
+        p.lat.toFixed(6)+', '+p.lon.toFixed(6)+'</div></div></div>';
+    });
+  }
+  if(!total)html='<p style="color:#555;text-align:center;margin-top:20px">No boundary points yet. Walk the fence and capture GPS points.</p>';
+  geofPointsEl.innerHTML=html;
+}
+
+function geofDelBuffer(i){geofBuffer.splice(i,1);geofSaveBuffer();geofRenderPoints()}
+
+geofRenderPoints();
 </script></body></html>"""
 
 MOBILE_UPLOAD_HTML = MOBILE_UPLOAD_HTML.replace("__WHIM_ICON_B64__", _WHIM_ICON_B64)
@@ -776,8 +1169,32 @@ class AudioUploadHandler(BaseHTTPRequestHandler):
             self._serve_text(WHIM_M_SW, "application/javascript")
         elif self.path in ("/icon-192.png", "/icon-512.png"):
             self._serve_pwa_icon(192 if "192" in self.path else 512)
+        elif self.path == "/api/geof/boundary":
+            self._serve_geof_boundary()
         else:
             self._serve_upload_page()
+
+    def _serve_geof_boundary(self):
+        """Return current fence boundary points as JSON for mobile display."""
+        fence_path = os.path.expanduser("~/.openclaw/fence_config.json")
+        fence = {"vertices": [], "collars": []}
+        if os.path.isfile(fence_path):
+            try:
+                with open(fence_path, "r") as fh:
+                    fence = json.load(fh)
+            except (json.JSONDecodeError, IOError):
+                pass
+        pts = []
+        for i, v in enumerate(fence.get("vertices", [])):
+            pts.append({"index": i, "lat": v[0], "lon": v[1],
+                         "label": v[2] if len(v) > 2 else ""})
+        data = json.dumps({"points": pts, "count": len(pts)}).encode("utf-8")
+        self.send_response(200)
+        self._cors_headers()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _serve_health(self):
         import urllib.request
@@ -801,8 +1218,78 @@ class AudioUploadHandler(BaseHTTPRequestHandler):
             self._handle_upload()
         elif self.path == "/api/chat":
             self._handle_ai_chat()
+        elif self.path == "/api/geof/boundary":
+            self._handle_geof_boundary()
         else:
             self.send_error(404)
+
+    def _handle_geof_boundary(self):
+        """Accept GPS boundary point(s) from Whim.m mobile and update fence config."""
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, ValueError) as exc:
+            if hasattr(self.server, "app") and hasattr(self.server.app, "_geof_log_alert"):
+                self.server.app.after(0, lambda: self.server.app._geof_log_alert(
+                    f"Mobile sync: Malformed JSON - {exc}", "alert"))
+            self.send_error(400, f"Invalid JSON: {exc}")
+            return
+
+        fence_path = os.path.expanduser("~/.openclaw/fence_config.json")
+        fence = {"vertices": [], "collars": []}
+        if os.path.isfile(fence_path):
+            try:
+                with open(fence_path, "r") as fh:
+                    fence = json.load(fh)
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        points = data.get("points", [])
+        if isinstance(data.get("lat"), (int, float)) and isinstance(data.get("lon"), (int, float)):
+            points = [{"lat": data["lat"], "lon": data["lon"],
+                        "label": data.get("label", "")}]
+
+        added = 0
+        for pt in points:
+            lat = pt.get("lat")
+            lon = pt.get("lon")
+            if lat is not None and lon is not None:
+                label = pt.get("label", "")
+                fence.setdefault("vertices", []).append([float(lat), float(lon), label])
+                added += 1
+
+        if added == 0:
+            resp = json.dumps({"status": "error", "message": "No valid points"}).encode("utf-8")
+            self.send_response(400)
+            self._cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
+        os.makedirs(os.path.dirname(fence_path), exist_ok=True)
+        with open(fence_path, "w") as fh:
+            json.dump(fence, fh, indent=2)
+
+        resp = json.dumps({
+            "status": "ok", "added": added,
+            "total_vertices": len(fence.get("vertices", []))
+        }).encode("utf-8")
+        self.send_response(200)
+        self._cors_headers()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+
+        if hasattr(self.server, "app"):
+            if hasattr(self.server.app, "_geof_log_alert"):
+                self.server.app.after(0, lambda: self.server.app._geof_log_alert(
+                    f"Mobile sync: {added} point(s) received from Whim.m", "ok"))
+            if hasattr(self.server.app, "_geof_reload_fence"):
+                self.server.app.after(0, self.server.app._geof_reload_fence)
 
     def _serve_upload_page(self):
         data = MOBILE_UPLOAD_HTML.encode("utf-8")
@@ -964,6 +1451,8 @@ class AudioUploadHandler(BaseHTTPRequestHandler):
         "ARCHIVE & FILES: archive.new, archive.save, archive.open, journal, ingest.\n"
         "FOLDER OPS: /browse <incoming|downloads|vaults> [query] (list/search folder), "
         "/search <query> (search across all three folders), /diagnose (run Whim health checks).\n"
+        "OPENFANG: /openfang (kernel status), /chk (read latest kickback), "
+        "/solve (feed kickback to AI for diagnosis).\n"
         "SYSTEM: You can read/write files, run shell commands, manage SmartThings devices, "
         "control SSH tunnel networking, manage sessions, and access all Whim subsystems.\n"
         "When the user issues a command, acknowledge it and describe what you would do. "
@@ -1178,6 +1667,7 @@ class ModernApp(tk.Tk):
                 pass
 
         self.build_ui()
+        self._write_theme_state(self._load_settings().get("theme", "Dark (Whim)"))
         self.after(50, self.pump_incoming)
         self.after(500, self._ingest_start)
         self.update_idletasks()
@@ -1309,6 +1799,39 @@ class ModernApp(tk.Tk):
             except Exception:
                 pass
 
+            # Gather local PC stats
+            pc_stats_text = ""
+            try:
+                with open("/proc/stat") as _pf:
+                    cpu_line = _pf.readline().split()
+                idle1 = int(cpu_line[4])
+                total1 = sum(int(x) for x in cpu_line[1:])
+                time.sleep(0.5)
+                with open("/proc/stat") as _pf:
+                    cpu_line = _pf.readline().split()
+                idle2 = int(cpu_line[4])
+                total2 = sum(int(x) for x in cpu_line[1:])
+                cpu_pct = 100 * (1 - (idle2 - idle1) / max(total2 - total1, 1))
+
+                with open("/proc/meminfo") as _mf:
+                    mem_lines = _mf.readlines()
+                mem_total = mem_avail = 0
+                for ml in mem_lines:
+                    if ml.startswith("MemTotal:"):
+                        mem_total = int(ml.split()[1])
+                    elif ml.startswith("MemAvailable:"):
+                        mem_avail = int(ml.split()[1])
+                mem_pct = 100 * (1 - mem_avail / max(mem_total, 1))
+
+                du = disk_usage_gb()
+                disk_pct = 100 * du.get("used_gb", 0) / max(du.get("total_gb", 1), 1)
+
+                pc_stats_text = (f"CPU {cpu_pct:.0f}%  "
+                                 f"MEM {mem_pct:.0f}%  "
+                                 f"DSK {disk_pct:.0f}%")
+            except Exception:
+                pass
+
             for dev in self._known_devices:
                 online = ip_online.get(dev["ip"], False)
                 color = "#2fa572" if online else "#8a7a6a"
@@ -1316,7 +1839,12 @@ class ModernApp(tk.Tk):
                 if not w:
                     continue
                 batt_text = ""
+                stats_text = ""
                 adb_model = dev.get("adb_model")
+                if dev["ip"] == "127.0.0.1":
+                    online = True
+                    color = "#2fa572"
+                    stats_text = pc_stats_text
                 if adb_model and adb_model in adb_serials:
                     try:
                         br = subprocess.run(
@@ -1335,6 +1863,8 @@ class ModernApp(tk.Tk):
                                c.itemconfig(d, fill=cl))
                     self.after(0, lambda bl=w["batt_label"], bt=batt_text:
                                bl.config(text=bt))
+                    self.after(0, lambda sl=w["stats_label"], st=stats_text:
+                               sl.config(text=st))
                 except Exception:
                     pass
             time.sleep(10)
@@ -1354,6 +1884,7 @@ class ModernApp(tk.Tk):
         self.focus_force()
 
     def _tray_quit(self, icon=None, item=None):
+        self._geof_cleanup_embed()
         self._tunnel_poll_running = False
         self._device_poll_running = False
         if self._tray_icon:
@@ -1394,6 +1925,34 @@ class ModernApp(tk.Tk):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
 
+    def _restart_whim_mobile_server(self):
+        port = 8089
+        self._server_refresh_btn.config(fg=TH["yellow"])
+        self.update_idletasks()
+        try:
+            import signal as _sig
+            for proc in subprocess.run(
+                    ["pgrep", "-f", "whim_m_v2.1.py"], capture_output=True, text=True
+            ).stdout.strip().splitlines():
+                pid = int(proc.strip())
+                os.kill(pid, _sig.SIGTERM)
+            import time; time.sleep(0.5)
+        except Exception:
+            pass
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "mobile", "whim_m_v2.1.py")
+        if not os.path.isfile(script):
+            script = WHIM_M_SCRIPT
+        if os.path.isfile(script):
+            subprocess.Popen(
+                [sys.executable, script, "--port", str(port)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            self._server_refresh_btn.config(fg=TH["green"])
+        else:
+            self._server_refresh_btn.config(fg="#ff4444")
+        self.after(2000, lambda: self._server_refresh_btn.config(fg=TH["fg"]))
+
     def _setup_ttk_styles(self):
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -1411,7 +1970,7 @@ class ModernApp(tk.Tk):
                          padding=[14, 6], font=TH["font_sm"])
         style.map("TNotebook.Tab",
                    background=[("selected", TH["card"]), ("active", TH["card"])],
-                   foreground=[("selected", "#3a3228"), ("active", TH["fg"])])
+                   foreground=[("selected", "#FF8C00"), ("active", TH["fg"])])
         style.configure("TEntry", fieldbackground=TH["input"], foreground=TH["fg"],
                          borderwidth=1, insertcolor=TH["fg"])
         style.map("TEntry", bordercolor=[("focus", TH["btn"])])
@@ -1468,6 +2027,247 @@ class ModernApp(tk.Tk):
         self.option_add("*Listbox.foreground", TH["fg"])
         self.option_add("*Listbox.selectBackground", TH["select_bg"])
         self.option_add("*Listbox.selectForeground", TH["fg"])
+
+    def _apply_theme(self, theme_name):
+        old_palette = {k: v for k, v in TH.items() if isinstance(v, str) and v.startswith("#")}
+        _role_priority = ["bg", "card", "input", "border", "border_hi",
+                          "btn", "btn_hover", "btn_border",
+                          "fg", "fg2", "fg_dim", "select_bg",
+                          "green", "red", "yellow", "blue_text"]
+        old_to_role = {}
+        for role in _role_priority:
+            if role in old_palette:
+                c = old_palette[role].lower()
+                if c not in old_to_role:
+                    old_to_role[c] = role
+        _apply_theme_to_th(theme_name)
+        self._setup_ttk_styles()
+        self._recolor_widgets(self, old_to_role)
+        for toplevel in self.winfo_children():
+            if isinstance(toplevel, tk.Toplevel):
+                self._recolor_widgets(toplevel, old_to_role)
+        self._recolor_canvas_items()
+        self.configure(bg=TH["bg"])
+        self.option_add("*TCombobox*Listbox.background", TH["input"])
+        self.option_add("*TCombobox*Listbox.foreground", TH["fg"])
+        self.option_add("*TCombobox*Listbox.selectBackground", TH["select_bg"])
+        self.option_add("*TCombobox*Listbox.selectForeground", TH["fg"])
+        self.option_add("*Listbox.background", TH["input"])
+        self.option_add("*Listbox.foreground", TH["fg"])
+        self.option_add("*Listbox.selectBackground", TH["select_bg"])
+        self.option_add("*Listbox.selectForeground", TH["fg"])
+        self._write_theme_state(theme_name)
+
+    def _write_theme_state(self, theme_name):
+        if not THEME_STATE_FILE:
+            return
+        css_vars = {}
+        for key in ("bg", "card", "input", "border", "border_hi",
+                     "btn", "btn_hover", "btn_border",
+                     "fg", "fg2", "fg_dim", "green", "red", "yellow",
+                     "blue_text", "select_bg"):
+            if key in TH and isinstance(TH[key], str):
+                css_vars[f"--{key.replace('_', '-')}"] = TH[key]
+        css_vars["--accent"] = TH.get("btn", "#e8793a")
+        state = {
+            "theme": theme_name,
+            "version": "3.5.0",
+            "css_vars": css_vars,
+            "timestamp": datetime.now().isoformat(),
+        }
+        try:
+            os.makedirs(os.path.dirname(THEME_STATE_FILE), exist_ok=True)
+            with open(THEME_STATE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception:
+            pass
+
+    def _map_color(self, hex_color, old_to_role):
+        role = old_to_role.get(hex_color.lower())
+        if role and role in TH and isinstance(TH[role], str):
+            return TH[role]
+        return None
+
+    def _recolor_widgets(self, widget, old_to_role):
+        wclass = widget.winfo_class()
+        try:
+            if isinstance(widget, RoundedButton):
+                widget._bg = TH["btn"]
+                widget._fg = "#000000"
+                widget._hover_bg = TH["btn_hover"]
+                widget._border = TH["btn_border"]
+                try:
+                    pbg = widget.master["bg"]
+                except (tk.TclError, KeyError):
+                    pbg = TH["bg"]
+                widget.configure(bg=pbg)
+                widget._draw(widget._bg)
+                widget.unbind("<Enter>")
+                widget.unbind("<Leave>")
+                widget.bind("<Enter>", lambda e, w=widget: w._draw(w._hover_bg))
+                widget.bind("<Leave>", lambda e, w=widget: w._draw(w._bg))
+            elif isinstance(widget, ToggleSwitch):
+                widget._on_color = TH["green"]
+                try:
+                    pbg = widget.master["bg"]
+                except (tk.TclError, KeyError):
+                    pbg = TH["bg"]
+                widget._bg_color = pbg
+                widget.configure(bg=pbg)
+                widget._draw()
+            elif wclass in ("Frame", "Labelframe"):
+                cur = str(widget.cget("bg"))
+                if cur.startswith("#"):
+                    mapped = self._map_color(cur, old_to_role)
+                    if mapped:
+                        widget.configure(bg=mapped)
+                try:
+                    cur_hl = str(widget.cget("highlightbackground"))
+                    if cur_hl.startswith("#"):
+                        mapped_hl = self._map_color(cur_hl, old_to_role)
+                        if mapped_hl:
+                            widget.configure(highlightbackground=mapped_hl)
+                except tk.TclError:
+                    pass
+            elif wclass == "Label":
+                cur_bg = str(widget.cget("bg"))
+                cur_fg = str(widget.cget("fg"))
+                if cur_bg.startswith("#"):
+                    mapped = self._map_color(cur_bg, old_to_role)
+                    if mapped:
+                        widget.configure(bg=mapped)
+                if cur_fg.startswith("#"):
+                    mapped = self._map_color(cur_fg, old_to_role)
+                    if mapped:
+                        widget.configure(fg=mapped)
+            elif wclass == "Text":
+                cur_bg = str(widget.cget("bg"))
+                if cur_bg.startswith("#"):
+                    mapped = self._map_color(cur_bg, old_to_role)
+                    if mapped:
+                        widget.configure(bg=mapped)
+                cur_fg = str(widget.cget("fg"))
+                if cur_fg.startswith("#"):
+                    mapped = self._map_color(cur_fg, old_to_role)
+                    if mapped:
+                        widget.configure(fg=mapped)
+                widget.configure(insertbackground=TH["fg"])
+            elif wclass == "Canvas":
+                cur = str(widget.cget("bg"))
+                if cur.startswith("#"):
+                    mapped = self._map_color(cur, old_to_role)
+                    if mapped:
+                        widget.configure(bg=mapped)
+            elif wclass == "Button":
+                cur_bg = str(widget.cget("bg"))
+                if cur_bg.startswith("#"):
+                    mapped = self._map_color(cur_bg, old_to_role)
+                    if mapped:
+                        widget.configure(bg=mapped)
+                cur_fg = str(widget.cget("fg"))
+                if cur_fg.startswith("#"):
+                    mapped = self._map_color(cur_fg, old_to_role)
+                    if mapped:
+                        widget.configure(fg=mapped)
+            elif wclass == "Checkbutton":
+                cur_bg = str(widget.cget("bg"))
+                if cur_bg.startswith("#"):
+                    mapped = self._map_color(cur_bg, old_to_role)
+                    if mapped:
+                        widget.configure(bg=mapped)
+                cur_fg = str(widget.cget("fg"))
+                if cur_fg.startswith("#"):
+                    mapped = self._map_color(cur_fg, old_to_role)
+                    if mapped:
+                        widget.configure(fg=mapped)
+                widget.configure(selectcolor=TH["input"],
+                                 activebackground=TH["card"],
+                                 activeforeground=TH["fg"])
+            elif wclass == "Listbox":
+                widget.configure(bg=TH["input"], fg=TH["fg"],
+                                 selectbackground=TH["select_bg"],
+                                 selectforeground=TH["fg"])
+            elif wclass == "Radiobutton":
+                cur_bg = str(widget.cget("bg"))
+                if cur_bg.startswith("#"):
+                    mapped = self._map_color(cur_bg, old_to_role)
+                    if mapped:
+                        widget.configure(bg=mapped)
+                cur_fg = str(widget.cget("fg"))
+                if cur_fg.startswith("#"):
+                    mapped = self._map_color(cur_fg, old_to_role)
+                    if mapped:
+                        widget.configure(fg=mapped)
+                widget.configure(selectcolor=TH["input"],
+                                 activebackground=TH["card"],
+                                 activeforeground=TH["fg"])
+            elif wclass == "Entry":
+                widget.configure(bg=TH["input"], fg=TH["fg"],
+                                 insertbackground=TH["fg"])
+            elif wclass == "Spinbox":
+                widget.configure(bg=TH["input"], fg=TH["fg"],
+                                 buttonbackground=TH["card"],
+                                 insertbackground=TH["fg"])
+            elif wclass == "Scale":
+                widget.configure(bg=TH["bg"], fg=TH["fg"],
+                                 troughcolor=TH["input"])
+            elif wclass == "Scrollbar":
+                widget.configure(bg=TH["card"], troughcolor=TH["bg"])
+        except (tk.TclError, Exception):
+            pass
+        for child in widget.winfo_children():
+            self._recolor_widgets(child, old_to_role)
+
+    def _recolor_canvas_items(self):
+        for widget in self._walk_all_widgets(self):
+            if not isinstance(widget, tk.Canvas):
+                continue
+            try:
+                for item_id in widget.find_all():
+                    item_type = widget.type(item_id)
+                    if item_type == "oval":
+                        fill = widget.itemcget(item_id, "fill")
+                        if fill.startswith("#"):
+                            mapped = self._map_color_accent(fill)
+                            if mapped:
+                                widget.itemconfigure(item_id, fill=mapped)
+                    elif item_type == "rectangle":
+                        fill = widget.itemcget(item_id, "fill")
+                        outline = widget.itemcget(item_id, "outline")
+                        if fill.startswith("#"):
+                            mapped = self._map_color_accent(fill)
+                            if mapped:
+                                widget.itemconfigure(item_id, fill=mapped)
+                        if outline.startswith("#"):
+                            mapped = self._map_color_accent(outline)
+                            if mapped:
+                                widget.itemconfigure(item_id, outline=mapped)
+                    elif item_type == "text":
+                        fill = widget.itemcget(item_id, "fill")
+                        if fill.startswith("#"):
+                            mapped = self._map_color_accent(fill)
+                            if mapped:
+                                widget.itemconfigure(item_id, fill=mapped)
+            except (tk.TclError, Exception):
+                pass
+
+    def _map_color_accent(self, hex_color):
+        _ACCENT_MAP = {
+            "#00ff00": TH["green"],
+            "#2fa572": TH["green"],
+            "#e8793a": TH["btn"],
+            "#d94040": TH["red"],
+            "#e0a030": TH["yellow"],
+            "#4a7aff": TH["btn"],
+            "#3358cc": TH["btn_hover"],
+            "#c4382a": TH["red"],
+        }
+        return _ACCENT_MAP.get(hex_color.lower())
+
+    def _walk_all_widgets(self, root):
+        yield root
+        for child in root.winfo_children():
+            yield from self._walk_all_widgets(child)
 
     # --- Generic themed widget helpers ---
     def _card(self, parent, title="", fg=None):
@@ -1539,6 +2339,8 @@ class ModernApp(tk.Tk):
             self.whimai_model_var.set(model)
         if hasattr(self, "_preset_model_lbl"):
             self._preset_model_lbl.config(text=model)
+        if hasattr(self, "_whim_env"):
+            self._whim_env.set_current(model)
         self._save_settings()
 
     def _refresh_models(self):
@@ -1552,6 +2354,8 @@ class ModernApp(tk.Tk):
                 names = [m["name"] for m in data.get("models", [])]
                 if names:
                     self.after(0, lambda: self._model_combo.config(values=names))
+                    if hasattr(self, "_whim_env"):
+                        self._whim_env.refresh_models(names)
             except Exception:
                 pass
         threading.Thread(target=_fetch, daemon=True).start()
@@ -1568,6 +2372,7 @@ class ModernApp(tk.Tk):
     def _save_settings(self):
         cfg = self._load_settings()
         cfg["model"] = self._global_model_var.get()
+        cfg["preset"] = getattr(self, "_whimai_active_preset", "Creative")
         cfg["ollama_url"] = getattr(self, "_settings_ollama_url_var",
                                      type("", (), {"get": lambda s: "http://localhost:11434"})()).get()
         cfg["openai_key"] = getattr(self, "_settings_openai_key_var",
@@ -1586,6 +2391,42 @@ class ModernApp(tk.Tk):
             self._whimai_ollama_url = cfg["ollama_url"]
         if cfg.get("openai_key") and hasattr(self, "_settings_openai_key_var"):
             self._settings_openai_key_var.set(cfg["openai_key"])
+        preset_name = cfg.get("preset", "Creative")
+        if preset_name in self._whimai_presets:
+            self._whimai_active_preset = preset_name
+            p = self._whimai_presets[preset_name]
+            self._whimai_model = p["model"]
+            self._global_model_var.set(p["model"])
+            if hasattr(self, "_whimai_preset_var"):
+                self._whimai_preset_var.set(preset_name)
+            if hasattr(self, "whimai_model_var"):
+                self.whimai_model_var.set(p["model"])
+        self._apply_startup_voice()
+
+    def _apply_startup_voice(self):
+        """Set the default voice to revy_grit_02 on startup if not already set."""
+        active_voice_file = os.path.join(XTTS_VOICES_DIR, "active_voice.json")
+        default_voice_name = "revy_grit_02"
+        default_voice_file = None
+        for ext in (".wav", ".mp3"):
+            candidate = os.path.join(XTTS_VOICES_DIR, default_voice_name + ext)
+            if os.path.isfile(candidate):
+                default_voice_file = candidate
+                break
+        if not default_voice_file:
+            return
+        try:
+            if os.path.isfile(active_voice_file):
+                with open(active_voice_file, "r") as f:
+                    current = json.load(f)
+                if current.get("name") == default_voice_name:
+                    return
+            data = {"name": default_voice_name, "path": default_voice_file,
+                    "file": os.path.basename(default_voice_file)}
+            with open(active_voice_file, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
 
     def build_ui(self):
         header = tk.Frame(self, bg=TH["card"])
@@ -1594,7 +2435,7 @@ class ModernApp(tk.Tk):
             tk.Label(header, image=self._logo_img, bg=TH["card"]).pack(side="left", padx=(12, 4), pady=8)
         tk.Label(header, text="WHIM", bg=TH["card"], fg="#00ff00",
                  font=(_FONTS["title"], 26, "bold")).pack(side="left", padx=4, pady=8)
-        tk.Label(header, text="v3.3.0", bg=TH["card"], fg="#e8793a",
+        tk.Label(header, text="v3.5.0", bg=TH["card"], fg="#e8793a",
                  font=(_FONTS["mono"], 10, "bold")).pack(side="left", padx=(0, 8), pady=8)
 
         # Settings button removed — Settings tab provides this functionality
@@ -1617,6 +2458,26 @@ class ModernApp(tk.Tk):
                         activebackground=TH["card"], activeforeground=TH["fg"],
                         font=TH["font_sm"], highlightthickness=0).pack(side="left", padx=6)
         self._btn(conn, "Connect", self.on_connect).pack(side="left", padx=6)
+        _manual_btn_frame = tk.Frame(conn, bg=TH["card"])
+        _manual_btn_frame.pack(side="left", padx=(12, 0))
+        self._manual_book_img = None
+        _book_path = os.path.join(os.path.expanduser("~"), "Incoming", "book.png")
+        if os.path.isfile(_book_path):
+            try:
+                _book_img = Image.open(_book_path).convert("RGBA").resize(
+                    (16, 16), Image.LANCZOS)
+                self._manual_book_img = ImageTk.PhotoImage(_book_img)
+            except Exception:
+                pass
+        _mbtn_kw = dict(text=" MANUAL", compound="left",
+                        bg="#b0b0b0", fg="#1a1a1a", activebackground="#d0d0d0",
+                        activeforeground="#1a1a1a", font=(_FONTS["ui"], 8, "bold"),
+                        bd=0, padx=8, pady=2, cursor="hand2",
+                        command=lambda: webbrowser.open("https://scarter84.github.io/0411/"))
+        if self._manual_book_img:
+            _mbtn_kw["image"] = self._manual_book_img
+        _manual_btn = tk.Button(_manual_btn_frame, **_mbtn_kw)
+        _manual_btn.pack(side="left")
 
         ingest_row = tk.Frame(header_rows, bg=TH["card"])
         ingest_row.pack(fill="x", anchor="e", pady=(4, 0))
@@ -1680,10 +2541,61 @@ class ModernApp(tk.Tk):
         self._ac_btn.bind("<Enter>", lambda e: self._ac_btn.config(bg=TH["btn_hover"]))
         self._ac_btn.bind("<Leave>", lambda e: self._ac_btn.config(bg=TH["btn"]))
 
+        self._dashvm_btn = tk.Label(toggle_row, text="\U0001f697 Dash VM", bg=TH["btn"],
+                                    fg=TH["fg"], font=(_FONTS["ui"], 9), padx=8, pady=2,
+                                    cursor="hand2", relief="flat")
+        self._dashvm_btn.pack(side="left", padx=(0, 8))
+        self._dashvm_btn.bind("<Button-1>", lambda e: self._launch_dash_vm())
+        self._dashvm_btn.bind("<Enter>", lambda e: self._dashvm_btn.config(bg=TH["btn_hover"]))
+        self._dashvm_btn.bind("<Leave>", lambda e: self._dashvm_btn.config(bg=TH["btn"]))
+
+        tk.Frame(toggle_row, width=4, bg=TH["card"]).pack(side="left")
+
+        self._label(toggle_row, "Server:", font=TH["font_sm"]).pack(side="left", padx=(0, 2))
+        self._server_refresh_btn = tk.Label(toggle_row, text="REFRESH", bg=TH["btn"],
+                                            fg=TH["fg"], font=(_FONTS["ui"], 9), padx=8, pady=2,
+                                            cursor="hand2", relief="flat")
+        self._server_refresh_btn.pack(side="left", padx=(0, 8))
+        self._server_refresh_btn.bind("<Button-1>", lambda e: self._restart_whim_mobile_server())
+        self._server_refresh_btn.bind("<Enter>", lambda e: self._server_refresh_btn.config(bg=TH["btn_hover"]))
+        self._server_refresh_btn.bind("<Leave>", lambda e: self._server_refresh_btn.config(bg=TH["btn"]))
+
         tk.Frame(toggle_row, width=4, bg=TH["card"]).pack(side="left")
         self.toggle_status_var = tk.StringVar(value="")
         tk.Label(toggle_row, textvariable=self.toggle_status_var, bg=TH["card"],
                  fg=TH["green"], font=(_FONTS["mono"], 9)).pack(side="left", padx=6)
+
+        # --- Hardware Handshake Row ---
+        hw_row = tk.Frame(header_rows, bg=TH["card"])
+        hw_row.pack(fill="x", anchor="e", pady=(2, 0))
+
+        tk.Label(hw_row, text="\u25cf", bg=TH["card"], fg="#2fa572",
+                 font=(_FONTS["mono"], 8)).pack(side="left")
+        tk.Label(hw_row, text="LOCAL-FIRST", bg=TH["card"], fg="#2fa572",
+                 font=(_FONTS["mono"], 7, "bold")).pack(side="left", padx=(2, 8))
+
+        self._hw_ollama_dot = tk.Canvas(hw_row, width=8, height=8,
+                                         bg=TH["card"], highlightthickness=0)
+        self._hw_ollama_dot.pack(side="left", padx=(0, 2))
+        self._hw_ollama_dot_id = self._hw_ollama_dot.create_oval(
+            1, 1, 7, 7, fill="#8a7a6a", outline="")
+        self._hw_ollama_lbl = tk.Label(hw_row, text="Ollama", bg=TH["card"],
+                                        fg=TH["fg2"], font=(_FONTS["mono"], 7))
+        self._hw_ollama_lbl.pack(side="left", padx=(0, 6))
+
+        self._hw_gpu_lbl = tk.Label(hw_row, text="GPU --", bg=TH["card"],
+                                     fg=TH["fg2"], font=(_FONTS["mono"], 7))
+        self._hw_gpu_lbl.pack(side="left", padx=(0, 6))
+
+        self._hw_vram_lbl = tk.Label(hw_row, text="VRAM --", bg=TH["card"],
+                                      fg=TH["fg2"], font=(_FONTS["mono"], 7))
+        self._hw_vram_lbl.pack(side="left", padx=(0, 6))
+
+        self._hw_model_lbl = tk.Label(hw_row, text="", bg=TH["card"],
+                                       fg="#e8793a", font=(_FONTS["mono"], 7))
+        self._hw_model_lbl.pack(side="left", padx=(0, 4))
+
+        self.after(1000, self._hw_status_poll)
 
         # ===== DEVICE LIST BAR =====
         self._device_bar = tk.Frame(self, bg=TH["card"], bd=0, highlightthickness=1,
@@ -1694,6 +2606,9 @@ class ModernApp(tk.Tk):
         self._device_widgets = {}
         self._known_devices = _USER_CFG.get("devices", [
             {"name": "localhost", "ip": "127.0.0.1", "label": "PC", "adb_model": None},
+            {"name": "lenovo-tb311fu", "ip": "", "label": "Lenovo Tablet", "adb_model": "TB311FU"},
+            {"name": "galaxy-s9", "ip": "", "label": "Galaxy S9", "adb_model": "SM_G965U"},
+            {"name": "galaxy-s22", "ip": "", "label": "Galaxy S22", "adb_model": "SM_S901U"},
         ])
         for dev in self._known_devices:
             frame = tk.Frame(self._device_bar, bg=TH["card"])
@@ -1707,8 +2622,30 @@ class ModernApp(tk.Tk):
             batt_label = tk.Label(frame, text="", bg=TH["card"], fg=TH["green"],
                                   font=(_FONTS["mono"], 8))
             batt_label.pack(side="left", padx=(4, 0))
+            stats_label = tk.Label(frame, text="", bg=TH["card"], fg=TH["fg2"],
+                                   font=(_FONTS["mono"], 8))
+            stats_label.pack(side="left", padx=(4, 0))
             self._device_widgets[dev["name"]] = {"canvas": dot_canvas, "dot": dot_id,
-                                                  "batt_label": batt_label}
+                                                  "batt_label": batt_label,
+                                                  "stats_label": stats_label}
+
+        # Whim Ecosystem health lights
+        sep = tk.Frame(self._device_bar, bg=TH["border_hi"], width=1)
+        sep.pack(side="left", fill="y", padx=(8, 8), pady=4)
+        tk.Label(self._device_bar, text="ECOSYSTEM", bg=TH["card"], fg=TH["fg_dim"],
+                 font=(_FONTS["mono"], 7)).pack(side="left", padx=(0, 6))
+        self._eco_widgets = {}
+        for eco_id, eco_label in [("whim_m", "Whim.m"), ("whim_v", "Whim.v")]:
+            ef = tk.Frame(self._device_bar, bg=TH["card"])
+            ef.pack(side="left", padx=(0, 10), pady=4)
+            ec = tk.Canvas(ef, width=10, height=10, bg=TH["card"], highlightthickness=0)
+            ec.pack(side="left", padx=(0, 3))
+            ed = ec.create_oval(1, 1, 9, 9, fill="#8a7a6a", outline="")
+            el = tk.Label(ef, text=eco_label, bg=TH["card"], fg=TH["fg"],
+                          font=(_FONTS["mono"], 9))
+            el.pack(side="left")
+            self._eco_widgets[eco_id] = {"canvas": ec, "dot": ed}
+
         self._device_poll_running = True
         threading.Thread(target=self._poll_device_status, daemon=True).start()
 
@@ -1726,8 +2663,15 @@ class ModernApp(tk.Tk):
             ("library", "LIBRARY"),
             ("archive", "ARCHIVE"),
             ("persona", "PERSONA"),
+            ("doppler", "DOPPLER"),
             ("geof", "GEOF"),
+            ("ham", "HAM"),
+            ("avatar", "AVATAR"),
             ("sync", "SYNC"),
+            ("nodeflow", "NODEFLOW"),
+            ("opus", "OPUS"),
+            ("email", "EMAIL"),
+            ("brain", "BRAIN"),
             ("settings", "SETTINGS"),
         ]
 
@@ -1787,13 +2731,66 @@ class ModernApp(tk.Tk):
         self.build_archive()
         self.build_ss()
         self.build_persona()
+        self._ensure_locations_file()
+        self.build_doppler()
         self.build_geof()
+        self.build_ham()
+        self.build_avatar()
         self.build_sync()
+        self.build_nodeflow()
+        self.build_opus()
+        self.build_email()
+        self.build_brain()
         self.build_settings()
 
         self._apply_saved_settings()
         self._refresh_models()
-       
+        self.after(800, self._whimai_boot_banner)
+
+        # Global keyboard shortcut: Ctrl+Shift+G opens Brain query modal
+        self.bind_all("<Control-Shift-g>", lambda e: self._brain_quick_query())
+        self.bind_all("<Control-Shift-G>", lambda e: self._brain_quick_query())
+
+        # Global mouse-wheel scroll for any scrollable widget under cursor
+        self.bind_all("<Button-4>", self._global_scroll)
+        self.bind_all("<Button-5>", self._global_scroll)
+        self.bind_all("<MouseWheel>", self._global_scroll)
+
+    def _global_scroll(self, event):
+        """Route mouse-wheel events to the scrollable widget under the cursor."""
+        w = event.widget
+        try:
+            x, y = w.winfo_pointerxy()
+            target = w.winfo_containing(x, y)
+        except Exception:
+            return
+        if target is None:
+            return
+        # Walk up from the widget under cursor to find a scrollable ancestor
+        widget = target
+        for _ in range(30):
+            if widget is None:
+                return
+            wclass = widget.winfo_class()
+            if wclass in ("Text", "Listbox", "Canvas", "Treeview"):
+                break
+            widget = widget.master
+        else:
+            return
+        # Determine scroll direction
+        if event.num == 4:
+            delta = -3
+        elif event.num == 5:
+            delta = 3
+        elif hasattr(event, "delta") and event.delta:
+            delta = int(-1 * (event.delta / 120)) * 3
+        else:
+            return
+        try:
+            widget.yview_scroll(delta, "units")
+        except Exception:
+            pass
+
     def _init_tab_drag(self):
         pass
 
@@ -1989,6 +2986,9 @@ class ModernApp(tk.Tk):
         text = self.chat_entry.get().strip()
         if not text:
             return
+        if not _ws_connected.is_set():
+            self.append_chat("[Not connected \u2014 click Connect or enable Auto-connect in Settings]\n", "#d94040")
+            return
         self.chat_entry.delete(0, "end")
         req = {"type": "req", "id": new_id("chatSend"), "method": "chat.send",
                "params": {"text": text, "idempotencyKey": uuid.uuid4().hex}}
@@ -1996,6 +2996,9 @@ class ModernApp(tk.Tk):
         self.append_chat(f"> [AI] {text}\n", "#00ddff")
 
     def chat_abort(self):
+        if not _ws_connected.is_set():
+            self.append_chat("[Not connected \u2014 abort not sent]\n", "#d94040")
+            return
         outgoing.put({"type": "req", "id": new_id("chatAbort"), "method": "chat.abort", "params": {}})
         self.append_chat("[Abort requested]\n", "#ff5555")
 
@@ -2012,8 +3015,13 @@ class ModernApp(tk.Tk):
         self._whimai_placeholder_active = True
         self._whimai_chat_history = []
         self._whimai_streaming = False
-        self._whimai_model = "llama3.1:8b-16k"
+        self._whimai_model = "deepseek-r1:32b"
         self._whimai_ollama_url = "http://localhost:11434"
+        self._whim_env = WhimEnvironment(self._whimai_ollama_url)
+        self._freshtail = FreshTail(
+            ollama_url=self._whimai_ollama_url,
+            summary_model="llama3.1:8b-16k"
+        )
 
         wrap = tk.Frame(f, bg=TH["bg"])
         wrap.pack(fill="both", expand=True, padx=12, pady=12)
@@ -2022,12 +3030,40 @@ class ModernApp(tk.Tk):
 
         self._whimai_presets = {
             "Default": {"model": "llama3.1:8b-16k", "ctx": 16384, "temp": 0.7, "tools": "all", "system": ""},
-            "Creative": {"model": "llama3.1:8b-16k", "ctx": 16384, "temp": 1.2, "tools": "all", "system": "You are a creative writing assistant. Be vivid and expressive."},
-            "Code": {"model": "llama3.1:8b-16k", "ctx": 16384, "temp": 0.2, "tools": "code", "system": "You are a concise code assistant. Return code with minimal explanation."},
-            "Analyst": {"model": "llama3.1:8b-16k", "ctx": 8192, "temp": 0.3, "tools": "search,calc", "system": "You are a data analyst. Be factual and precise."},
+            "Creative": {"model": "deepseek-r1:32b", "ctx": 32768, "temp": 1.2, "tools": "all", "system": (
+                "You are OpenClaw Creative, the expressive AI voice of the Whim ecosystem. "
+                "Be vivid and articulate. You have full autonomous access to the Archive and "
+                "all terminal subsystems.\n\n"
+                "## NATURAL LANGUAGE → COMMAND BRIDGE\n"
+                "When the user speaks in plain English about retrieving or playing content, "
+                "you MUST respond with the exact slash command on its own line. These are "
+                "top-priority system calls — do NOT paraphrase or explain, just emit the command.\n\n"
+                "Intent mapping:\n"
+                "- \"the last cellphone notes\" / \"my phone notes\" / \"last upload\" / "
+                "\"what did I send from my phone\" → /arc read <most recent file in Journal>\n"
+                "- \"the last TRV recording\" / \"play the TRV\" / \"that cipher file\" / "
+                "\"hear the last recording\" → /trv play\n"
+                "- \"play the last audio\" / \"replay that\" / \"hear it again\" → playback\n"
+                "- \"read <X> aloud\" / \"speak the archive\" → /arc speak <X>\n"
+                "- \"show me the archive <X>\" / \"pull up <X>\" → /arc read <X>\n"
+                "- \"search the archive for <X>\" → /arc search <X>\n"
+                "- \"list the archive\" / \"what's in the archive\" → /arc list\n\n"
+                "If the user's request matches any of the above intents, output ONLY the "
+                "corresponding command. No preamble, no follow-up — just the command.\n\n"
+                "For everything else, be creative, vivid, and expressive as usual."
+            )},
+            "Code": {"model": "deepseek-r1:32b", "ctx": 32768, "temp": 0.2, "tools": "code", "system": "You are a concise code assistant. Return code with minimal explanation."},
+            "Analyst": {"model": "deepseek-r1:32b", "ctx": 32768, "temp": 0.3, "tools": "search,calc", "system": "You are a data analyst. Be factual and precise."},
             "Minimal": {"model": "llama3.1:8b-16k", "ctx": 4096, "temp": 0.5, "tools": "none", "system": "Answer in as few words as possible."},
         }
-        self._whimai_active_preset = "Default"
+        self._whimai_active_preset = "Creative"
+
+        self._tool_registry = ToolRegistry()
+        self._preset_architect = PresetArchitect(
+            self._tool_registry,
+            ollama_url=getattr(self, "_whimai_ollama_url", "http://127.0.0.1:11434"),
+            model="deepseek-r1:32b"
+        )
 
         self._whimai_turn_data = []
         self._whimai_total_prompt_tokens = 0
@@ -2035,6 +3071,25 @@ class ModernApp(tk.Tk):
         self._whimai_dropped_msgs = []
         self._whimai_sys_telemetry = {"cpu": 0.0, "ram_mb": 0, "vram_mb": 0, "gpu_util": 0}
         self._whimai_telemetry_polling = False
+
+        self._auto_speak = False
+        self._speech_pipeline = None
+        self._speak_highlight_words = []
+        self._last_tts_wav = None
+        self._speak_response_start_idx = None
+        if _HAS_SPEECH:
+            _app_dir = os.path.dirname(os.path.realpath(__file__))
+            venv_py = os.path.normpath(
+                os.path.join(_app_dir, os.pardir, ".venv", "bin", "python"))
+            if not os.path.isfile(venv_py):
+                _fallback = os.path.expanduser("~/vaults/WHIM/.venv/bin/python")
+                if os.path.isfile(_fallback):
+                    venv_py = _fallback
+            self._speech_pipeline = SpeechPipeline(
+                xtts_conda_python=XTTS_CONDA_PYTHON,
+                venv_python=venv_py,
+                voices_dir=XTTS_VOICES_DIR,
+            )
 
         body = tk.Frame(wrap, bg=TH["bg"])
         body.pack(fill="both", expand=True)
@@ -2063,7 +3118,7 @@ class ModernApp(tk.Tk):
         log_frame.pack(side="left", fill="both", expand=True)
 
         self.whimai_log = tk.Text(log_frame, bg=TH["input"], fg=TH["fg"],
-                                   font=(_FONTS["mono"], 10, "bold"), wrap="word",
+                                   font=("Montserrat SemiBold", 10), wrap="word",
                                    state="disabled", bd=0, highlightthickness=1,
                                    highlightbackground=TH["border"],
                                    highlightcolor=TH["btn"], padx=6, pady=4)
@@ -2072,17 +3127,29 @@ class ModernApp(tk.Tk):
         self.whimai_log.pack(side="left", fill="both", expand=True)
         ai_scroll.pack(side="right", fill="y")
 
-        self.whimai_log.tag_config("ai", foreground="#e08030", font=(_FONTS["mono"], 10, "bold"))
-        self.whimai_log.tag_config("user", foreground="#40e0d0", font=(_FONTS["mono"], 10, "bold"))
+        self.whimai_log.tag_config("ai", foreground="#e08030", font=("Montserrat SemiBold", 10))
+        self.whimai_log.tag_config("ai_italic", foreground="#e08030", font=("Montserrat SemiBold", 10, "italic"))
+        self.whimai_log.tag_config("user", foreground="#40e0d0", font=("Montserrat SemiBold", 10))
+        self.whimai_log.tag_config("speak_highlight", background="#e8793a", foreground="#141210",
+                                    font=("Montserrat SemiBold", 10))
 
         afford_row = tk.Frame(left_col, bg=TH["bg"])
         afford_row.pack(fill="x", pady=(4, 0))
         for lbl, cmd in [("Edit Last", self._whimai_edit_last),
                          ("Regen", self._whimai_regenerate),
                          ("Copy MD", self._whimai_copy_md),
+                         ("Print", self._whimai_print),
                          ("Send to Page", self._whimai_send_to_page),
                          ("Make Task", self._whimai_make_task)]:
             self._btn(afford_row, lbl, cmd).pack(side="left", padx=2)
+        self._speak_toggle_btn = self._btn(afford_row, "SPEAK", self._toggle_auto_speak)
+        self._speak_toggle_btn.pack(side="left", padx=2)
+        self._export_mp3_btn = self._btn(afford_row, "Export MP3", self._export_tts_mp3)
+        self._export_mp3_btn.pack(side="left", padx=2)
+        self._btn(afford_row, "Revyfloat", self._launch_revyfloat).pack(side="left", padx=2)
+        self._speak_indicator = tk.Label(afford_row, text="", bg=TH["bg"],
+                                          fg=TH["green"], font=(_FONTS["mono"], 12))
+        self._speak_indicator.pack(side="left", padx=(4, 2))
         tk.Label(afford_row, textvariable=self.whimai_status_var, bg=TH["bg"],
                  fg=TH["green"], font=(_FONTS["mono"], 9)).pack(side="right", padx=4)
 
@@ -2129,7 +3196,7 @@ class ModernApp(tk.Tk):
         input_frame.pack(fill="x", pady=(8, 0))
 
         self.whimai_entry = tk.Text(input_frame, bg=TH["input"], fg="#e08030",
-                                     font=(_FONTS["mono"], 11), height=3, wrap="word",
+                                     font=("Montserrat SemiBold", 11), height=3, wrap="word",
                                      bd=0, highlightthickness=1, insertbackground=TH["fg"],
                                      highlightbackground=TH["border"],
                                      highlightcolor=TH["btn"], padx=6, pady=4,
@@ -2188,13 +3255,37 @@ class ModernApp(tk.Tk):
         right_col.rowconfigure(3, weight=2)
         right_col.columnconfigure(0, weight=1)
 
-        # -- Model / Session Presets --
+        # -- Model / Session Presets (scrollable) --
         presets_card = self._card(right_col, "PRESETS", fg="#8a7a6a")
-        presets_card.grid(row=0, column=0, sticky="new", pady=(0, 4))
+        presets_card.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+
+        _presets_outer = tk.Frame(presets_card, bg=TH["card"])
+        _presets_outer.pack(fill="both", expand=True, padx=0, pady=(0, 0))
+        _presets_canvas = tk.Canvas(_presets_outer, bg=TH["card"],
+                                    highlightthickness=0, bd=0)
+        _presets_sb = self._scrollbar(_presets_outer, command=_presets_canvas.yview)
+        _presets_inner = tk.Frame(_presets_canvas, bg=TH["card"])
+        _presets_inner.bind("<Configure>",
+            lambda e: _presets_canvas.configure(scrollregion=_presets_canvas.bbox("all")))
+        _presets_canvas.create_window((0, 0), window=_presets_inner, anchor="nw",
+                                      tags="inner")
+        _presets_canvas.configure(yscrollcommand=_presets_sb.set)
+        _presets_canvas.pack(side="left", fill="both", expand=True)
+        _presets_sb.pack(side="right", fill="y")
+
+        def _presets_scroll(event):
+            _presets_canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+        for w in (_presets_canvas, _presets_inner):
+            w.bind("<Button-4>", _presets_scroll)
+            w.bind("<Button-5>", _presets_scroll)
+
+        def _presets_resize_canvas(event):
+            _presets_canvas.itemconfigure("inner", width=event.width)
+        _presets_canvas.bind("<Configure>", _presets_resize_canvas)
 
         self.whimai_model_var = tk.StringVar(value=self._whimai_model)
 
-        preset_sel = tk.Frame(presets_card, bg=TH["card"])
+        preset_sel = tk.Frame(_presets_inner, bg=TH["card"])
         preset_sel.pack(fill="x", padx=10, pady=(0, 4))
         tk.Label(preset_sel, text="PROFILE:", bg=TH["card"], fg="#8a7a6a",
                  font=(_FONTS["mono"], 9, "bold")).pack(side="left", padx=4)
@@ -2205,7 +3296,7 @@ class ModernApp(tk.Tk):
         preset_combo.pack(side="left", padx=4)
         preset_combo.bind("<<ComboboxSelected>>", lambda e: self._whimai_apply_preset())
 
-        info_frame = tk.Frame(presets_card, bg=TH["card"])
+        info_frame = tk.Frame(_presets_inner, bg=TH["card"])
         info_frame.pack(fill="x", padx=10, pady=(0, 6))
 
         r1 = tk.Frame(info_frame, bg=TH["card"])
@@ -2225,9 +3316,15 @@ class ModernApp(tk.Tk):
         self._preset_ctx_lbl.pack(side="left")
         tk.Label(r2, text="  TEMP:", bg=TH["card"], fg="#8a7a6a",
                  font=(_FONTS["mono"], 8, "bold")).pack(side="left", padx=(8, 0))
-        self._preset_temp_lbl = tk.Label(r2, text="0.7", bg=TH["card"],
-                                          fg=TH["fg"], font=(_FONTS["mono"], 9))
-        self._preset_temp_lbl.pack(side="left")
+        self._preset_temp_var = tk.DoubleVar(value=0.7)
+        self._preset_temp_slider = tk.Scale(
+            r2, from_=0.0, to=2.0, resolution=0.1, orient="horizontal",
+            variable=self._preset_temp_var, bg=TH["card"], fg=TH["fg"],
+            troughcolor=TH["input"], highlightthickness=0,
+            activebackground=TH["btn_hover"], font=(_FONTS["mono"], 8),
+            length=120, showvalue=True, bd=0,
+            command=lambda v: self._on_temp_slider_change(float(v)))
+        self._preset_temp_slider.pack(side="left", padx=(2, 0))
 
         r3 = tk.Frame(info_frame, bg=TH["card"])
         r3.pack(fill="x", pady=1)
@@ -2238,13 +3335,34 @@ class ModernApp(tk.Tk):
         self._preset_tools_lbl.pack(side="left")
 
         r4 = tk.Frame(info_frame, bg=TH["card"])
-        r4.pack(fill="x", pady=(1, 4))
+        r4.pack(fill="x", pady=(1, 0))
         tk.Label(r4, text="SYSTEM:", bg=TH["card"], fg="#8a7a6a",
                  font=(_FONTS["mono"], 8, "bold"), width=8, anchor="w").pack(side="left")
         self._preset_sys_lbl = tk.Label(r4, text="(none)", bg=TH["card"],
                                          fg=TH["fg2"], font=(_FONTS["mono"], 8),
                                          wraplength=220, justify="left", anchor="w")
         self._preset_sys_lbl.pack(side="left", fill="x", expand=True)
+
+        r5 = tk.Frame(info_frame, bg=TH["card"])
+        r5.pack(fill="x", pady=(1, 4))
+        tk.Label(r5, text="VOICE:", bg=TH["card"], fg="#8a7a6a",
+                 font=(_FONTS["mono"], 8, "bold"), width=8, anchor="w").pack(side="left")
+        self._preset_voice_lbl = tk.Label(r5, text="(none)", bg=TH["card"],
+                                           fg=TH["fg2"], font=(_FONTS["mono"], 9))
+        self._preset_voice_lbl.pack(side="left")
+        self._preset_refresh_voice()
+
+        # -- Architect row (OpenTailor) --
+        arch_row = tk.Frame(_presets_inner, bg=TH["card"])
+        arch_row.pack(fill="x", padx=10, pady=(4, 8))
+        self._btn(arch_row, "\u2699 Architect", self._opentailor_open_architect).pack(
+            side="left", padx=2)
+        self._btn(arch_row, "Tool Store", self._opentailor_open_store).pack(
+            side="left", padx=2)
+        self._preset_tailor_status = tk.Label(
+            arch_row, text="", bg=TH["card"], fg=TH["fg2"],
+            font=(_FONTS["mono"], 8))
+        self._preset_tailor_status.pack(side="left", padx=6)
 
         # -- Observability panel --
         obs_card = self._card(right_col, "OBSERVABILITY", fg="#8a7a6a")
@@ -2279,18 +3397,18 @@ class ModernApp(tk.Tk):
         perf_grid = tk.Frame(self._obs_frame, bg=TH["input"])
         perf_grid.pack(fill="x", padx=4, pady=(0, 4))
 
-        metrics = [
+        perf_top = tk.Frame(perf_grid, bg=TH["input"])
+        perf_top.pack(fill="x")
+        perf_top.columnconfigure(0, weight=1)
+        perf_top.columnconfigure(1, weight=1)
+        top_metrics = [
             ("tok/s:", "_obs_tps", "--"),
             ("latency:", "_obs_latency", "--"),
             ("prompt eval:", "_obs_prompt_lat", "--"),
-            ("GPU VRAM:", "_obs_vram", "--"),
-            ("GPU util:", "_obs_gpu", "--"),
-            ("CPU:", "_obs_cpu", "--"),
-            ("RAM:", "_obs_ram", "--"),
         ]
-        for i, (label, attr, default) in enumerate(metrics):
+        for i, (label, attr, default) in enumerate(top_metrics):
             r, c = divmod(i, 2)
-            cell = tk.Frame(perf_grid, bg=TH["input"])
+            cell = tk.Frame(perf_top, bg=TH["input"])
             cell.grid(row=r, column=c, sticky="w", padx=(0, 12), pady=1)
             tk.Label(cell, text=label, bg=TH["input"], fg="#8a7a6a",
                      font=(_FONTS["mono"], 8, "bold"), anchor="w").pack(side="left")
@@ -2298,11 +3416,46 @@ class ModernApp(tk.Tk):
                            font=(_FONTS["mono"], 8))
             lbl.pack(side="left", padx=(4, 0))
             setattr(self, attr, lbl)
-        perf_grid.columnconfigure(0, weight=1)
-        perf_grid.columnconfigure(1, weight=1)
+
+        self._obs_bars = {}
+        bar_metrics = [
+            ("CPU",      "_obs_cpu",  100),
+            ("RAM",      "_obs_ram",  128000),
+            ("GPU util", "_obs_gpu",  100),
+            ("VRAM",     "_obs_vram", 12282),
+        ]
+        for label_text, attr, max_val in bar_metrics:
+            row = tk.Frame(perf_grid, bg=TH["input"])
+            row.pack(fill="x", padx=2, pady=1)
+            tk.Label(row, text=f"{label_text}:", bg=TH["input"], fg="#8a7a6a",
+                     font=(_FONTS["mono"], 8, "bold"), width=9, anchor="w").pack(side="left")
+            bar_canvas = tk.Canvas(row, bg="#1a1816", height=10,
+                                   highlightthickness=0, bd=0)
+            bar_canvas.pack(side="left", fill="x", expand=True, padx=(2, 4))
+            val_lbl = tk.Label(row, text="--", bg=TH["input"], fg=TH["fg"],
+                               font=(_FONTS["mono"], 8), width=8, anchor="e")
+            val_lbl.pack(side="right")
+            setattr(self, attr, val_lbl)
+            self._obs_bars[attr] = {"canvas": bar_canvas, "max": max_val}
+
+        self._obs_event_log = []
+        self._obs_active_event = None
 
         tk.Frame(self._obs_frame, bg=TH["border_hi"], height=1).pack(
-            fill="x", padx=4, pady=(4, 4))
+            fill="x", padx=4, pady=(4, 2))
+
+        evt_hdr = tk.Frame(self._obs_frame, bg=TH["input"])
+        evt_hdr.pack(fill="x", padx=4, pady=(0, 2))
+        tk.Label(evt_hdr, text="EVENT CAPTURE", bg=TH["input"], fg=TH["blue_text"],
+                 font=(_FONTS["ui"], 9, "bold")).pack(side="left")
+
+        self._obs_event_text = tk.Text(self._obs_frame, bg=TH["input"], fg=TH["fg2"],
+                                       font=(_FONTS["mono"], 7), height=4, wrap="word",
+                                       bd=0, highlightthickness=0, state="disabled")
+        self._obs_event_text.pack(fill="x", padx=4, pady=(0, 4))
+
+        tk.Frame(self._obs_frame, bg=TH["border_hi"], height=1).pack(
+            fill="x", padx=4, pady=(2, 4))
 
         # Tool trace section header
         trace_hdr = tk.Frame(self._obs_frame, bg=TH["input"])
@@ -2448,12 +3601,24 @@ class ModernApp(tk.Tk):
             ("journal", "Open journal dir"),
             ("ingest", "Start ingest server"),
             ("", None),
+            ("ARCHIVE AGENT", None),
+            ("/arc list", "List archive files"),
+            ("/arc read <file>", "Read archive file into chat"),
+            ("/arc speak <file>", "Read archive file aloud (TTS)"),
+            ("/arc search <query>", "Search inside archive files"),
+            ("/browse archive", "Browse archive directory"),
+            ("", None),
             ("FOLDER OPS", None),
             ("/browse incoming", "List Incoming files"),
             ("/browse downloads", "List Downloads files"),
             ("/browse vaults", "List Vaults files"),
             ("/search", "Search all folders"),
             ("/diagnose", "Run Whim diagnostics"),
+            ("", None),
+            ("OPENFANG", None),
+            ("/openfang", "Kernel status"),
+            ("/chk", "Read latest kickback"),
+            ("/solve", "Analyze kickback with AI"),
         ]
 
         for cmd, desc in commands:
@@ -2533,6 +3698,7 @@ class ModernApp(tk.Tk):
         "incoming": _PLAT_PATHS.get("incoming_dir", os.path.expanduser("~/Incoming")),
         "downloads": _PLAT_PATHS.get("downloads_dir", os.path.expanduser("~/Downloads")),
         "vaults": os.path.join(os.path.expanduser("~"), "Documents", "Whim") if IS_MAC else os.path.expanduser("~/vaults"),
+        "archive": ARCHIVE_DIR,
     }
 
     def _whimai_handle_command(self, text):
@@ -2563,6 +3729,303 @@ class ModernApp(tk.Tk):
         # /diagnose -- run Whim health checks
         if lower.startswith("/diagnose") or lower.startswith("/diag"):
             self._whimai_cmd_diagnose()
+            return True
+
+        # /chk -- read latest OpenFang kickback
+        if lower.startswith("/chk"):
+            self._openfang_cmd_chk()
+            return True
+
+        # /solve -- feed latest kickback to Ollama for analysis
+        if lower.startswith("/solve"):
+            self._openfang_cmd_solve()
+            return True
+
+        # /openfang -- show OpenFang kernel status
+        if lower.startswith("/openfang"):
+            self._openfang_cmd_status()
+            return True
+
+        # /speak [text] -- speak text or toggle auto-speak
+        if lower.startswith("/speak"):
+            parts = text.split(None, 1)
+            if len(parts) > 1:
+                self._speak_text(parts[1])
+            else:
+                self._toggle_auto_speak()
+                state = "ON" if self._auto_speak else "OFF"
+                self._whimai_append(f"Auto-speak: {state}\n", "ai")
+            return True
+
+        # /shutup -- stop current speech
+        if lower.startswith("/shutup") or lower.startswith("/stfu"):
+            if self._speech_pipeline and self._speech_pipeline.is_speaking:
+                self._speech_pipeline.stop()
+                self._whimai_append("Speech stopped.\n", "ai")
+            else:
+                self._whimai_append("Not speaking.\n", "ai")
+            return True
+
+        # /trv play -- play the latest TRV/cipher recording
+        # /trv info -- show info about the latest TRV file
+        if lower.startswith("/trv"):
+            parts = text.split(None)
+            sub = parts[1].lower() if len(parts) > 1 else "play"
+            audio_dirs = [UPLOAD_DIR, self.AUDIO_JR_DIR]
+            if sub == "play":
+                path = get_latest_trv(audio_dirs)
+                if path:
+                    self._whimai_append(
+                        f"[SYSTEM] TRV playback: {os.path.basename(path)}\n", "ai")
+                    threading.Thread(
+                        target=lambda: _plat_play_audio(path), daemon=True).start()
+                else:
+                    self._whimai_append("[SYSTEM] No TRV files found.\n", "ai")
+            elif sub == "info":
+                path = get_latest_trv(audio_dirs)
+                if path:
+                    import time as _time
+                    mtime = os.path.getmtime(path)
+                    ts = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(mtime))
+                    sz = os.path.getsize(path)
+                    sz_str = f"{sz / 1024:.1f} KB" if sz < 1048576 else f"{sz / 1048576:.1f} MB"
+                    self._whimai_append(
+                        f"[SYSTEM] Last TRV file: {os.path.basename(path)}\n"
+                        f"  Path: {path}\n  Modified: {ts}\n  Size: {sz_str}\n", "ai")
+                else:
+                    self._whimai_append("[SYSTEM] No TRV files found.\n", "ai")
+            else:
+                self._whimai_append(
+                    "TRV commands:\n"
+                    "  /trv play    — play latest TRV recording\n"
+                    "  /trv info    — show info about latest TRV file\n", "ai")
+            return True
+
+        # /arc list [query] -- list archive files
+        # /arc read <file>  -- read archive file into chat
+        # /arc speak <file> -- read archive file aloud via TTS
+        # /arc search <query> -- search inside archive file contents
+        if lower.startswith("/arc"):
+            parts = text.split(None)
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            arg = " ".join(parts[2:]) if len(parts) > 2 else ""
+
+            if sub == "list" or sub == "ls":
+                self._arc_agent_list(arg if arg else None)
+            elif sub == "read" or sub == "cat":
+                if arg:
+                    self._arc_agent_read(arg)
+                else:
+                    self._whimai_append("Usage: /arc read <filename>\n", "ai")
+            elif sub == "speak" or sub == "say":
+                if arg:
+                    self._arc_agent_speak(arg)
+                else:
+                    self._whimai_append("Usage: /arc speak <filename>\n", "ai")
+            elif sub == "search" or sub == "grep":
+                if arg:
+                    self._arc_agent_search(arg)
+                else:
+                    self._whimai_append("Usage: /arc search <query>\n", "ai")
+            else:
+                self._whimai_append(
+                    "Archive commands:\n"
+                    "  /arc list [filter]    — list archive files\n"
+                    "  /arc read <file>      — read file into chat\n"
+                    "  /arc speak <file>     — read file aloud (TTS)\n"
+                    "  /arc search <query>   — search inside archive files\n", "ai")
+            return True
+
+        # /email list [count] -- list inbox headers
+        # /email read <id>    -- read a specific email
+        # /email search <q>   -- search emails
+        if lower.startswith("/email"):
+            parts = text.split(None)
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            arg = " ".join(parts[2:]) if len(parts) > 2 else ""
+            if sub == "list" or sub == "ls":
+                count = int(arg) if arg.isdigit() else 5
+                self._email_ai_list(count)
+            elif sub == "read" or sub == "cat":
+                if arg:
+                    self._email_ai_read(arg.strip())
+                else:
+                    self._whimai_append("Usage: /email read <message_id>\n", "ai")
+            elif sub == "search" or sub == "find":
+                if arg:
+                    self._email_ai_search(arg)
+                else:
+                    self._whimai_append("Usage: /email search <query>\n", "ai")
+            else:
+                self._whimai_append(
+                    "Email commands:\n"
+                    "  /email list [count]   — list inbox headers (default 5)\n"
+                    "  /email read <id>      — read email by message ID\n"
+                    "  /email search <query> — search emails\n", "ai")
+            return True
+
+        # -- Natural-language bridge: map common phrases to system calls --
+        result = match_intent(text)
+        if result:
+            intent, arg = result
+            return self._whimai_bridge_dispatch(intent, arg)
+
+        # -- GBrain commands --
+        if lower.startswith("/gbrain"):
+            parts = text.split(None, 2)
+            sub = parts[1].lower() if len(parts) > 1 else "status"
+            arg = parts[2] if len(parts) > 2 else ""
+            self._whimai_cmd_gbrain(sub, arg)
+            return True
+
+        # -- Agentic proxy: soft keyword fallback (search_first_then_ask) --
+        proxy = proxy_match(text)
+        if proxy:
+            proxy_intent, action = proxy
+            return self._whimai_proxy_dispatch(proxy_intent, action, text)
+
+        return False
+
+    def _whimai_bridge_dispatch(self, intent, arg):
+        """Execute a system call matched by the AI bridge."""
+        audio_dirs = [UPLOAD_DIR, self.AUDIO_JR_DIR]
+
+        if intent == INTENT_LAST_PHONE_NOTES:
+            path = get_latest_upload(UPLOAD_DIR)
+            if path:
+                base = os.path.basename(path)
+                self._whimai_append(
+                    f"[SYSTEM] Last phone upload: {base}\n", "ai")
+                self._arc_agent_read(base)
+            else:
+                self._whimai_append("[SYSTEM] No uploads found in Journal.\n", "ai")
+            return True
+
+        if intent == INTENT_LAST_TRV_RECORDING:
+            path = get_latest_trv(audio_dirs)
+            if path:
+                self._whimai_append(
+                    f"[SYSTEM] TRV playback: {os.path.basename(path)}\n", "ai")
+                threading.Thread(
+                    target=lambda: _plat_play_audio(path), daemon=True).start()
+            else:
+                self._whimai_append("[SYSTEM] No TRV recordings found.\n", "ai")
+            return True
+
+        if intent == INTENT_PLAY_LAST_AUDIO:
+            path = get_latest_audio(audio_dirs)
+            if path:
+                self._whimai_append(
+                    f"[SYSTEM] Playing last audio: {os.path.basename(path)}\n", "ai")
+                threading.Thread(
+                    target=lambda: _plat_play_audio(path), daemon=True).start()
+            else:
+                self._whimai_append("[SYSTEM] No audio files found.\n", "ai")
+            return True
+
+        if intent == INTENT_PLAY_TRV:
+            path = get_latest_trv(audio_dirs)
+            if path:
+                self._whimai_append(
+                    f"[SYSTEM] TRV playback: {os.path.basename(path)}\n", "ai")
+                threading.Thread(
+                    target=lambda: _plat_play_audio(path), daemon=True).start()
+            else:
+                self._whimai_append("[SYSTEM] No TRV files found.\n", "ai")
+            return True
+
+        if intent == INTENT_WHAT_WAS_TRV:
+            path = get_latest_trv(audio_dirs)
+            if path:
+                import time as _time
+                mtime = os.path.getmtime(path)
+                ts = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(mtime))
+                sz = os.path.getsize(path)
+                sz_str = f"{sz / 1024:.1f} KB" if sz < 1048576 else f"{sz / 1048576:.1f} MB"
+                self._whimai_append(
+                    f"[SYSTEM] Last TRV file: {os.path.basename(path)}\n"
+                    f"  Path: {path}\n  Modified: {ts}\n  Size: {sz_str}\n", "ai")
+            else:
+                self._whimai_append("[SYSTEM] No TRV files found.\n", "ai")
+            return True
+
+        if intent == INTENT_ARC_SPEAK:
+            if arg:
+                self._arc_agent_speak(arg)
+            else:
+                self._whimai_append("Usage: /arc speak <filename>\n", "ai")
+            return True
+
+        if intent == INTENT_ARC_READ:
+            if arg:
+                self._arc_agent_read(arg)
+            else:
+                self._whimai_append("Usage: /arc read <filename>\n", "ai")
+            return True
+
+        if intent == INTENT_ARC_LIST:
+            self._arc_agent_list(arg if arg else None)
+            return True
+
+        if intent == INTENT_ARC_SEARCH:
+            if arg:
+                self._arc_agent_search(arg)
+            else:
+                self._whimai_append("Usage: /arc search <query>\n", "ai")
+            return True
+
+        return False
+
+    def _whimai_proxy_dispatch(self, proxy_intent, action, original_text):
+        """Handle soft keyword hits from the agentic proxy.
+
+        The default_action 'search_first_then_ask' means: run a search/list
+        to show the user what's available, then let them pick.
+        """
+        if proxy_intent == PROXY_INTENT_AUDIO:
+            audio_dirs = [UPLOAD_DIR, self.AUDIO_JR_DIR]
+            if action == "search_first_then_ask":
+                path = get_latest_audio(audio_dirs)
+                if path:
+                    import time as _time
+                    mtime = os.path.getmtime(path)
+                    ts = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(mtime))
+                    self._whimai_append(
+                        f"[PROXY] Audio detected. Most recent: {os.path.basename(path)} "
+                        f"({ts})\n  → Say 'play it' to listen, or 'play the TRV' for "
+                        f"cipher files.\n", "ai")
+                else:
+                    self._whimai_append(
+                        "[PROXY] No audio files found in Journal or audioJR.\n", "ai")
+            else:
+                path = get_latest_audio(audio_dirs)
+                if path:
+                    threading.Thread(
+                        target=lambda: _plat_play_audio(path), daemon=True).start()
+                    self._whimai_append(
+                        f"[PROXY] Playing: {os.path.basename(path)}\n", "ai")
+                else:
+                    self._whimai_append("[PROXY] No audio files found.\n", "ai")
+            return True
+
+        if proxy_intent == PROXY_INTENT_ARCHIVE:
+            if action == "search_first_then_ask":
+                words = re.findall(r"[a-z]{3,}", original_text.lower())
+                skip = {"the", "read", "find", "show", "what", "notes",
+                        "cellphone", "phone", "app", "last", "from", "get",
+                        "pull", "open", "that", "this", "those", "with"}
+                query_words = [w for w in words if w not in skip]
+                if query_words:
+                    query = " ".join(query_words[:3])
+                    self._whimai_append(
+                        f"[PROXY] Searching archive for: {query}\n", "ai")
+                    self._arc_agent_search(query)
+                else:
+                    self._whimai_append(
+                        "[PROXY] Listing recent archive files:\n", "ai")
+                    self._arc_agent_list(None)
+            else:
+                self._arc_agent_list(None)
             return True
 
         return False
@@ -2641,6 +4104,150 @@ class ModernApp(tk.Tk):
         result_text = "\n".join(lines)
         self._whimai_chat_history.append({"role": "assistant", "content": result_text})
         self.whimai_status_var.set("Ready")
+
+    # ==================== ARCHIVE AGENT COMMANDS ====================
+
+    def _arc_agent_resolve(self, name_hint):
+        """Resolve a filename hint to an actual archive file (case-insensitive, partial match)."""
+        if not os.path.isdir(ARCHIVE_DIR):
+            return None
+        hint_lower = name_hint.lower()
+        exact = os.path.join(ARCHIVE_DIR, name_hint)
+        if os.path.isfile(exact):
+            return exact
+        for fn in os.listdir(ARCHIVE_DIR):
+            if fn.lower() == hint_lower and os.path.isfile(os.path.join(ARCHIVE_DIR, fn)):
+                return os.path.join(ARCHIVE_DIR, fn)
+        for fn in os.listdir(ARCHIVE_DIR):
+            if hint_lower in fn.lower() and os.path.isfile(os.path.join(ARCHIVE_DIR, fn)):
+                return os.path.join(ARCHIVE_DIR, fn)
+        return None
+
+    def _arc_agent_list(self, query=None):
+        """List archive files, optionally filtered."""
+        self.whimai_status_var.set("Listing archive...")
+        try:
+            if not os.path.isdir(ARCHIVE_DIR):
+                self._whimai_append(f"[Archive] Directory not found: {ARCHIVE_DIR}\n", "ai")
+                return
+            entries = []
+            for entry in os.scandir(ARCHIVE_DIR):
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                if query and query.lower() not in name.lower():
+                    continue
+                try:
+                    stat = entry.stat()
+                    size = stat.st_size
+                    mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+                    if size < 1024:
+                        sz = f"{size} B"
+                    elif size < 1048576:
+                        sz = f"{size / 1024:.1f} KB"
+                    else:
+                        sz = f"{size / 1048576:.1f} MB"
+                except OSError:
+                    sz, mtime = "?", "?"
+                entries.append(f"  {mtime}  {sz:>10}  {name}")
+            entries.sort(reverse=True)
+            header = f"── ARCHIVE ({ARCHIVE_DIR}) ──"
+            if query:
+                header += f"  filter: \"{query}\""
+            header += f"  ({len(entries)} files)"
+            lines = [header, ""] + entries if entries else [header, "", "  (no matching files)"]
+            out = "\n".join(lines) + "\n"
+            self._whimai_append(out, "ai")
+            self._whimai_chat_history.append({"role": "assistant", "content": out})
+        except Exception as e:
+            self._whimai_append(f"[Archive list error]: {e}\n", "ai")
+        finally:
+            self.whimai_status_var.set("Ready")
+
+    def _arc_agent_read(self, name_hint):
+        """Read an archive file and display its content in the AI chat."""
+        self.whimai_status_var.set(f"Reading archive: {name_hint}...")
+        path = self._arc_agent_resolve(name_hint)
+        if not path:
+            self._whimai_append(f"[Archive] File not found: {name_hint}\n", "ai")
+            self.whimai_status_var.set("Ready")
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+            base = os.path.basename(path)
+            size = len(content)
+            if size > 8000:
+                preview = content[:8000]
+                truncated = f"\n... (truncated — {size} chars total, showing first 8000)\n"
+            else:
+                preview = content
+                truncated = ""
+            header = f"── ARCHIVE FILE: {base} ({size} chars) ──\n"
+            out = header + preview + truncated
+            self._whimai_append(out, "ai")
+            self._whimai_chat_history.append({"role": "assistant", "content": out})
+        except Exception as e:
+            self._whimai_append(f"[Archive read error]: {e}\n", "ai")
+        finally:
+            self.whimai_status_var.set("Ready")
+
+    def _arc_agent_speak(self, name_hint):
+        """Read an archive file and speak it aloud via TTS."""
+        self.whimai_status_var.set(f"Loading archive for TTS: {name_hint}...")
+        path = self._arc_agent_resolve(name_hint)
+        if not path:
+            self._whimai_append(f"[Archive] File not found: {name_hint}\n", "ai")
+            self.whimai_status_var.set("Ready")
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+            base = os.path.basename(path)
+            clean = content.strip()
+            if clean.startswith("--- Archive Entry ---"):
+                idx = clean.find("---\n\n")
+                if idx != -1:
+                    clean = clean[idx + 5:]
+            self._whimai_append(f"[Speaking archive file: {base} ({len(clean)} chars)]\n", "ai")
+            self._speak_text(clean)
+        except Exception as e:
+            self._whimai_append(f"[Archive speak error]: {e}\n", "ai")
+            self.whimai_status_var.set("Ready")
+
+    def _arc_agent_search(self, query):
+        """Search inside archive file contents for a query string."""
+        self.whimai_status_var.set(f"Searching archive: {query}...")
+        try:
+            if not os.path.isdir(ARCHIVE_DIR):
+                self._whimai_append(f"[Archive] Directory not found: {ARCHIVE_DIR}\n", "ai")
+                return
+            results = []
+            q_lower = query.lower()
+            for fn in sorted(os.listdir(ARCHIVE_DIR)):
+                fpath = os.path.join(ARCHIVE_DIR, fn)
+                if not os.path.isfile(fpath):
+                    continue
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                        lines = fh.readlines()
+                    for i, line in enumerate(lines, 1):
+                        if q_lower in line.lower():
+                            snippet = line.strip()[:120]
+                            results.append(f"  {fn}:{i}  {snippet}")
+                except (OSError, UnicodeDecodeError):
+                    continue
+            header = f"── ARCHIVE SEARCH: \"{query}\" ── ({len(results)} hits)"
+            lines = [header, ""] + results[:50] if results else [header, "", "  (no matches)"]
+            if len(results) > 50:
+                lines.append(f"  ... and {len(results) - 50} more matches")
+            out = "\n".join(lines) + "\n"
+            self._whimai_append(out, "ai")
+            self._whimai_chat_history.append({"role": "assistant", "content": out})
+        except Exception as e:
+            self._whimai_append(f"[Archive search error]: {e}\n", "ai")
+        finally:
+            self.whimai_status_var.set("Ready")
 
     def _whimai_cmd_diagnose(self):
         """Run health checks across Whim subsystems."""
@@ -2723,6 +4330,279 @@ class ModernApp(tk.Tk):
         self._whimai_chat_history.append({"role": "assistant", "content": result_text})
         self.whimai_status_var.set("Ready")
 
+    # ── OpenFang kernel integration ────────────────────────────────
+
+    _openfang_status_hook = None  # placeholder for future HUD callback
+
+    def _openfang_notify_hook(self, state):
+        """Status hook for the future floating HUD. Receives 'green', 'yellow', or 'red'."""
+        if callable(self._openfang_status_hook):
+            try:
+                self._openfang_status_hook(state)
+            except Exception:
+                pass
+
+    def _openfang_read_kernel_state(self):
+        if not os.path.isfile(OPENFANG_STATE_FILE):
+            return "unknown"
+        try:
+            with open(OPENFANG_STATE_FILE, "r") as f:
+                return json.load(f).get("state", "unknown")
+        except Exception:
+            return "unknown"
+
+    def _openfang_get_latest_kickback(self):
+        if not os.path.isdir(KICKBACKS_DIR):
+            return None, None
+        files = [f for f in os.listdir(KICKBACKS_DIR)
+                 if f.startswith("kickback_") and f.endswith(".md")]
+        if not files:
+            return None, None
+        files.sort(reverse=True)
+        path = os.path.join(KICKBACKS_DIR, files[0])
+        try:
+            with open(path, "r") as f:
+                content = f.read()
+            return path, content
+        except Exception:
+            return path, None
+
+    def _openfang_parse_kickback(self, content):
+        """Parse YAML frontmatter from a kickback document."""
+        result = {}
+        if not content or "---" not in content:
+            return result
+        parts = content.split("---", 2)
+        if len(parts) < 3:
+            return result
+        for line in parts[1].strip().splitlines():
+            if ":" in line:
+                key, _, val = line.partition(":")
+                result[key.strip()] = val.strip().strip('"')
+        return result
+
+    def _whimai_cmd_gbrain(self, sub, arg):
+        """Handle /gbrain <sub> [arg] commands."""
+        import subprocess as _sp
+        cfg = self._load_settings().get("gbrain", {})
+        install_dir = cfg.get("install_dir", os.path.expanduser("~/gbrain"))
+        bun = os.path.expanduser("~/.bun/bin/bun")
+        cli = os.path.join(install_dir, "src", "cli.ts")
+        if not os.path.isfile(cli):
+            self._whimai_append("[GBrain] Not installed. Configure in Settings > GBrain tab.\n", "ai")
+            self.whimai_status_var.set("Ready")
+            return
+        if sub == "status":
+            self.whimai_status_var.set("GBrain status...")
+            def _st():
+                try:
+                    r = _sp.run([bun, "run", cli, "stats"],
+                                capture_output=True, text=True, timeout=15,
+                                cwd=install_dir)
+                    out = r.stdout.strip() if r.returncode == 0 else f"Error: {r.stderr.strip()[:200]}"
+                except Exception as ex:
+                    out = f"Error: {ex}"
+                self.after(0, lambda: self._whimai_append(f"[GBrain Status]\n{out}\n", "ai"))
+                self.after(0, lambda: self.whimai_status_var.set("Ready"))
+            threading.Thread(target=_st, daemon=True).start()
+        elif sub == "query" and arg:
+            self.whimai_status_var.set(f"GBrain query: {arg[:40]}...")
+            def _q():
+                try:
+                    r = _sp.run([bun, "run", cli, "query", arg],
+                                capture_output=True, text=True, timeout=30,
+                                cwd=install_dir)
+                    out = r.stdout.strip() if r.returncode == 0 else f"Error: {r.stderr.strip()[:200]}"
+                except Exception as ex:
+                    out = f"Error: {ex}"
+                self.after(0, lambda: self._whimai_append(f"[GBrain Query: {arg}]\n{out}\n", "ai"))
+                self._whimai_chat_history.append({"role": "assistant", "content": f"[GBrain Query: {arg}]\n{out}"})
+                self.after(0, lambda: self.whimai_status_var.set("Ready"))
+            threading.Thread(target=_q, daemon=True).start()
+        elif sub == "search" and arg:
+            self.whimai_status_var.set(f"GBrain search: {arg[:40]}...")
+            def _s():
+                try:
+                    r = _sp.run([bun, "run", cli, "search", arg],
+                                capture_output=True, text=True, timeout=15,
+                                cwd=install_dir)
+                    out = r.stdout.strip() if r.returncode == 0 else f"Error: {r.stderr.strip()[:200]}"
+                except Exception as ex:
+                    out = f"Error: {ex}"
+                self.after(0, lambda: self._whimai_append(f"[GBrain Search: {arg}]\n{out}\n", "ai"))
+                self._whimai_chat_history.append({"role": "assistant", "content": f"[GBrain Search: {arg}]\n{out}"})
+                self.after(0, lambda: self.whimai_status_var.set("Ready"))
+            threading.Thread(target=_s, daemon=True).start()
+        else:
+            self._whimai_append(
+                "Usage: /gbrain <query|search|status> [argument]\n"
+                "  /gbrain query <question>  — hybrid brain search with synthesis\n"
+                "  /gbrain search <term>     — keyword search in the brain\n"
+                "  /gbrain status            — show brain stats and health\n",
+                "ai")
+
+    def _openfang_cmd_status(self):
+        """Show OpenFang kernel status and latest kickback summary."""
+        self.whimai_status_var.set("Checking OpenFang...")
+        state = self._openfang_read_kernel_state()
+        state_display = {"green": "[ACTIVE]", "yellow": "[PROCESSING]",
+                         "red": "[STOPPED]"}.get(state, "[UNKNOWN]")
+        lines = ["── OPENFANG STATUS ──", ""]
+        lines.append(f"  Kernel State:   {state_display} ({state})")
+        lines.append(f"  Kickbacks Dir:  {KICKBACKS_DIR}")
+
+        path, content = self._openfang_get_latest_kickback()
+        if path:
+            kb = self._openfang_parse_kickback(content)
+            lines.append(f"  Latest File:    {os.path.basename(path)}")
+            lines.append(f"  Timestamp:      {kb.get('timestamp', 'n/a')}")
+            lines.append(f"  Confidence:     {kb.get('confidence', 'n/a')}")
+            lines.append(f"  Source:         {kb.get('source', 'n/a')}")
+            lines.append(f"  Summary:        {kb.get('neural_summary', 'n/a')}")
+        else:
+            lines.append("  Latest File:    (no kickbacks found)")
+
+        self._openfang_notify_hook(state if state in ("green", "yellow", "red") else "red")
+        self._whimai_append("\n".join(lines) + "\n", "ai")
+        self._whimai_chat_history.append({"role": "assistant", "content": "\n".join(lines)})
+        self.whimai_status_var.set("Ready")
+
+    def _openfang_cmd_chk(self):
+        """Read and display the latest OpenFang kickback document."""
+        self.whimai_status_var.set("Reading kickback...")
+        path, content = self._openfang_get_latest_kickback()
+        if not path:
+            self._whimai_append("[OpenFang] No kickback documents found in "
+                                f"{KICKBACKS_DIR}\n", "ai")
+            self._openfang_notify_hook("red")
+            self.whimai_status_var.set("Ready")
+            return
+
+        kb = self._openfang_parse_kickback(content)
+        conf = kb.get("confidence", "?")
+        try:
+            conf_f = float(conf)
+            conf_tag = "HIGH" if conf_f >= 0.8 else "MED" if conf_f >= 0.5 else "LOW"
+        except (ValueError, TypeError):
+            conf_tag = "?"
+
+        lines = [
+            "── OPENFANG KICKBACK ──", "",
+            f"  File:          {os.path.basename(path)}",
+            f"  Timestamp:     {kb.get('timestamp', 'n/a')}",
+            f"  Confidence:    {conf} ({conf_tag})",
+            f"  Coordinate:    {kb.get('coordinate', 'n/a')}",
+            f"  Source:        {kb.get('source', 'n/a')}",
+            f"  Kernel State:  {kb.get('kernel_state', 'n/a')}",
+            "",
+            f"  Visual:        {kb.get('visual_description', 'n/a')}",
+            f"  OCR Text:      {kb.get('ocr_text', 'n/a')}",
+            f"  Neural:        {kb.get('neural_summary', 'n/a')}",
+            f"  Context Hash:  {kb.get('context_hash', 'n/a')}",
+        ]
+
+        self._openfang_notify_hook("yellow")
+        self._whimai_append("\n".join(lines) + "\n", "ai")
+        self._whimai_chat_history.append({"role": "assistant", "content": "\n".join(lines)})
+        self.whimai_status_var.set("Ready")
+
+    def _openfang_cmd_solve(self):
+        """Feed the latest kickback to Ollama and display AI analysis."""
+        path, content = self._openfang_get_latest_kickback()
+        if not path:
+            self._whimai_append("[OpenFang] No kickback to solve. "
+                                "Run the kernel or stub first.\n", "ai")
+            self.whimai_status_var.set("Ready")
+            return
+
+        state = self._openfang_read_kernel_state()
+        if state == "red":
+            self._whimai_append("[OpenFang] Kernel is STOPPED (red). "
+                                "Reset via the status window before solving.\n", "ai")
+            self._openfang_notify_hook("red")
+            self.whimai_status_var.set("Ready")
+            return
+
+        self._openfang_notify_hook("yellow")
+        self.whimai_status_var.set("OpenFang: solving...")
+        self._whimai_streaming = True
+
+        kb = self._openfang_parse_kickback(content)
+        solve_prompt = (
+            "You are WISP, the Whim Terminal systems processor. "
+            "The OpenFang visual watchdog kernel has detected an issue. "
+            "Analyze the following kickback and provide a concise diagnosis "
+            "with a proposed fix.\n\n"
+            f"Timestamp: {kb.get('timestamp', 'n/a')}\n"
+            f"Confidence: {kb.get('confidence', 'n/a')}\n"
+            f"Visual Description: {kb.get('visual_description', 'n/a')}\n"
+            f"OCR Text: {kb.get('ocr_text', 'n/a')}\n"
+            f"Neural Summary: {kb.get('neural_summary', 'n/a')}\n"
+            f"Source: {kb.get('source', 'n/a')}\n"
+            f"Context Hash: {kb.get('context_hash', 'n/a')}\n\n"
+            "Provide: 1) Root cause  2) Severity (low/med/high)  3) Proposed fix"
+        )
+
+        self._whimai_chat_history.append({"role": "user", "content": solve_prompt})
+        self._whimai_append(f"> /solve — analyzing kickback: {os.path.basename(path)}\n", "user")
+        threading.Thread(target=self._openfang_solve_stream,
+                         args=(solve_prompt,), daemon=True).start()
+
+    def _openfang_solve_stream(self, prompt):
+        """Stream Ollama response for a /solve kickback analysis."""
+        import urllib.request
+        import time as _time
+        wall_start = _time.time()
+        try:
+            messages = self._freshtail.build_context(
+                self._whimai_chat_history,
+                system_prompt="",
+                ctx_limit=8192,
+                preset_name=self._whimai_active_preset
+            )
+            payload = json.dumps({
+                "model": self._whimai_model,
+                "messages": messages,
+                "stream": True,
+                "options": {"temperature": 0.4, "num_ctx": 8192}
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self._whimai_ollama_url}/api/chat",
+                data=payload, method="POST",
+                headers={"Content-Type": "application/json"})
+            self.after(0, lambda: self._whimai_append("", "ai"))
+            full_response = []
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                buf = b""
+                while True:
+                    chunk = resp.read(1)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if chunk == b"\n" and buf.strip():
+                        try:
+                            data = json.loads(buf.strip())
+                            token = data.get("message", {}).get("content", "")
+                            if token:
+                                full_response.append(token)
+                                self.after(0, lambda t=token: self._whimai_append(t, "ai"))
+                            if data.get("done", False):
+                                break
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        buf = b""
+            assistant_text = "".join(full_response)
+            self._whimai_chat_history.append({"role": "assistant", "content": assistant_text})
+            self.after(0, lambda: self._whimai_append("\n", "ai"))
+            self.after(0, lambda: self.whimai_status_var.set("Ready"))
+            self.after(0, lambda: self._openfang_notify_hook("green"))
+        except Exception as e:
+            self.after(0, lambda: self._whimai_append(f"\n[OpenFang Solve Error: {e}]\n", "ai"))
+            self.after(0, lambda: self.whimai_status_var.set("Error"))
+            self.after(0, lambda: self._openfang_notify_hook("red"))
+        finally:
+            self._whimai_streaming = False
+
     def _whimai_send(self):
         if self._whimai_placeholder_active:
             return
@@ -2760,49 +4640,152 @@ class ModernApp(tk.Tk):
             preset = self._whimai_presets.get(self._whimai_active_preset, {})
             temperature = preset.get("temp", 0.7)
             num_ctx = preset.get("ctx", 16384)
-            sys_prompt = preset.get("system", "") or (
+            base_prompt = preset.get("system", "") or (
                 "You are OpenClaw, the AI assistant powering the Whim ecosystem. "
                 "You have tool access and can execute commands the user requests. "
-                "Available local commands: /browse <incoming|downloads|vaults> [query], "
-                "/search <query> (search all folders), /diagnose (system health check). "
+                "Available local commands: /browse <incoming|downloads|vaults|archive> [query], "
+                "/search <query> (search all folders), /diagnose (system health check), "
+                "/openfang (kernel status), /chk (read kickback), /solve (AI kickback analysis). "
+                "Archive agent commands: /arc list [filter] (list archive files), "
+                "/arc read <file> (retrieve and display an archive file), "
+                "/arc speak <file> (read an archive file aloud via TTS), "
+                "/arc search <query> (search inside archive file contents). "
+                "Email commands: /email list [count] (list inbox headers), "
+                "/email read <id> (read email by message ID), "
+                "/email search <query> (search emails). "
+                "You have autonomous access to the Archive. When the user asks about past entries, "
+                "documents, changelogs, or saved files, proactively use /arc commands to retrieve "
+                "and present the information. If the user asks you to read something aloud, use /arc speak. "
+                "IMPORTANT: When asked about email, NEVER guess or fabricate email content. "
+                "If you have the email_himalaya tool available, use it. Otherwise, tell the user "
+                "to run /email list or /email read <id> to see real inbox data. "
+                "GBrain commands: /gbrain query <question> (search the brain), "
+                "/gbrain search <term> (keyword search), /gbrain status (check brain health). "
                 "Be concise and direct. You are always ready to act."
+            ) + PLAYBACK_PRIORITY_PROMPT + _AGENT_LOGIC_PROMPT
+            try:
+                from whim_dictionary import build_whimai_context_block
+                base_prompt += "\n\n" + build_whimai_context_block()
+            except ImportError:
+                pass
+            if hasattr(self, "_whim_env"):
+                self._whim_env.set_current(self._whimai_model)
+                sys_prompt = base_prompt + "\n\n" + self._whim_env.build_manifest()
+            else:
+                sys_prompt = base_prompt
+            messages = self._freshtail.build_context(
+                self._whimai_chat_history,
+                system_prompt=sys_prompt,
+                ctx_limit=num_ctx,
+                preset_name=self._whimai_active_preset
             )
-            messages = list(self._whimai_chat_history)
-            if sys_prompt and (not messages or messages[0].get("role") != "system"):
-                messages.insert(0, {"role": "system", "content": sys_prompt})
-            payload = json.dumps({
+            ollama_tools = self._build_ollama_tools()
+
+            # -- Cloud fallback path when Ollama is unreachable --
+            if not _check_ollama(self._whimai_ollama_url):
+                self.after(0, lambda: self._whimai_append("", "ai"))
+                self.after(0, lambda: self._obs_start_event("LLM inference (routed)"))
+                full_response = []
+                _routed_source = "none"
+                for token, done, source, err in _route_stream(
+                        self._whimai_ollama_url, messages,
+                        self._whimai_model, temperature, num_ctx):
+                    _routed_source = source
+                    if err and not full_response:
+                        self.after(0, lambda e=err: self._whimai_append(
+                            f"\n[Router: {e}]\n", "ai"))
+                        break
+                    if token:
+                        full_response.append(token)
+                        self.after(0, lambda t=token: self._whimai_append(t, "ai"))
+                    if done:
+                        break
+                if _routed_source != "ollama" and _routed_source != "none":
+                    self.after(0, lambda s=_routed_source: self.whimai_status_var.set(
+                        f"Routed via {s}"))
+                assistant_text = "".join(full_response)
+                self._whimai_chat_history.append({"role": "assistant", "content": assistant_text})
+                wall_ms = (_time.time() - wall_start) * 1000.0
+                turn["total_ms"] = wall_ms
+                turn["eval_tokens"] = len(assistant_text.split())
+                self._whimai_turn_data.append(turn)
+                self.after(0, self._obs_end_event)
+                self.after(0, lambda: self._whimai_append("\n", "ai"))
+                self.after(0, lambda: self.whimai_status_var.set("Ready"))
+                self.after(0, lambda: self._whimai_update_turn_labels(turn))
+                self.after(0, self._whimai_update_ctx_meter)
+                if self._auto_speak and assistant_text.strip():
+                    self.after(100, lambda t=assistant_text: self._speak_text(t))
+                return  # skip the Ollama tool-call loop
+
+            # -- Standard Ollama path (with tool calls) --
+            base_payload = {
                 "model": self._whimai_model,
                 "messages": messages,
                 "stream": True,
                 "options": {"temperature": temperature, "num_ctx": num_ctx}
-            }).encode("utf-8")
+            }
+            if ollama_tools:
+                base_payload["tools"] = ollama_tools
+            payload = json.dumps(base_payload).encode("utf-8")
             req = urllib.request.Request(
                 f"{self._whimai_ollama_url}/api/chat",
                 data=payload, method="POST",
                 headers={"Content-Type": "application/json"})
             self.after(0, lambda: self._whimai_append("", "ai"))
+            self.after(0, lambda: self._obs_start_event("LLM inference"))
             full_response = []
             final_data = {}
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                buf = b""
-                while True:
-                    chunk = resp.read(1)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    if chunk == b"\n" and buf.strip():
-                        try:
-                            data = json.loads(buf.strip())
-                            token = data.get("message", {}).get("content", "")
-                            if token:
-                                full_response.append(token)
-                                self.after(0, lambda t=token: self._whimai_append(t, "ai"))
-                            if data.get("done", False):
-                                final_data = data
-                                break
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-                        buf = b""
+            max_tool_rounds = 3
+            tool_round = 0
+            while True:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    buf = b""
+                    while True:
+                        chunk = resp.read(1)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        if chunk == b"\n" and buf.strip():
+                            try:
+                                data = json.loads(buf.strip())
+                                token = data.get("message", {}).get("content", "")
+                                if token:
+                                    full_response.append(token)
+                                    self.after(0, lambda t=token: self._whimai_append(t, "ai"))
+                                if data.get("done", False):
+                                    final_data = data
+                                    break
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+                            buf = b""
+                tool_calls = final_data.get("message", {}).get("tool_calls", [])
+                if tool_calls and tool_round < max_tool_rounds:
+                    tool_round += 1
+                    assistant_text_so_far = "".join(full_response)
+                    assistant_msg = {"role": "assistant", "content": assistant_text_so_far}
+                    assistant_msg["tool_calls"] = tool_calls
+                    messages.append(assistant_msg)
+                    for tc in tool_calls:
+                        fname = tc.get("function", {}).get("name", "unknown")
+                        fargs = tc.get("function", {}).get("arguments", {})
+                        self.after(0, lambda n=fname: self._whimai_append(
+                            f"\n[Tool: {n}]\n", "ai"))
+                        self.after(0, lambda: self.whimai_status_var.set("Executing tool..."))
+                        result = self._execute_tool_call(fname, fargs)
+                        result_str = json.dumps(result, indent=2)
+                        messages.append({"role": "tool", "content": result_str})
+                    base_payload["messages"] = messages
+                    payload = json.dumps(base_payload).encode("utf-8")
+                    req = urllib.request.Request(
+                        f"{self._whimai_ollama_url}/api/chat",
+                        data=payload, method="POST",
+                        headers={"Content-Type": "application/json"})
+                    full_response = []
+                    final_data = {}
+                    self.after(0, lambda: self.whimai_status_var.set("Thinking..."))
+                    continue
+                break
             assistant_text = "".join(full_response)
             self._whimai_chat_history.append({"role": "assistant", "content": assistant_text})
             wall_ms = (_time.time() - wall_start) * 1000.0
@@ -2819,14 +4802,18 @@ class ModernApp(tk.Tk):
             self._whimai_total_eval_tokens += turn["eval_tokens"]
             self._whimai_turn_data.append(turn)
             turn_idx = len(self._whimai_turn_data)
+            self.after(0, self._obs_end_event)
             self.after(0, lambda: self._whimai_append("\n", "ai"))
             self.after(0, lambda: self.whimai_status_var.set("Ready"))
             self.after(0, lambda: self._whimai_update_turn_labels(turn))
             self.after(0, lambda: self._whimai_update_perf_panel(turn))
             self.after(0, lambda: self._whimai_add_trace_entry(turn_idx, turn))
             self.after(0, self._whimai_update_ctx_meter)
+            if self._auto_speak and assistant_text.strip():
+                self.after(100, lambda t=assistant_text: self._speak_text(t))
         except Exception as e:
             wall_ms = (_time.time() - wall_start) * 1000.0
+            self.after(0, self._obs_end_event)
             turn["failed"] = True
             turn["error"] = str(e)
             turn["total_ms"] = wall_ms
@@ -2848,8 +4835,215 @@ class ModernApp(tk.Tk):
         self.whimai_log.config(state="disabled")
         self._whimai_update_gutter()
 
+    def _whimai_boot_banner(self):
+        model = self._global_model_var.get()
+        ollama_url = self._whimai_ollama_url
+        ollama_ok = False
+        model_count = 0
+        try:
+            import urllib.request
+            url = ollama_url.rstrip("/") + "/api/tags"
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                data = json.loads(resp.read())
+                ollama_ok = True
+                model_count = len(data.get("models", []))
+        except Exception:
+            pass
+        gpu_active = self._whimai_sys_telemetry.get("vram_mb", 0) > 0
+        lines = []
+        lines.append("  WHIM TERMINAL v3.5.0")
+        lines.append("  Local-First \u2022 No Cloud \u2022 No Telemetry")
+        lines.append("")
+        if ollama_ok:
+            lines.append(f"  \u25cf Ollama online \u2014 {model_count} model(s) loaded")
+        else:
+            lines.append("  \u25cb Ollama offline \u2014 check http://localhost:11434")
+        lines.append(f"  \u25cf Active model: {model}")
+        if gpu_active:
+            vram = self._whimai_sys_telemetry.get("vram_mb", 0)
+            gpu = self._whimai_sys_telemetry.get("gpu_util", 0)
+            lines.append(f"  \u25cf GPU engaged \u2014 VRAM {vram}MB / {gpu}% util")
+        else:
+            lines.append("  \u25cb GPU: not detected or idle")
+        lines.append("")
+        lines.append("  WISP resident agent standing by.")
+        lines.append("  Type a message, or try /browse, /search, /email, /diagnose")
+        lines.append("")
+        self.whimai_log.config(state="normal")
+        self.whimai_log.tag_configure("boot_header", foreground="#2fa572",
+                                       font=(_FONTS["mono"], 10, "bold"))
+        self.whimai_log.tag_configure("boot_info", foreground="#8a7a6a",
+                                       font=(_FONTS["mono"], 9))
+        self.whimai_log.tag_configure("boot_ok", foreground="#2fa572",
+                                       font=(_FONTS["mono"], 9))
+        self.whimai_log.tag_configure("boot_warn", foreground="#c4382a",
+                                       font=(_FONTS["mono"], 9))
+        self.whimai_log.insert("end", lines[0] + "\n", "boot_header")
+        self.whimai_log.insert("end", lines[1] + "\n", "boot_info")
+        self.whimai_log.insert("end", "\n")
+        for line in lines[3:]:
+            if line.startswith("  \u25cf"):
+                self.whimai_log.insert("end", line + "\n", "boot_ok")
+            elif line.startswith("  \u25cb"):
+                self.whimai_log.insert("end", line + "\n", "boot_warn")
+            elif line.startswith("  WISP"):
+                self.whimai_log.insert("end", line + "\n", "boot_header")
+            elif line.startswith("  Type"):
+                self.whimai_log.insert("end", line + "\n", "boot_info")
+            else:
+                self.whimai_log.insert("end", line + "\n", "boot_info")
+        self.whimai_log.config(state="disabled")
+        self._whimai_update_gutter()
+
     def _whimai_defrag(self):
         pass
+
+    # ==================== SPEECH PIPELINE INTEGRATION ====================
+
+    def _launch_revyfloat(self):
+        import subprocess
+        script = os.path.expanduser("~/revyfloat/launch.sh")
+        if not os.path.isfile(script):
+            self._whimai_append("[Revyfloat not found: ~/revyfloat/launch.sh]\n", "ai")
+            return
+        self._obs_start_event("Revyfloat lip-sync")
+        subprocess.Popen(["bash", script], start_new_session=True)
+        self.after(5000, self._obs_end_event)
+
+    def _toggle_auto_speak(self):
+        self._auto_speak = not self._auto_speak
+        if hasattr(self, "_speak_indicator"):
+            self._speak_indicator.config(
+                text="\U0001F50A" if self._auto_speak else "",
+                fg=TH["green"] if self._auto_speak else TH["bg"])
+
+    def _ollama_unload_model(self):
+        """Unload the current Ollama model to free VRAM for TTS."""
+        try:
+            import urllib.request
+            payload = json.dumps({
+                "model": self._whimai_model,
+                "keep_alive": 0
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self._whimai_ollama_url}/api/generate",
+                data=payload, method="POST",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except Exception:
+            pass
+
+    def _speak_text(self, text):
+        if not self._speech_pipeline:
+            self._whimai_append("[Speech pipeline not available]\n", "ai")
+            return
+        if self._speech_pipeline.is_speaking:
+            self._speech_pipeline.stop()
+            import time as _t
+            _t.sleep(0.1)
+
+        clean = text.strip()
+        if len(clean) > 2000:
+            clean = clean[:2000]
+
+        self._speak_response_start_idx = self.whimai_log.index("end-2c linestart")
+        self.whimai_status_var.set("Speaking...")
+        self._obs_start_event("TTS / speech")
+
+        def on_tts_ready(result):
+            self._last_tts_wav = result.wav_path
+            self.after(0, lambda: self._whimai_append(
+                f"[TTS: {result.duration:.1f}s, {len(result.words)} words]\n", "ai"))
+
+        def on_word(idx, w):
+            self.after(0, lambda i=idx, word=w: self._speak_highlight_word(i, word))
+
+        def on_done(error):
+            self.after(0, self._obs_end_event)
+            self.after(0, self._speak_clear_highlights)
+            if error:
+                self.after(0, lambda: self._whimai_append(f"[Speech error: {error}]\n", "ai"))
+            self.after(0, lambda: self.whimai_status_var.set("Ready"))
+
+        avatar_fn = None
+        if getattr(self, "_avatar_server_running", False):
+            avatar_fn = _avatar_stream
+
+        from platform_compat import play_audio as _plat_play_audio
+        self._speech_pipeline.speak(
+            clean,
+            on_tts_ready=on_tts_ready,
+            on_word=on_word,
+            on_done=on_done,
+            avatar_stream_fn=avatar_fn,
+            play_audio_fn=_plat_play_audio,
+            pre_tts_fn=self._ollama_unload_model,
+        )
+
+    def _speak_highlight_word(self, word_idx, word_data):
+        self.whimai_log.tag_remove("speak_highlight", "1.0", "end")
+        word_text = word_data["word"]
+        start = self._speak_response_start_idx or "1.0"
+        pos = self.whimai_log.search(word_text, start, stopindex="end", nocase=True)
+        if pos:
+            end_pos = f"{pos}+{len(word_text)}c"
+            self.whimai_log.tag_add("speak_highlight", pos, end_pos)
+            self.whimai_log.see(pos)
+            self._speak_response_start_idx = end_pos
+
+    def _speak_clear_highlights(self):
+        self.whimai_log.tag_remove("speak_highlight", "1.0", "end")
+        self._speak_response_start_idx = None
+
+    def _export_tts_mp3(self):
+        wav = self._last_tts_wav
+        if not wav or not os.path.isfile(wav):
+            self._whimai_append("[No TTS audio to export — speak a response first]\n", "ai")
+            return
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        mp3_dir = os.path.join(HOME, "voices", "exports")
+        os.makedirs(mp3_dir, exist_ok=True)
+        mp3_path = os.path.join(mp3_dir, f"whim_tts_{ts}.mp3")
+        self.whimai_status_var.set("Exporting MP3...")
+
+        def _convert():
+            try:
+                result = subprocess.run(
+                    ["ffmpeg", "-y", "-i", wav, "-codec:a", "libmp3lame",
+                     "-qscale:a", "2", mp3_path],
+                    capture_output=True, text=True, timeout=30)
+                if result.returncode == 0 and os.path.isfile(mp3_path):
+                    size_kb = os.path.getsize(mp3_path) / 1024
+                    self.after(0, lambda: self._whimai_append(
+                        f"[Exported: {mp3_path} ({size_kb:.0f} KB)]\n", "ai"))
+                else:
+                    err = result.stderr.strip().split("\n")[-1] if result.stderr else "unknown error"
+                    self.after(0, lambda: self._whimai_append(
+                        f"[MP3 export failed: {err}]\n", "ai"))
+            except Exception as e:
+                self.after(0, lambda: self._whimai_append(
+                    f"[MP3 export error: {e}]\n", "ai"))
+            finally:
+                self.after(0, lambda: self.whimai_status_var.set("Ready"))
+
+        threading.Thread(target=_convert, daemon=True).start()
+
+    # ==================== END SPEECH PIPELINE ====================
+
+    def _preset_refresh_voice(self):
+        active_voice_file = os.path.join(XTTS_VOICES_DIR, "active_voice.json")
+        try:
+            if os.path.isfile(active_voice_file):
+                with open(active_voice_file, "r") as f:
+                    data = json.load(f)
+                name = data.get("name", "")
+                if name:
+                    self._preset_voice_lbl.config(text=name, fg=TH["green"])
+                    return
+        except Exception:
+            pass
+        self._preset_voice_lbl.config(text="(none)", fg=TH["fg2"])
 
     def _whimai_apply_preset(self):
         name = self._whimai_preset_var.get()
@@ -2862,11 +5056,1121 @@ class ModernApp(tk.Tk):
         self._global_model_var.set(p["model"])
         self._preset_model_lbl.config(text=p["model"])
         self._preset_ctx_lbl.config(text=str(p["ctx"]))
-        self._preset_temp_lbl.config(text=str(p["temp"]))
+        self._preset_temp_var.set(p["temp"])
         self._preset_tools_lbl.config(text=p["tools"])
         sys_text = p["system"] if p["system"] else "(none)"
         self._preset_sys_lbl.config(text=sys_text, fg=TH["fg"] if p["system"] else TH["fg2"])
+        self._preset_refresh_voice()
         self.whimai_status_var.set(f"Preset: {name}")
+
+    def _on_temp_slider_change(self, value):
+        preset = self._whimai_presets.get(self._whimai_active_preset)
+        if preset:
+            preset["temp"] = value
+
+    # ── OpenTailor: Tool Store & Architect ──────────────────────────
+
+    _GRID_COLS = 4
+
+    _TOOLSTORE_ICON_MAP = {
+        "System Admin": "systemadmin.png",
+        "Workspace": "Workspace.png",
+        "Web Intel": "Webintel.png",
+        "Creative": "Creative.png",
+        "Farm-Tech": "Farm.png",
+        "Development": "Development.png",
+        "Archive": "archive.png",
+    }
+    _TOOLSTORE_ICON_DIR = os.path.join(os.path.expanduser("~"), "settings")
+
+    def _load_toolstore_icon(self, bundle_name, size=32):
+        if not hasattr(self, "_ts_icon_cache"):
+            self._ts_icon_cache = {}
+        if bundle_name in self._ts_icon_cache:
+            return self._ts_icon_cache[bundle_name]
+        fname = self._TOOLSTORE_ICON_MAP.get(bundle_name)
+        if fname:
+            fpath = os.path.join(self._TOOLSTORE_ICON_DIR, fname)
+            if os.path.isfile(fpath):
+                try:
+                    img = Image.open(fpath).convert("RGBA").resize(
+                        (size, size), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self._ts_icon_cache[bundle_name] = photo
+                    return photo
+                except Exception:
+                    pass
+        self._ts_icon_cache[bundle_name] = None
+        return None
+
+    def _opentailor_build_bundle_grid(self):
+        for w in self._tailor_bundle_frame.winfo_children():
+            w.destroy()
+        self._tailor_tool_vars = {}
+        self._tailor_card_frames = {}
+        self._tailor_bundle_dots = {}
+        self._tailor_bundle_counts = {}
+        self._tailor_bundle_toggles = {}
+
+        preset = self._tailor_preset_var.get() if hasattr(self, "_tailor_preset_var") \
+            else self._whimai_active_preset
+        enabled_ids = self._tool_registry.get_tool_ids_for_preset(preset)
+
+        bundle_names = self._tool_registry.get_bundle_names()
+        for idx, bname in enumerate(bundle_names):
+            row = idx // self._GRID_COLS
+            col = idx % self._GRID_COLS
+            self._tailor_bundle_frame.columnconfigure(col, weight=1, uniform="card")
+            self._tailor_bundle_frame.rowconfigure(row, weight=0)
+
+            bdata = self._tool_registry.bundles[bname]
+            icon = bdata.get("icon", "")
+            risk = bdata.get("risk", "low")
+            risk_info = self._tool_registry.risk_levels.get(risk, {})
+            risk_color = risk_info.get("color", TH["fg2"])
+            risk_label = risk_info.get("label", risk)
+
+            tools = bdata.get("tools", [])
+            bundle_enabled = sum(1 for t in tools if t["id"] in enabled_ids)
+            all_on = bundle_enabled == len(tools)
+
+            all_descs = [t.get("description", "") for t in tools]
+            all_descs.append(bdata.get("description", ""))
+            max_desc_len = max((len(d) for d in all_descs), default=0)
+            tip_lines = max(2, -(-max_desc_len // 28))
+
+            card_bg = "#1e1a16" if risk in ("critical", "high") else TH["card"]
+            glow_color = risk_color if risk in ("critical", "high") else TH["border_hi"]
+            card = tk.Frame(self._tailor_bundle_frame, bg=card_bg, bd=0,
+                            highlightthickness=1, highlightbackground=glow_color)
+            card.grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
+            self._tailor_card_frames[bname] = card
+
+            icon_row = tk.Frame(card, bg=card_bg)
+            icon_row.pack(fill="x", padx=8, pady=(8, 2))
+            icon_photo = self._load_toolstore_icon(bname, size=32)
+            if icon_photo:
+                tk.Label(icon_row, image=icon_photo, bg=card_bg,
+                         bd=0).pack(side="left")
+            else:
+                tk.Label(icon_row, text=icon, bg=card_bg, fg=TH["fg"],
+                         font=(_FONTS["ui"], 20)).pack(side="left")
+
+            dot_color = "#2fa572" if all_on else ("#e0a030" if bundle_enabled > 0 else "#8a7a6a")
+            dot = tk.Canvas(icon_row, width=10, height=10, bg=card_bg,
+                            highlightthickness=0, bd=0)
+            dot.create_oval(1, 1, 9, 9, fill=dot_color, outline="")
+            dot.pack(side="right", padx=(0, 2), pady=2)
+            self._tailor_bundle_dots[bname] = dot
+
+            tk.Label(card, text=bname, bg=card_bg, fg=TH["fg"],
+                     font=(_FONTS["ui"], 10, "bold"), anchor="w").pack(
+                fill="x", padx=8, pady=(0, 1))
+
+            badge_frame = tk.Frame(card, bg=card_bg)
+            badge_frame.pack(fill="x", padx=8, pady=(0, 4))
+            badge = tk.Label(badge_frame, text=f" {risk_label} ",
+                             bg=risk_color, fg="#000000" if risk == "low" else "#ffffff",
+                             font=(_FONTS["mono"], 7, "bold"))
+            badge.pack(side="left")
+            count_lbl = tk.Label(badge_frame,
+                                 text=f"  {bundle_enabled}/{len(tools)} active",
+                                 bg=card_bg, fg=TH["fg2"],
+                                 font=(_FONTS["mono"], 7))
+            count_lbl.pack(side="left", padx=4)
+            self._tailor_bundle_counts[bname] = (count_lbl, len(tools))
+
+            tip_lbl = tk.Label(card, text="", bg=card_bg, fg=TH["fg2"],
+                               font=(_FONTS["ui"], 8), anchor="nw", wraplength=200,
+                               justify="left", height=tip_lines)
+            tip_lbl.pack(fill="x", padx=8, pady=(0, 2))
+
+            desc = bdata.get("description", "")
+            def _show_tip(e, lbl=tip_lbl, txt=desc):
+                lbl.config(text=txt)
+            def _hide_tip(e, lbl=tip_lbl):
+                lbl.config(text="")
+            card.bind("<Enter>", _show_tip)
+            card.bind("<Leave>", _hide_tip)
+
+            tk.Frame(card, bg=TH["border_hi"], height=1).pack(fill="x", padx=6, pady=(0, 4))
+
+            bundle_toggles = []
+            for tool in tools:
+                tid = tool["id"]
+                trisk = tool.get("risk", "low")
+                trisk_info = self._tool_registry.risk_levels.get(trisk, {})
+                tcolor = trisk_info.get("color", TH["fg2"])
+
+                var = tk.BooleanVar(value=(tid in enabled_ids))
+                self._tailor_tool_vars[tid] = var
+
+                trow = tk.Frame(card, bg=card_bg)
+                trow.pack(fill="x", padx=8, pady=1)
+
+                ts = ToggleSwitch(trow, variable=var, width=44, height=22,
+                                  bg=card_bg)
+                ts.pack(side="left", padx=(0, 4))
+                bundle_toggles.append(ts)
+
+                tname_lbl = tk.Label(trow, text=tool["name"], bg=card_bg, fg=TH["fg"],
+                                     font=(_FONTS["mono"], 8), anchor="w")
+                tname_lbl.pack(side="left", padx=(0, 2))
+
+                if trisk in ("critical", "high"):
+                    tk.Label(trow, text="\u26a0", bg=card_bg, fg=tcolor,
+                             font=(_FONTS["mono"], 7)).pack(side="right", padx=(0, 2))
+
+                tdesc = tool.get("description", "")
+                def _show_tool_tip(e, lbl=tip_lbl, txt=tdesc):
+                    lbl.config(text=txt)
+                tname_lbl.bind("<Enter>", _show_tool_tip)
+                trow.bind("<Enter>", _show_tool_tip)
+
+            toggle_row = tk.Frame(card, bg=card_bg)
+            toggle_row.pack(fill="x", padx=8, pady=(4, 6))
+            all_lbl = tk.Label(toggle_row, text="[all]", bg=card_bg, fg="#e8793a",
+                               font=(_FONTS["mono"], 8), cursor="hand2")
+            all_lbl.pack(side="left", padx=(0, 6))
+            all_lbl.bind("<Button-1>",
+                         lambda e, bn=bname: self._opentailor_toggle_bundle(bn, True))
+            none_lbl = tk.Label(toggle_row, text="[none]", bg=card_bg, fg="#8a7a6a",
+                                font=(_FONTS["mono"], 8), cursor="hand2")
+            none_lbl.pack(side="left")
+            none_lbl.bind("<Button-1>",
+                          lambda e, bn=bname: self._opentailor_toggle_bundle(bn, False))
+            self._tailor_bundle_toggles[bname] = bundle_toggles
+
+    def _opentailor_refresh_bundles(self):
+        self._opentailor_build_bundle_grid()
+
+    def _opentailor_toggle_bundle(self, bundle_name, enabled):
+        preset = self._tailor_preset_var.get()
+        tools = self._tool_registry.get_tools_for_bundle(bundle_name)
+        for t in tools:
+            tid = t["id"]
+            if tid in self._tailor_tool_vars:
+                self._tailor_tool_vars[tid].set(enabled)
+            self._tool_registry.set_tool_enabled(preset, tid, enabled)
+        for ts in self._tailor_bundle_toggles.get(bundle_name, []):
+            ts._draw()
+        self._opentailor_update_bundle_status(bundle_name)
+
+    def _opentailor_update_bundle_status(self, bundle_name):
+        tools = self._tool_registry.get_tools_for_bundle(bundle_name)
+        preset = self._tailor_preset_var.get()
+        enabled_ids = self._tool_registry.get_tool_ids_for_preset(preset)
+        bundle_enabled = sum(1 for t in tools if t["id"] in enabled_ids)
+        total = len(tools)
+        all_on = bundle_enabled == total
+        dot_color = "#2fa572" if all_on else ("#e0a030" if bundle_enabled > 0 else "#8a7a6a")
+        dot = self._tailor_bundle_dots.get(bundle_name)
+        if dot:
+            dot.delete("all")
+            dot.create_oval(1, 1, 9, 9, fill=dot_color, outline="")
+        count_info = self._tailor_bundle_counts.get(bundle_name)
+        if count_info:
+            count_lbl, _ = count_info
+            count_lbl.config(text=f"  {bundle_enabled}/{total} active")
+
+    def _opentailor_apply_selections(self):
+        preset = self._tailor_preset_var.get()
+        for tid, var in self._tailor_tool_vars.items():
+            self._tool_registry.set_tool_enabled(preset, tid, var.get())
+        self._tool_registry.save_selections()
+
+        critical = SafetyGate.check_tool_risk(self._tool_registry, preset)
+        if critical:
+            names = ", ".join(c["tool_name"] for c in critical)
+            ok = messagebox.askokcancel(
+                "Critical Tools Warning",
+                f"The following tools require manual approval:\n\n{names}\n\n"
+                "These tools will NOT auto-execute. You must approve each use.\n\n"
+                "Continue?",
+                parent=self)
+            if not ok:
+                return
+
+        summary = self._tool_registry.tools_summary_string(preset)
+        if preset in self._whimai_presets:
+            self._whimai_presets[preset]["tools"] = summary
+        if preset == self._whimai_active_preset:
+            self._preset_tools_lbl.config(text=summary)
+
+        self._tailor_status_lbl.config(text=f"Tools applied to '{preset}'")
+        self.after(3000, lambda: self._tailor_status_lbl.config(text=""))
+
+    def _opentailor_apply_openclaw(self):
+        preset = self._tailor_preset_var.get()
+        for tid, var in self._tailor_tool_vars.items():
+            self._tool_registry.set_tool_enabled(preset, tid, var.get())
+        self._tool_registry.save_selections()
+
+        ok = self._tool_registry.apply_to_openclaw_json(preset)
+        if ok:
+            self._tailor_status_lbl.config(text="openclaw.json updated")
+        else:
+            self._tailor_status_lbl.config(text="Error: openclaw.json not found", fg=TH["red"])
+        self.after(3000, lambda: self._tailor_status_lbl.config(text="", fg=TH["green"]))
+
+    def _opentailor_open_store(self):
+        self._switch_tab("settings")
+
+    def _load_guide_comments(self):
+        if USER_GUIDE_COMMENTS_FILE and os.path.isfile(USER_GUIDE_COMMENTS_FILE):
+            try:
+                with open(USER_GUIDE_COMMENTS_FILE) as fh:
+                    raw = json.load(fh)
+                out = {}
+                for key, val in raw.items():
+                    if isinstance(val, str):
+                        out[key] = [{"text": val, "author": "user"}]
+                    elif isinstance(val, list):
+                        out[key] = val
+                    else:
+                        out[key] = []
+                return out
+            except Exception:
+                pass
+        return {}
+
+    def _save_guide_comments(self):
+        if not USER_GUIDE_COMMENTS_FILE:
+            return
+        comments = {}
+        for key, widget in self._ug_comment_widgets.items():
+            entries = self._ug_extract_entries(widget)
+            if entries:
+                comments[key] = entries
+        try:
+            os.makedirs(os.path.dirname(USER_GUIDE_COMMENTS_FILE), exist_ok=True)
+            with open(USER_GUIDE_COMMENTS_FILE, "w") as fh:
+                json.dump(comments, fh, indent=2)
+            self._ug_save_lbl.config(text="Notes saved", fg="#2fa572")
+            self.after(3000, lambda: self._ug_save_lbl.config(text=""))
+        except Exception as ex:
+            self._ug_save_lbl.config(text=f"Save error: {ex}", fg="#c4382a")
+
+    def _ug_extract_entries(self, widget):
+        entries = []
+        content = widget.get("1.0", "end-1c")
+        if not content.strip():
+            return entries
+        idx = "1.0"
+        while widget.compare(idx, "<", "end-1c"):
+            tags = widget.tag_names(idx)
+            if "droid_note" in tags:
+                author = "droid"
+            else:
+                author = "user"
+            if author == "droid":
+                rng = widget.tag_nextrange("droid_note", idx)
+                if rng:
+                    seg = widget.get(rng[0], rng[1])
+                    entries.append({"text": seg, "author": "droid"})
+                    idx = rng[1]
+                else:
+                    break
+            else:
+                droid_start = widget.tag_nextrange("droid_note", idx)
+                end = droid_start[0] if droid_start else "end-1c"
+                seg = widget.get(idx, end)
+                if seg.strip():
+                    entries.append({"text": seg, "author": "user"})
+                idx = end
+        return entries
+
+    def ug_add_droid_note(self, bundle_key, text):
+        widget = self._ug_comment_widgets.get(bundle_key)
+        if not widget:
+            return
+        current = widget.get("1.0", "end-1c")
+        if current.strip():
+            widget.insert("end", "\n")
+        widget.insert("end", text, "droid_note")
+        widget.after(100, lambda: self._ug_autosize(widget))
+
+    # ====================== EMAIL SETTINGS SUB-TAB ======================
+
+    _HIMALAYA_CONFIG = os.path.expanduser("~/.config/himalaya/config.toml")
+    _HIMALAYA_DIR = os.path.expanduser("~/.config/himalaya")
+    _EMAIL_PROVIDERS = {
+        "Gmail": {
+            "imap_host": "imap.gmail.com", "imap_port": 993, "imap_tls": "tls",
+            "smtp_host": "smtp.gmail.com", "smtp_port": 587, "smtp_tls": "start-tls",
+        },
+        "Outlook / Hotmail": {
+            "imap_host": "outlook.office365.com", "imap_port": 993, "imap_tls": "tls",
+            "smtp_host": "smtp.office365.com", "smtp_port": 587, "smtp_tls": "start-tls",
+        },
+        "Yahoo": {
+            "imap_host": "imap.mail.yahoo.com", "imap_port": 993, "imap_tls": "tls",
+            "smtp_host": "smtp.mail.yahoo.com", "smtp_port": 587, "smtp_tls": "start-tls",
+        },
+        "Custom": {
+            "imap_host": "", "imap_port": 993, "imap_tls": "tls",
+            "smtp_host": "", "smtp_port": 587, "smtp_tls": "start-tls",
+        },
+    }
+
+    def _email_parse_config(self):
+        accounts = {}
+        if not os.path.isfile(self._HIMALAYA_CONFIG):
+            return accounts
+        try:
+            import tomllib
+            with open(self._HIMALAYA_CONFIG, "rb") as f:
+                data = tomllib.load(f)
+            for key, acct in data.get("accounts", {}).items():
+                accounts[key] = {
+                    "email": acct.get("email", ""),
+                    "display_name": acct.get("display-name", ""),
+                    "default": acct.get("default", False),
+                    "imap_host": acct.get("backend", {}).get("host", ""),
+                    "imap_port": acct.get("backend", {}).get("port", 993),
+                    "smtp_host": acct.get("message", {}).get("send", {}).get(
+                        "backend", {}).get("host", ""),
+                    "smtp_port": acct.get("message", {}).get("send", {}).get(
+                        "backend", {}).get("port", 587),
+                }
+        except Exception:
+            pass
+        return accounts
+
+    def _email_write_config(self, accounts):
+        os.makedirs(self._HIMALAYA_DIR, exist_ok=True)
+        lines = []
+        first_name = list(accounts.keys())[0] if accounts else ""
+        display_name = accounts[first_name].get("display_name", "") if first_name else ""
+        lines.append(f'display-name = "{display_name}"')
+        lines.append('downloads-dir = "~/Downloads"')
+        lines.append("")
+        for name, acct in accounts.items():
+            lines.append(f"[accounts.{name}]")
+            if acct.get("default"):
+                lines.append("default = true")
+            lines.append(f'email = "{acct["email"]}"')
+            lines.append(f'display-name = "{acct.get("display_name", "")}"')
+            lines.append("")
+            lines.append('folder.aliases.inbox = "INBOX"')
+            if "gmail" in acct.get("imap_host", "").lower():
+                lines.append('folder.aliases.sent = "[Gmail]/Sent Mail"')
+                lines.append('folder.aliases.drafts = "[Gmail]/Drafts"')
+                lines.append('folder.aliases.trash = "[Gmail]/Trash"')
+            lines.append("")
+            lines.append("envelope.list.page-size = 20")
+            lines.append("envelope.list.datetime-local-tz = true")
+            lines.append("")
+            lines.append('message.delete.style = "folder"')
+            lines.append("message.send.save-copy = false")
+            lines.append("")
+            lines.append('backend.type = "imap"')
+            lines.append(f'backend.host = "{acct["imap_host"]}"')
+            lines.append(f"backend.port = {acct['imap_port']}")
+            tls_type = acct.get("imap_tls", "tls")
+            lines.append(f'backend.encryption.type = "{tls_type}"')
+            lines.append(f'backend.login = "{acct["email"]}"')
+            lines.append('backend.auth.type = "password"')
+            pw_file = os.path.join(self._HIMALAYA_DIR, f".{name}-password")
+            lines.append(f'backend.auth.cmd = "cat {pw_file}"')
+            lines.append("")
+            lines.append(f'message.send.backend.type = "smtp"')
+            lines.append(f'message.send.backend.host = "{acct["smtp_host"]}"')
+            lines.append(f"message.send.backend.port = {acct['smtp_port']}")
+            smtp_tls = acct.get("smtp_tls", "start-tls")
+            lines.append(f'message.send.backend.encryption.type = "{smtp_tls}"')
+            lines.append(f'message.send.backend.login = "{acct["email"]}"')
+            lines.append('message.send.backend.auth.type = "password"')
+            lines.append(f'message.send.backend.auth.cmd = "cat {pw_file}"')
+            lines.append("")
+        with open(self._HIMALAYA_CONFIG, "w") as f:
+            f.write("\n".join(lines))
+
+    def _email_save_password(self, account_name, password):
+        os.makedirs(self._HIMALAYA_DIR, exist_ok=True)
+        pw_file = os.path.join(self._HIMALAYA_DIR, f".{account_name}-password")
+        with open(pw_file, "w") as f:
+            f.write(password)
+        os.chmod(pw_file, 0o600)
+
+    def _build_email_settings(self, parent):
+        self._email_acct_vars = {}
+
+        wrap = tk.Frame(parent, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=4, pady=8)
+
+        canvas = tk.Canvas(wrap, bg=TH["bg"], highlightthickness=0, bd=0)
+        scrollbar = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        scroll_frame = tk.Frame(canvas, bg=TH["bg"])
+        scroll_frame.bind("<Configure>",
+                          lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        _cw_id = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        def _sync_frame_width(event):
+            canvas.itemconfigure(_cw_id, width=event.width)
+        canvas.bind("<Configure>", _sync_frame_width)
+        def _on_scroll(event):
+            canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+        canvas.bind_all("<Button-4>", _on_scroll)
+        canvas.bind_all("<Button-5>", _on_scroll)
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+
+        # --- Header ---
+        hdr = tk.Frame(scroll_frame, bg=TH["bg"])
+        hdr.pack(fill="x", pady=(0, 8))
+        tk.Label(hdr, text="\u2709  EMAIL ACCOUNTS", bg=TH["bg"], fg="#2fa572",
+                 font=(_FONTS["ui"], 14, "bold")).pack(side="left")
+        self._email_cfg_status = tk.Label(hdr, text="", bg=TH["bg"],
+                                           fg="#2fa572", font=(_FONTS["mono"], 9))
+        self._email_cfg_status.pack(side="right", padx=8)
+
+        # --- Setup Guide ---
+        guide_card = self._card(scroll_frame, "SETUP GUIDE", fg="#8a7a6a")
+        guide_card.pack(fill="x", pady=(0, 8))
+        guide_inner = tk.Frame(guide_card, bg=TH["card"])
+        guide_inner.pack(fill="x", padx=10, pady=(0, 10))
+
+        steps = [
+            ("1.", "Gmail users", "Enable 2-Factor Authentication on your Google "
+             "account, then generate an App Password at "
+             "myaccount.google.com > Security > App passwords. "
+             "Use the 16-character app password below (not your regular password)."),
+            ("2.", "Outlook / Hotmail", "Go to account.microsoft.com > Security > "
+             "Advanced security > App passwords. Generate a new app password "
+             "and paste it below."),
+            ("3.", "Yahoo", "Go to login.yahoo.com > Account Security > "
+             "Generate app password. Select 'Other App' and copy the password."),
+            ("4.", "Add your account", "Select your provider, enter your email "
+             "and app password, then click Add Account. Whim writes the "
+             "Himalaya config automatically -- no terminal commands needed."),
+            ("5.", "Test it", "After adding, click Test Connection to verify "
+             "IMAP/SMTP connectivity. Then switch to the Email tab to "
+             "read and send mail."),
+        ]
+        for num, title, desc in steps:
+            row = tk.Frame(guide_inner, bg=TH["card"])
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=num, bg=TH["card"], fg="#e8793a",
+                     font=(_FONTS["mono"], 9, "bold"), width=3,
+                     anchor="ne").pack(side="left", padx=(0, 4))
+            col = tk.Frame(row, bg=TH["card"])
+            col.pack(side="left", fill="x", expand=True)
+            tk.Label(col, text=title, bg=TH["card"], fg=TH["fg"],
+                     font=(_FONTS["ui"], 9, "bold"), anchor="w").pack(anchor="w")
+            tk.Label(col, text=desc, bg=TH["card"], fg=TH["fg2"],
+                     font=(_FONTS["ui"], 8), anchor="w", wraplength=600,
+                     justify="left").pack(anchor="w")
+
+        # --- Existing Accounts ---
+        self._email_accts_card = self._card(scroll_frame, "CONFIGURED ACCOUNTS", fg="#8a7a6a")
+        self._email_accts_card.pack(fill="x", pady=(0, 8))
+        self._email_accts_inner = tk.Frame(self._email_accts_card, bg=TH["card"])
+        self._email_accts_inner.pack(fill="x", padx=10, pady=(0, 10))
+        self._email_refresh_accounts_list()
+
+        # --- Add Account Form ---
+        add_card = self._card(scroll_frame, "ADD ACCOUNT", fg="#8a7a6a")
+        add_card.pack(fill="x", pady=(0, 8))
+        add_inner = tk.Frame(add_card, bg=TH["card"])
+        add_inner.pack(fill="x", padx=10, pady=(0, 10))
+
+        fields = [
+            ("Provider:", "_email_add_provider"),
+            ("Display Name:", "_email_add_name"),
+            ("Email Address:", "_email_add_email"),
+            ("App Password:", "_email_add_password"),
+        ]
+        self._email_add_provider = tk.StringVar(value="Gmail")
+        self._email_add_name = tk.StringVar()
+        self._email_add_email = tk.StringVar()
+        self._email_add_password = tk.StringVar()
+        self._email_add_imap_host = tk.StringVar(value="imap.gmail.com")
+        self._email_add_imap_port = tk.StringVar(value="993")
+        self._email_add_smtp_host = tk.StringVar(value="smtp.gmail.com")
+        self._email_add_smtp_port = tk.StringVar(value="587")
+
+        for label_text, var_name in fields:
+            r = tk.Frame(add_inner, bg=TH["card"])
+            r.pack(fill="x", pady=3)
+            tk.Label(r, text=label_text, bg=TH["card"], fg=TH["fg2"],
+                     font=TH["font_sm"], width=14, anchor="w").pack(side="left")
+            if var_name == "_email_add_provider":
+                combo = ttk.Combobox(r, textvariable=self._email_add_provider,
+                                     values=list(self._EMAIL_PROVIDERS.keys()),
+                                     width=20, state="readonly")
+                combo.pack(side="left", padx=4)
+                combo.bind("<<ComboboxSelected>>",
+                           lambda e: self._email_on_provider_change())
+            elif var_name == "_email_add_password":
+                pw_entry = self._entry(r, self._email_add_password, width=30)
+                pw_entry.configure(show="\u2022")
+                pw_entry.pack(side="left", padx=4)
+                self._email_pw_show = tk.BooleanVar(value=False)
+                tk.Checkbutton(r, text="Show", variable=self._email_pw_show,
+                               bg=TH["card"], fg=TH["fg2"], selectcolor=TH["input"],
+                               activebackground=TH["card"], activeforeground=TH["fg"],
+                               font=(_FONTS["mono"], 8), highlightthickness=0,
+                               command=lambda pw=pw_entry: pw.configure(
+                                   show="" if self._email_pw_show.get() else "\u2022")
+                               ).pack(side="left", padx=4)
+            else:
+                self._entry(r, getattr(self, var_name), width=30).pack(
+                    side="left", padx=4)
+
+        # Custom server fields (shown when provider is Custom)
+        self._email_custom_frame = tk.Frame(add_inner, bg=TH["card"])
+        custom_fields = [
+            ("IMAP Host:", self._email_add_imap_host),
+            ("IMAP Port:", self._email_add_imap_port),
+            ("SMTP Host:", self._email_add_smtp_host),
+            ("SMTP Port:", self._email_add_smtp_port),
+        ]
+        for label_text, var in custom_fields:
+            r = tk.Frame(self._email_custom_frame, bg=TH["card"])
+            r.pack(fill="x", pady=2)
+            tk.Label(r, text=label_text, bg=TH["card"], fg=TH["fg2"],
+                     font=TH["font_sm"], width=14, anchor="w").pack(side="left")
+            self._entry(r, var, width=30).pack(side="left", padx=4)
+
+        btn_row = tk.Frame(add_inner, bg=TH["card"])
+        btn_row.pack(fill="x", pady=(8, 4))
+        self._btn(btn_row, "Add Account", self._email_add_account).pack(
+            side="left", padx=4)
+        self._btn(btn_row, "Test Connection", self._email_test_connection).pack(
+            side="left", padx=4)
+        self._email_add_status = tk.Label(btn_row, text="", bg=TH["card"],
+                                           fg="#2fa572", font=(_FONTS["mono"], 9))
+        self._email_add_status.pack(side="left", padx=8)
+
+    def _email_on_provider_change(self):
+        provider = self._email_add_provider.get()
+        pdata = self._EMAIL_PROVIDERS.get(provider, {})
+        self._email_add_imap_host.set(pdata.get("imap_host", ""))
+        self._email_add_imap_port.set(str(pdata.get("imap_port", 993)))
+        self._email_add_smtp_host.set(pdata.get("smtp_host", ""))
+        self._email_add_smtp_port.set(str(pdata.get("smtp_port", 587)))
+        if provider == "Custom":
+            self._email_custom_frame.pack(fill="x", pady=(4, 0))
+        else:
+            self._email_custom_frame.pack_forget()
+
+    def _email_refresh_accounts_list(self):
+        for w in self._email_accts_inner.winfo_children():
+            w.destroy()
+        accounts = self._email_parse_config()
+        if not accounts:
+            tk.Label(self._email_accts_inner, text="No accounts configured",
+                     bg=TH["card"], fg=TH["fg2"],
+                     font=TH["font_sm"]).pack(anchor="w", pady=4)
+            return
+        for name, acct in accounts.items():
+            row = tk.Frame(self._email_accts_inner, bg=TH["card"])
+            row.pack(fill="x", pady=2)
+            default_tag = " (default)" if acct.get("default") else ""
+            tk.Label(row, text=f"\u2709  {acct['email']}{default_tag}",
+                     bg=TH["card"], fg=TH["fg"],
+                     font=(_FONTS["mono"], 9, "bold")).pack(side="left")
+            tk.Label(row, text=f"  {acct.get('display_name', '')}  \u2022  "
+                     f"{acct.get('imap_host', '')}",
+                     bg=TH["card"], fg=TH["fg2"],
+                     font=(_FONTS["mono"], 8)).pack(side="left", padx=8)
+            remove_btn = tk.Button(
+                row, text="Remove", bg="#c4382a", fg="#ffffff",
+                font=(_FONTS["mono"], 7, "bold"), bd=0, padx=6, pady=1,
+                cursor="hand2",
+                command=lambda n=name: self._email_remove_account(n))
+            remove_btn.pack(side="right", padx=4)
+
+    def _email_add_account(self):
+        email = self._email_add_email.get().strip()
+        password = self._email_add_password.get().strip()
+        display_name = self._email_add_name.get().strip()
+        provider = self._email_add_provider.get()
+
+        if not email or not password:
+            self._email_add_status.config(
+                text="Email and password are required", fg="#c4382a")
+            return
+
+        acct_name = email.split("@")[0].replace(".", "_").replace("+", "_")
+        accounts = self._email_parse_config()
+
+        pdata = self._EMAIL_PROVIDERS.get(provider, self._EMAIL_PROVIDERS["Custom"])
+        imap_host = self._email_add_imap_host.get().strip() or pdata["imap_host"]
+        smtp_host = self._email_add_smtp_host.get().strip() or pdata["smtp_host"]
+
+        accounts[acct_name] = {
+            "email": email,
+            "display_name": display_name or email.split("@")[0],
+            "default": len(accounts) == 0,
+            "imap_host": imap_host,
+            "imap_port": int(self._email_add_imap_port.get() or 993),
+            "imap_tls": pdata.get("imap_tls", "tls"),
+            "smtp_host": smtp_host,
+            "smtp_port": int(self._email_add_smtp_port.get() or 587),
+            "smtp_tls": pdata.get("smtp_tls", "start-tls"),
+        }
+
+        try:
+            self._email_save_password(acct_name, password)
+            self._email_write_config(accounts)
+            self._email_add_status.config(
+                text=f"Account {email} added", fg="#2fa572")
+            self._email_add_email.set("")
+            self._email_add_password.set("")
+            self._email_add_name.set("")
+            self._email_refresh_accounts_list()
+            self.after(4000, lambda: self._email_add_status.config(text=""))
+        except Exception as ex:
+            self._email_add_status.config(
+                text=f"Error: {ex}", fg="#c4382a")
+
+    def _email_remove_account(self, account_name):
+        accounts = self._email_parse_config()
+        if account_name in accounts:
+            del accounts[account_name]
+            pw_file = os.path.join(self._HIMALAYA_DIR, f".{account_name}-password")
+            if os.path.isfile(pw_file):
+                os.remove(pw_file)
+            if accounts and not any(a.get("default") for a in accounts.values()):
+                first_key = next(iter(accounts))
+                accounts[first_key]["default"] = True
+            self._email_write_config(accounts)
+            self._email_refresh_accounts_list()
+            self._email_cfg_status.config(text=f"Removed {account_name}")
+            self.after(3000, lambda: self._email_cfg_status.config(text=""))
+
+    def _email_test_connection(self):
+        email = self._email_add_email.get().strip()
+        password = self._email_add_password.get().strip()
+        imap_host = self._email_add_imap_host.get().strip()
+        imap_port = int(self._email_add_imap_port.get() or 993)
+
+        if not email or not password or not imap_host:
+            self._email_add_status.config(
+                text="Fill in email, password, and server fields first", fg="#c4382a")
+            return
+        self._email_add_status.config(text="Testing IMAP...", fg=TH["yellow"])
+
+        def _test():
+            try:
+                import imaplib
+                conn = imaplib.IMAP4_SSL(imap_host, imap_port)
+                conn.login(email, password)
+                conn.logout()
+                self.after(0, lambda: self._email_add_status.config(
+                    text="Connection successful", fg="#2fa572"))
+            except Exception as ex:
+                msg = str(ex)[:60]
+                self.after(0, lambda: self._email_add_status.config(
+                    text=f"Failed: {msg}", fg="#c4382a"))
+        threading.Thread(target=_test, daemon=True).start()
+
+    _UG_TOOL_ICONS = {
+        "File System": "\U0001f4c2", "Shell Execute": "\u2318",
+        "Process Monitor": "\u2699", "System Time": "\u23f0",
+        "Tmux Session": "\u2630", "Session Logs": "\U0001f4dc",
+        "Google Workspace": "\U0001f4e8", "Notion": "\U0001f4d3",
+        "Obsidian Vault": "\U0001f48e", "Email (Himalaya)": "\u2709",
+        "Slack": "\U0001f4ac", "Discord Ops": "\U0001f3ae",
+        "Tavily Search": "\U0001f50d", "Brave Search": "\U0001f981",
+        "Firecrawl": "\U0001f525", "YouTube Summarizer": "\u25b6",
+        "RSS Reader": "\U0001f4e1",
+        "Image Generation": "\U0001f5bc", "TTS (XTTS)": "\U0001f50a",
+        "Whisper (Local)": "\U0001f399", "FFmpeg Tools": "\U0001f3ac",
+        "Video Frames": "\U0001f39e",
+        "GPS Tracker": "\U0001f4cd", "LoRa Node": "\U0001f4e1",
+        "Weather & Doppler": "\u26c5", "APRS Tracker": "\U0001f4e1",
+        "Livestock DB": "\U0001f404",
+        "GitHub CLI": "\U0001f419", "Python REPL": "\U0001f40d",
+        "Docker Manager": "\U0001f433", "SQL Toolkit": "\U0001f5c3",
+        "Delegate to Qwen": "\U0001f916",
+        "Read Archive": "\U0001f4c4", "Search Archive": "\U0001f50e",
+        "Speak Archive": "\U0001f4e2",
+    }
+
+    def _build_user_guide(self, parent):
+        self._ug_comment_widgets = {}
+        self._ug_icon_refs = []
+        saved_comments = self._load_guide_comments()
+
+        wrap = tk.Frame(parent, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=4, pady=8)
+
+        toolbar = tk.Frame(wrap, bg=TH["bg"])
+        toolbar.pack(fill="x", pady=(0, 4))
+        save_btn = tk.Button(toolbar, text="\u2913 Save Notes", bg="#1a3a3a",
+                             fg="#40e0d0", font=(_FONTS["mono"], 9, "bold"),
+                             bd=0, activebackground="#2a4a4a",
+                             activeforeground="#40e0d0", cursor="hand2",
+                             command=self._save_guide_comments)
+        save_btn.pack(side="left", padx=4)
+        self._ug_save_lbl = tk.Label(toolbar, text="", bg=TH["bg"],
+                                      fg="#2fa572", font=(_FONTS["mono"], 9))
+        self._ug_save_lbl.pack(side="left", padx=8)
+        tk.Label(toolbar, text="Ctrl+S to quick-save", bg=TH["bg"],
+                 fg="#8a7a6a", font=(_FONTS["mono"], 8)).pack(side="right", padx=4)
+
+        text = tk.Text(wrap, bg="#1a1612", fg=TH["fg"], font=(_FONTS["ui"], 10),
+                       wrap="word", bd=0, highlightthickness=0, padx=16, pady=12,
+                       insertbackground=TH["fg"], cursor="arrow", state="normal")
+        ug_sb = tk.Scrollbar(wrap, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=ug_sb.set)
+        ug_sb.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        self._ug_text = text
+
+        text.tag_configure("title", font=(_FONTS["ui"], 18, "bold"),
+                           foreground="#e8793a", spacing3=8)
+        text.tag_configure("subtitle", font=(_FONTS["ui"], 10),
+                           foreground="#8a7a6a", spacing3=4)
+        text.tag_configure("section_num", font=(_FONTS["mono"], 12, "bold"),
+                           foreground="#e8793a", spacing1=16)
+        text.tag_configure("bundle_name", font=(_FONTS["ui"], 13, "bold"),
+                           foreground=TH["fg"], spacing1=4, spacing3=4)
+        text.tag_configure("bundle_desc", font=(_FONTS["ui"], 10),
+                           foreground="#8a7a6a", spacing3=6)
+        text.tag_configure("tool_icon", font=(_FONTS["ui"], 10),
+                           foreground=TH["fg"])
+        text.tag_configure("tool_name", font=(_FONTS["mono"], 10, "bold"),
+                           foreground="#e8793a")
+        text.tag_configure("tool_desc", font=(_FONTS["ui"], 9),
+                           foreground=TH["fg"], lmargin1=24, lmargin2=24, spacing3=4)
+        text.tag_configure("risk_low", font=(_FONTS["mono"], 8, "bold"),
+                           foreground="#2fa572")
+        text.tag_configure("risk_medium", font=(_FONTS["mono"], 8, "bold"),
+                           foreground="#e8793a")
+        text.tag_configure("risk_high", font=(_FONTS["mono"], 8, "bold"),
+                           foreground="#c4382a")
+        text.tag_configure("risk_critical", font=(_FONTS["mono"], 8, "bold"),
+                           foreground="#ff0040")
+        text.tag_configure("divider", font=(_FONTS["mono"], 6),
+                           foreground="#3a3020", spacing1=4, spacing3=4)
+        text.tag_configure("note", font=(_FONTS["ui"], 9),
+                           foreground="#8a7a6a", lmargin1=12, lmargin2=12, spacing3=2)
+        text.tag_configure("comment_label", font=(_FONTS["mono"], 8, "bold"),
+                           foreground="#40e0d0", spacing1=6)
+        text.tag_configure("droid_label", font=(_FONTS["mono"], 8, "bold"),
+                           foreground="#e8a050", spacing1=2)
+        text.tag_configure("legend", font=(_FONTS["mono"], 8),
+                           foreground="#8a7a6a", spacing3=2)
+        text.tag_configure("legend_user", font=(_FONTS["mono"], 8, "bold"),
+                           foreground="#40e0d0")
+        text.tag_configure("legend_droid", font=(_FONTS["mono"], 8, "bold"),
+                           foreground="#e8a050")
+        text.tag_configure("link", font=(_FONTS["mono"], 10, "bold"),
+                           foreground="#e8793a", underline=True)
+
+        div = "\u2014" * 40 + "\n"
+
+        text.insert("end", "WHIM TOOL STORE \u2014 USER GUIDE\n", "title")
+        text.insert("end",
+                     "Capability bundles available for Whim presets. "
+                     "Each bundle groups related tools by function and risk level.\n"
+                     "Toggle tools in the Tool Store tab, then Apply to Preset "
+                     "to activate them for your AI sessions.\n", "subtitle")
+        text.insert("end", "   ", "legend")
+        text.insert("end", "\u25cf User notes", "legend_user")
+        text.insert("end", "   ", "legend")
+        text.insert("end", "\u25cf Droid notes", "legend_droid")
+        text.insert("end", "\n\n", "legend")
+
+        text.insert("end", "   \u270e General Notes:\n", "comment_label")
+        general_frame = self._ug_make_comment(
+            text, "__general__", saved_comments.get("__general__"))
+        text.window_create("end", window=general_frame, stretch=True,
+                           padx=16, pady=4)
+        text.insert("end", "\n\n")
+
+        bundles = self._tool_registry.bundles
+        risk_levels = self._tool_registry.risk_levels
+
+        for idx, (bname, bdata) in enumerate(bundles.items(), 1):
+            icon_emoji = bdata.get("icon", "")
+            risk = bdata.get("risk", "low")
+            risk_info = risk_levels.get(risk, {})
+            risk_label = risk_info.get("label", risk)
+            tools = bdata.get("tools", [])
+
+            text.insert("end", div, "divider")
+
+            icon_photo = self._load_toolstore_icon(bname, size=24)
+            if icon_photo:
+                self._ug_icon_refs.append(icon_photo)
+                icon_lbl = tk.Label(text, image=icon_photo, bg="#1a1612", bd=0)
+                text.window_create("end", window=icon_lbl, padx=4, pady=2)
+                text.insert("end", " ")
+            else:
+                text.insert("end", f"  {icon_emoji}  ", "section_num")
+
+            text.insert("end", f"{idx:02d}  ", "section_num")
+            text.insert("end", f"{bname}\n", "bundle_name")
+            text.insert("end", f"   {bdata.get('description', '')}\n", "bundle_desc")
+            text.insert("end", "   Risk: ", "note")
+            text.insert("end", f"{risk_label}\n", f"risk_{risk}")
+            text.insert("end",
+                         f"   {len(tools)} tool(s) in this bundle\n\n", "note")
+
+            for tool in tools:
+                trisk = tool.get("risk", "low")
+                trisk_label = risk_levels.get(trisk, {}).get("label", trisk)
+                tool_icon = self._UG_TOOL_ICONS.get(tool["name"], "\u25b8")
+                text.insert("end", f"   {tool_icon} ", "tool_icon")
+                text.insert("end", f"{tool['name']}", "tool_name")
+                text.insert("end", f"  [{trisk_label}]", f"risk_{trisk}")
+                text.insert("end", "\n")
+                text.insert("end",
+                             f"{tool.get('description', '')}\n", "tool_desc")
+                auto = "Yes" if tool.get("auto_approve") \
+                    else "No (manual approval required)"
+                text.insert("end", f"Auto-approve: {auto}\n\n", "note")
+
+            text.insert("end", "   \u270e Your notes:\n", "comment_label")
+            comment_frame = self._ug_make_comment(
+                text, bname, saved_comments.get(bname))
+            text.window_create("end", window=comment_frame, stretch=True,
+                               padx=24, pady=4)
+            text.insert("end", "\n")
+
+        text.insert("end", "\n" + div, "divider")
+        text.insert("end", "RISK LEVELS\n\n", "bundle_name")
+        for rname, rdata in risk_levels.items():
+            text.insert("end",
+                         f"  \u25cf {rdata.get('label', rname)}: ", f"risk_{rname}")
+            text.insert("end", f"{rdata.get('description', '')}\n", "note")
+
+        text.insert("end", "\n\nFor the complete Whim manual, visit:\n", "note")
+        text.insert("end", "https://scarter84.github.io/0411/\n", "link")
+
+        def _open_manual(e):
+            webbrowser.open("https://scarter84.github.io/0411/")
+        text.tag_bind("link", "<Button-1>", _open_manual)
+        text.tag_bind("link", "<Enter>",
+                      lambda e: text.config(cursor="hand2"))
+        text.tag_bind("link", "<Leave>",
+                      lambda e: text.config(cursor="arrow"))
+
+        text.config(state="disabled")
+
+        self._ug_seed_droid_notes(saved_comments)
+
+    _UG_DROID_SEEDS = {
+        "System Admin": (
+            "Shell Execute and File System are the backbone of Whim's local "
+            "automation. Process Monitor pairs with tmux for session management. "
+            "All critical-risk -- manual approval enforced on every call."),
+        "Workspace": (
+            "Himalaya email integration is live (IMAP/SMTP via app password). "
+            "Notion token is configured in Settings > General. Discord Ops and "
+            "Slack are wired but require active gateway connection. Obsidian "
+            "vault reads are direct file access -- low risk, auto-approved."),
+        "Web Intel": (
+            "Tavily and Brave search are the primary research paths. Firecrawl "
+            "handles structured scraping. YouTube Summarizer pulls transcripts "
+            "via yt-dlp. All low-risk and auto-approved -- safe for autonomous "
+            "research loops."),
+        "Creative": (
+            "TTS runs through local XTTS with voice cloning (revy_grit_02 default). "
+            "Whisper transcription is local. FFmpeg handles media conversion -- "
+            "medium risk due to file writes. Image gen routes through local "
+            "Stable Diffusion when available."),
+        "Farm-Tech": (
+            "GPS and APRS tracking integrate with GeoF fencing system. LoRa "
+            "node requires hardware radio connection. Weather pulls from NOAA "
+            "API. Livestock DB is a local SQLite store -- medium risk for writes."),
+        "Development": (
+            "GitHub CLI (gh) is installed and authenticated. Python REPL is "
+            "sandboxed but high-risk. Docker manager can build/run containers. "
+            "Delegate to Qwen offloads coding tasks to local qwen3-coder:32b "
+            "via Ollama."),
+        "Archive": (
+            "Archive tools provide read-only access to ~/ARCHIVE. Search uses "
+            "full-text grep across all entries. Speak Archive feeds entries "
+            "through TTS for audio readdown. All low-risk, auto-approved."),
+    }
+
+    def _ug_seed_droid_notes(self, saved_comments):
+        for bundle_key, seed_text in self._UG_DROID_SEEDS.items():
+            existing = saved_comments.get(bundle_key, [])
+            has_droid = any(e.get("author") == "droid" for e in existing
+                           if isinstance(e, dict))
+            if not has_droid:
+                self.ug_add_droid_note(bundle_key, seed_text)
+        self.after(300, self._ug_resize_all)
+
+    def _ug_resize_all(self):
+        for widget in self._ug_comment_widgets.values():
+            self._ug_autosize(widget)
+
+    def _ug_make_comment(self, parent_text, key, entries=None):
+        frame = tk.Frame(parent_text, bg="#0e1a1a", bd=0,
+                         highlightthickness=1, highlightbackground="#1a3a3a")
+        cw = tk.Text(frame, bg="#0e1a1a", fg="#40e0d0",
+                     font=(_FONTS["mono"], 9), wrap="word", height=2,
+                     bd=0, highlightthickness=0, padx=8, pady=6,
+                     insertbackground="#40e0d0", cursor="xterm",
+                     undo=True)
+        cw.tag_configure("user_note", foreground="#40e0d0",
+                         font=(_FONTS["mono"], 9))
+        cw.tag_configure("droid_note", foreground="#e8a050",
+                         font=(_FONTS["mono"], 9, "italic"))
+        cw.pack(fill="x", expand=True)
+        if entries:
+            for entry in entries:
+                tag = "droid_note" if entry.get("author") == "droid" else "user_note"
+                cw.insert("end", entry.get("text", ""), tag)
+        cw.bind("<Control-s>", lambda e: self._save_guide_comments())
+        cw.bind("<KeyRelease>", lambda e, w=cw: self._ug_autosize(w))
+        cw.bind("<Key>", lambda e, w=cw: self._ug_tag_user_input(w))
+        cw.bind("<Configure>", lambda e, w=cw: w.after_idle(lambda: self._ug_autosize(w)))
+        self._ug_comment_widgets[key] = cw
+        cw.after(50, lambda: self._ug_autosize(cw))
+        return frame
+
+    def _ug_tag_user_input(self, widget):
+        widget.after_idle(lambda: self._ug_apply_user_tag(widget))
+
+    def _ug_apply_user_tag(self, widget):
+        try:
+            cursor = widget.index("insert")
+            tags = widget.tag_names(cursor)
+            if "droid_note" not in tags:
+                line, col = cursor.split(".")
+                line_start = f"{line}.0"
+                line_end = f"{line}.end"
+                has_droid = widget.tag_nextrange("droid_note", line_start, line_end)
+                if not has_droid:
+                    widget.tag_add("user_note", line_start, line_end)
+        except (tk.TclError, Exception):
+            pass
+
+    def _ug_autosize(self, widget):
+        widget.update_idletasks()
+        try:
+            display_lines = int(widget.count("1.0", "end", "displaylines")[0])
+        except (TypeError, tk.TclError):
+            content = widget.get("1.0", "end-1c")
+            display_lines = content.count("\n") + 1
+        new_h = max(2, display_lines + 1)
+        if widget.cget("height") != new_h:
+            widget.configure(height=new_h)
+
+    def _opentailor_open_architect(self):
+        win = tk.Toplevel(self)
+        win.title("OpenTailor Architect")
+        win.geometry("520x440")
+        win.configure(bg=TH["bg"])
+        win.transient(self)
+
+        tk.Label(win, text="PRESET ARCHITECT", bg=TH["bg"], fg=TH["green"],
+                 font=(_FONTS["ui"], 14, "bold")).pack(anchor="w", padx=16, pady=(12, 4))
+        tk.Label(win, text="Describe what you want this preset to do:",
+                 bg=TH["bg"], fg=TH["fg2"], font=TH["font_sm"]).pack(
+            anchor="w", padx=16, pady=(0, 4))
+
+        desc_text = tk.Text(win, bg=TH["input"], fg=TH["fg"],
+                            insertbackground=TH["fg"], font=(_FONTS["mono"], 10),
+                            height=5, wrap="word", bd=0, highlightthickness=1,
+                            highlightbackground=TH["border"],
+                            highlightcolor=TH["btn"])
+        desc_text.pack(fill="x", padx=16, pady=(0, 8))
+        desc_text.insert("1.0",
+            'I need a "Developer" preset. Add tools for GitHub, terminal execution, '
+            'and local file editing. Block all social media tools. Set the model to '
+            'deepseek-r1:32b and ensure the system prompt prioritizes Python efficiency.')
+
+        status_lbl = tk.Label(win, text="", bg=TH["bg"], fg=TH["yellow"],
+                              font=(_FONTS["mono"], 9))
+        status_lbl.pack(anchor="w", padx=16)
+
+        result_frame = tk.Frame(win, bg=TH["bg"])
+        result_frame.pack(fill="both", expand=True, padx=16, pady=(4, 8))
+
+        result_text = tk.Text(result_frame, bg=TH["input"], fg=TH["fg"],
+                              insertbackground=TH["fg"], font=(_FONTS["mono"], 9),
+                              wrap="word", bd=0, highlightthickness=1,
+                              highlightbackground=TH["border"],
+                              highlightcolor=TH["btn"], state="disabled")
+        result_text.pack(fill="both", expand=True)
+
+        btn_row = tk.Frame(win, bg=TH["bg"])
+        btn_row.pack(fill="x", padx=16, pady=(0, 12))
+
+        self._architect_result = None
+
+        def _on_generate():
+            desc = desc_text.get("1.0", "end-1c").strip()
+            if not desc:
+                status_lbl.config(text="Please enter a description.", fg=TH["red"])
+                return
+            status_lbl.config(text="Generating with Opus... please wait", fg=TH["yellow"])
+            generate_btn.config(state="disabled")
+
+            def _callback(preset, error):
+                def _update():
+                    generate_btn.config(state="normal")
+                    if error:
+                        status_lbl.config(text=f"Error: {error}", fg=TH["red"])
+                        return
+                    if not preset:
+                        status_lbl.config(text="No result returned", fg=TH["red"])
+                        return
+                    valid, warnings = self._preset_architect.validate_preset(preset)
+                    self._architect_result = preset
+                    result_text.config(state="normal")
+                    result_text.delete("1.0", "end")
+                    result_text.insert("1.0", json.dumps(preset, indent=2))
+                    result_text.config(state="disabled")
+                    if warnings:
+                        status_lbl.config(
+                            text="\u26a0 " + "; ".join(warnings), fg=TH["yellow"])
+                    else:
+                        status_lbl.config(text="Preset generated successfully", fg=TH["green"])
+                    apply_btn.config(state="normal")
+                self.after(0, _update)
+
+            self._preset_architect.generate_preset(desc, callback=_callback)
+
+        def _on_apply():
+            if not self._architect_result:
+                return
+            p = self._architect_result
+            name = p.get("name", "Custom")
+            self._whimai_presets[name] = {
+                "model": p.get("model", "deepseek-r1:32b"),
+                "ctx": p.get("ctx", 16384),
+                "temp": p.get("temp", 0.7),
+                "tools": "tailored",
+                "system": p.get("system", ""),
+            }
+            for tid in p.get("enabled_tools", []):
+                self._tool_registry.set_tool_enabled(name, tid, True)
+            self._tool_registry.save_selections()
+
+            summary = self._tool_registry.tools_summary_string(name)
+            self._whimai_presets[name]["tools"] = summary
+
+            if hasattr(self, "_whimai_preset_var"):
+                combo_vals = list(self._whimai_presets.keys())
+                # Update preset comboboxes
+                for w in [self._whimai_preset_var]:
+                    pass
+                self._whimai_preset_var.set(name)
+                self._whimai_apply_preset()
+
+            status_lbl.config(text=f"Preset '{name}' added and activated!", fg=TH["green"])
+            self._preset_tailor_status.config(text=f"New: {name}")
+            self.after(3000, lambda: self._preset_tailor_status.config(text=""))
+
+        generate_btn = self._btn(btn_row, "Generate", _on_generate)
+        generate_btn.pack(side="left", padx=2)
+        apply_btn = self._btn(btn_row, "Apply Preset", _on_apply)
+        apply_btn.pack(side="left", padx=2)
+        apply_btn.config(state="disabled")
+        self._btn(btn_row, "Close", win.destroy).pack(side="right", padx=2)
 
     def _whimai_edit_last(self):
         for msg in reversed(self._whimai_chat_history):
@@ -2907,6 +6211,39 @@ class ModernApp(tk.Tk):
         self.clipboard_append(md)
         self.whimai_status_var.set("Copied as Markdown")
 
+    def _whimai_print(self):
+        if not self._whimai_chat_history:
+            self.whimai_status_var.set("Nothing to print")
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # Plain text for printer (lp cannot render HTML)
+        txt_lines = [
+            "Whim.ai Chat Log",
+            f"{ts} | {len(self._whimai_chat_history)} messages",
+            "=" * 60, ""
+        ]
+        for msg in self._whimai_chat_history:
+            role = "You" if msg["role"] == "user" else "Whim.ai"
+            txt_lines.append(f"[{role}]")
+            txt_lines.append(msg["content"])
+            txt_lines.append("-" * 40)
+            txt_lines.append("")
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="whimai_chat_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(txt_lines))
+        try:
+            result = subprocess.run(
+                ["lp", "-d", "HP_ENVY_5052", path],
+                capture_output=True, text=True, timeout=15)
+            if result.returncode == 0:
+                self.whimai_status_var.set("Sent to HP ENVY 5052")
+            else:
+                self.whimai_status_var.set(
+                    f"Print error: {result.stderr.strip()}")
+        except FileNotFoundError:
+            self.whimai_status_var.set(
+                "CUPS not available - cannot print")
+
     def _whimai_send_to_page(self):
         if not self._whimai_chat_history:
             return
@@ -2946,6 +6283,8 @@ class ModernApp(tk.Tk):
         sys_prompt = preset.get("system", "")
         if sys_prompt:
             total_tokens += self._whimai_estimate_tokens(sys_prompt)
+        ft_stats = self._freshtail.get_stats()
+        total_tokens += ft_stats["summary_tokens"]
         pct = min(1.0, total_tokens / max(ctx_limit, 1))
         self._whimai_ctx_lbl.config(text=f"{total_tokens} / {ctx_limit} tokens")
         c = self._whimai_ctx_canvas
@@ -2960,7 +6299,13 @@ class ModernApp(tk.Tk):
         else:
             color = TH["red"]
         c.create_rectangle(0, 0, int(w * pct), h, fill=color, outline="")
-        if self._whimai_dropped_msgs:
+        n_summaries = ft_stats["summaries"]
+        if n_summaries > 0:
+            lbl = f"{n_summaries} summary layer{'s' if n_summaries != 1 else ''}"
+            if ft_stats["compacting"]:
+                lbl += " (compacting...)"
+            self._whimai_dropped_lbl.config(text=lbl)
+        elif self._whimai_dropped_msgs:
             n = len(self._whimai_dropped_msgs)
             self._whimai_dropped_lbl.config(
                 text=f"{n} msg{'s' if n != 1 else ''} dropped")
@@ -2970,18 +6315,17 @@ class ModernApp(tk.Tk):
     def _whimai_check_context_overflow(self):
         preset = self._whimai_presets.get(self._whimai_active_preset, {})
         ctx_limit = preset.get("ctx", 16384)
-        total = 0
-        for msg in self._whimai_chat_history:
-            total += self._whimai_estimate_tokens(msg.get("content", ""))
-        while total > ctx_limit * 0.95 and len(self._whimai_chat_history) > 2:
-            dropped = self._whimai_chat_history.pop(0)
-            drop_toks = self._whimai_estimate_tokens(dropped.get("content", ""))
-            total -= drop_toks
-            self._whimai_dropped_msgs.append({
-                "role": dropped["role"],
-                "tokens": drop_toks,
-                "preview": dropped.get("content", "")[:80]
-            })
+        self._freshtail.notify_turn(
+            self._whimai_chat_history,
+            ctx_limit=ctx_limit,
+            preset_name=self._whimai_active_preset
+        )
+        stats = self._freshtail.get_stats()
+        if stats["summaries"] > 0:
+            n = stats["summaries"]
+            self._whimai_dropped_lbl.config(
+                text=f"{n} summary layer{'s' if n != 1 else ''}"
+            )
 
     def _whimai_update_turn_labels(self, turn):
         pt = turn.get("prompt_tokens", 0)
@@ -3121,6 +6465,31 @@ class ModernApp(tk.Tk):
         self._obs_gpu.config(text=f"{s['gpu_util']}%")
         self._obs_cpu.config(text=f"{s['cpu']:.0f}%")
         self._obs_ram.config(text=f"{s['ram_mb']}MB")
+        bar_vals = {
+            "_obs_cpu": s["cpu"],
+            "_obs_ram": s["ram_mb"],
+            "_obs_gpu": s["gpu_util"],
+            "_obs_vram": s["vram_mb"],
+        }
+        for attr, val in bar_vals.items():
+            info = self._obs_bars.get(attr)
+            if not info:
+                continue
+            c = info["canvas"]
+            c.delete("all")
+            c.update_idletasks()
+            w = max(c.winfo_width(), 10)
+            h = max(c.winfo_height(), 6)
+            pct = min(1.0, val / max(info["max"], 1))
+            if pct < 0.5:
+                color = "#4caf50"
+            elif pct < 0.8:
+                color = "#e8793a"
+            else:
+                color = "#c4382a"
+            c.create_rectangle(0, 0, int(w * pct), h, fill=color, outline="")
+        if self._obs_active_event:
+            self._obs_log_event_snapshot(self._obs_active_event)
 
     def _whimai_telemetry_poll_tick(self):
         if not self._whimai_telemetry_polling:
@@ -3129,11 +6498,85 @@ class ModernApp(tk.Tk):
         self.after(100, self._whimai_refresh_sys_telemetry_ui)
         self.after(3000, self._whimai_telemetry_poll_tick)
 
+    def _hw_status_poll(self):
+        def _check():
+            ollama_ok = False
+            model_name = ""
+            try:
+                import urllib.request
+                url = self._whimai_ollama_url.rstrip("/") + "/api/tags"
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    data = json.loads(resp.read())
+                    ollama_ok = True
+                    models = data.get("models", [])
+                    if models:
+                        active = self._global_model_var.get()
+                        for m in models:
+                            if m.get("name", "").startswith(active.split(":")[0]):
+                                model_name = m.get("name", "")
+                                break
+                        if not model_name and models:
+                            model_name = models[0].get("name", "")
+            except Exception:
+                pass
+            snap = self._whimai_sys_telemetry
+            gpu_util = snap.get("gpu_util", 0)
+            vram_mb = snap.get("vram_mb", 0)
+            self.after(0, lambda: self._hw_status_update(
+                ollama_ok, gpu_util, vram_mb, model_name))
+        threading.Thread(target=_check, daemon=True).start()
+        self.after(10000, self._hw_status_poll)
+
+    def _hw_status_update(self, ollama_ok, gpu_util, vram_mb, model_name):
+        if ollama_ok:
+            self._hw_ollama_dot.itemconfigure(self._hw_ollama_dot_id, fill="#2fa572")
+            self._hw_ollama_lbl.config(fg=TH["fg"])
+        else:
+            self._hw_ollama_dot.itemconfigure(self._hw_ollama_dot_id, fill="#c4382a")
+            self._hw_ollama_lbl.config(fg="#c4382a")
+        if gpu_util > 0 or vram_mb > 0:
+            self._hw_gpu_lbl.config(text=f"GPU {gpu_util}%", fg=TH["fg"])
+            self._hw_vram_lbl.config(text=f"VRAM {vram_mb}MB", fg=TH["fg"])
+        else:
+            self._hw_gpu_lbl.config(text="GPU --", fg=TH["fg2"])
+            self._hw_vram_lbl.config(text="VRAM --", fg=TH["fg2"])
+        if model_name:
+            self._hw_model_lbl.config(text=model_name)
+
     def _whimai_start_telemetry_poll(self):
         if self._whimai_telemetry_polling:
             return
         self._whimai_telemetry_polling = True
         self._whimai_telemetry_poll_tick()
+
+    # ---------- Event capture (observability) ----------
+
+    def _obs_start_event(self, event_name):
+        self._obs_active_event = event_name
+        self._obs_log_event_snapshot(event_name, start=True)
+
+    def _obs_end_event(self):
+        if self._obs_active_event:
+            self._obs_log_event_snapshot(self._obs_active_event, end=True)
+        self._obs_active_event = None
+
+    def _obs_log_event_snapshot(self, event_name, start=False, end=False):
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%H:%M:%S")
+        s = self._whimai_sys_telemetry
+        tag = "START" if start else ("END" if end else "    ")
+        line = (f"[{ts}] {tag} {event_name}  "
+                f"CPU:{s['cpu']:.0f}%  RAM:{s['ram_mb']}MB  "
+                f"GPU:{s['gpu_util']}%  VRAM:{s['vram_mb']}MB\n")
+        self._obs_event_log.append(line)
+        if len(self._obs_event_log) > 200:
+            self._obs_event_log = self._obs_event_log[-100:]
+        t = self._obs_event_text
+        t.config(state="normal")
+        t.insert("end", line)
+        t.see("end")
+        t.config(state="disabled")
 
     # ---------- Capture helpers ----------
 
@@ -5718,11 +9161,13 @@ class ModernApp(tk.Tk):
             return
         active_voice_file = os.path.join(XTTS_VOICES_DIR, "active_voice.json")
         try:
-            data = {"name": name, "file": os.path.basename(path)}
+            data = {"name": name, "path": path, "file": os.path.basename(path)}
             with open(active_voice_file, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception:
             pass
+        if hasattr(self, "_preset_voice_lbl"):
+            self._preset_refresh_voice()
 
     def _xtts_get_selected_voice(self):
         sel = self.xtts_voice_list.curselection()
@@ -5851,6 +9296,11 @@ class ModernApp(tk.Tk):
         self.xtts_generating = False
         self.xtts_gen_btn.config(state="normal")
         self._xtts_draw_spectrogram()
+        # Stream visemes to the avatar if the server is running
+        if getattr(self, "_avatar_server_running", False):
+            wav = self.xtts_out_var.get().strip()
+            if wav and os.path.isfile(wav):
+                _avatar_stream(wav)
 
     def _xtts_draw_spectrogram(self, wav_path=None):
         if wav_path is None:
@@ -5950,6 +9400,8 @@ class ModernApp(tk.Tk):
         self._xtts_log_msg(f"▶ Playing {out_wav}…")
         self._spec_play_start = _time.time()
         self._spec_animate_index()
+        if getattr(self, "_avatar_server_running", False):
+            _avatar_stream(out_wav)
         threading.Thread(
             target=lambda: _plat_play_audio(out_wav),
             daemon=True).start()
@@ -6433,8 +9885,7 @@ class ModernApp(tk.Tk):
     _hmo_paused = False
     _hmo_exported = False
 
-    _HMO_ICON_PNG = os.path.expanduser(
-        "~/.openclaw/WhimUI/icons/audio-volume-zero-panel-24.png")
+    _HMO_ICON_PNG = os.path.join(_PLAT_PATHS.get("icons_dir", ""), "audio-volume-zero-panel-24.png")
 
     def build_hearmeout(self):
         f = self.tabs["hearmeout"]
@@ -6538,7 +9989,7 @@ class ModernApp(tk.Tk):
         transport_inner = tk.Frame(transport, bg=TH["card"])
         transport_inner.pack(pady=6)
 
-        _icons_dir = os.path.join(_PLAT_PATHS.get("openclaw_dir", ""), "WhimUI", "icons")
+        _icons_dir = _PLAT_PATHS.get("icons_dir", "")
         self._hmo_transport_imgs = {}
         for key, fname in [("play", "transport-play-28.png"),
                             ("pause", "transport-pause-28.png"),
@@ -6585,9 +10036,17 @@ class ModernApp(tk.Tk):
         self.hmo_transcript_box.config(yscrollcommand=t_sb.set)
         t_sb.config(command=self.hmo_transcript_box.yview)
         t_sb.pack(side="right", fill="y", padx=(0, 6), pady=(0, 6))
-        self.hmo_transcript_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.hmo_transcript_box.pack(fill="both", expand=True, padx=6, pady=(0, 2))
         self.hmo_transcript_box.insert("1.0", "(select an audio file to view transcript)")
         self.hmo_transcript_box.config(state="disabled")
+
+        transcript_btn_row = tk.Frame(transcript_card, bg=TH["card"])
+        transcript_btn_row.pack(fill="x", padx=6, pady=(0, 6))
+        RoundedButton(transcript_btn_row, text="CLEAR",
+                      command=self._hmo_clear_transcript,
+                      bg=TH["border_hi"], hover_bg=TH["border_hi"],
+                      border_color=TH["btn_border"],
+                      font=TH["font_sm"]).pack(side="right")
 
         # ========== RIGHT COLUMN: Actions + Transcript Names ==========
         right_col = tk.Frame(columns, bg=TH["bg"])
@@ -6617,7 +10076,7 @@ class ModernApp(tk.Tk):
         lo_btn_row = tk.Frame(export_card, bg=TH["card"])
         lo_btn_row.pack(fill="x", padx=10, pady=(0, 4))
         _msword_icon_path = os.path.join(
-            os.path.join(_PLAT_PATHS.get("openclaw_dir", ""), "WhimUI", "icons", "Mint-Y", "apps", "32", "ms-word.png"))
+            _PLAT_PATHS.get("icons_dir", ""), "Mint-Y", "apps", "32", "ms-word.png")
         self._hmo_word_img = None
         if os.path.isfile(_msword_icon_path):
             try:
@@ -6837,6 +10296,11 @@ class ModernApp(tk.Tk):
             self.hmo_delete_btn._draw(TH["border_hi"])
             self.hmo_delete_btn.config(state="disabled")
 
+    def _hmo_clear_transcript(self):
+        self.hmo_transcript_box.config(state="normal")
+        self.hmo_transcript_box.delete("1.0", "end")
+        self.hmo_transcript_box.config(state="disabled")
+
     def _hmo_delete_selected(self):
         has_transcript = self._hmo_has_active_transcript()
         if has_transcript:
@@ -6869,8 +10333,7 @@ class ModernApp(tk.Tk):
             return
         if self._hmo_playing_proc and self._hmo_playing_proc.poll() is None:
             self._hmo_playing_proc.terminate()
-        _plat_play_audio(path)
-        self._hmo_playing_proc = None
+        self._hmo_playing_proc = _plat_play_audio(path)
         self._hmo_paused = False
 
     def _hmo_pause(self):
@@ -11633,6 +15096,42 @@ camFlipBtn.addEventListener('click',()=>{
     # ================================================================
     # AUDIO CAPTURE — floating always-on-top tool
     # ================================================================
+    def _launch_dash_vm(self):
+        _candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "launch_whimv_dash.py"),
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), "launch_whimv_dash.py"),
+            os.path.expanduser("~/vaults/WHIM/app/launch_whimv_dash.py"),
+        ]
+        _dash_launcher = None
+        for p in _candidates:
+            if os.path.isfile(p):
+                _dash_launcher = p
+                break
+        if not _dash_launcher:
+            self.toggle_status_var.set("Dash VM launcher not found")
+            return
+        self._dashvm_btn.config(bg=TH["btn_hover"], text="\U0001f697 Starting...")
+        def _worker():
+            try:
+                import importlib
+                sys.path.insert(0, os.path.dirname(_dash_launcher))
+                import launch_whimv_dash
+                importlib.reload(launch_whimv_dash)
+                launch = launch_whimv_dash.launch
+                def _status(msg):
+                    try:
+                        self.after(0, lambda: self.toggle_status_var.set(msg))
+                    except Exception:
+                        pass
+                launch(ghost=True, callback=_status)
+                self.after(0, lambda: self._dashvm_btn.config(
+                    bg="#2fa572", text="\U0001f697 Dash VM"))
+            except Exception as e:
+                self.after(0, lambda: self.toggle_status_var.set(f"Dash VM error: {e}"))
+                self.after(0, lambda: self._dashvm_btn.config(
+                    bg=TH["btn"], text="\U0001f697 Dash VM"))
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _open_audio_capture(self):
         if hasattr(self, "_ac_win") and self._ac_win and self._ac_win.winfo_exists():
             self._ac_win.lift()
@@ -11723,6 +15222,15 @@ camFlipBtn.addEventListener('click',()=>{
         self._ac_name_entry.pack(side="left", padx=4)
         self._btn(name_frame, "Rename", self._ac_rename).pack(side="left", padx=2)
 
+        # Commit to AVR Lab voice list
+        commit_frame = tk.Frame(win, bg=TH["bg"])
+        commit_frame.pack(fill="x", **pad)
+        self._ac_commit_btn = self._btn(commit_frame, "\U0001f50a Commit to Voice List",
+                                         self._ac_commit_to_voices)
+        self._ac_commit_btn.pack(side="left", padx=4)
+        tk.Label(commit_frame, text=f"\u2192 {XTTS_VOICES_DIR}", bg=TH["bg"],
+                 fg=TH["fg2"], font=(_FONTS["mono"], 8)).pack(side="left", padx=4)
+
         # Output folder link
         out_frame = tk.Frame(win, bg=TH["bg"])
         out_frame.pack(fill="x", padx=12, pady=(2, 4))
@@ -11761,7 +15269,8 @@ camFlipBtn.addEventListener('click',()=>{
         if self._ac_recording:
             return
         source_desc = self._ac_source_var.get()
-        source_name = self._ac_source_map.get(source_desc, "default")
+        source_info = self._ac_source_map.get(source_desc, "default")
+        source_name = source_info["name"] if isinstance(source_info, dict) else source_info
         fmt = self._ac_format_var.get()
         bitrate = self._ac_bitrate_var.get()
         os.makedirs(AUDIO_CAPTURE_DIR, exist_ok=True)
@@ -11904,494 +15413,3921 @@ camFlipBtn.addEventListener('click',()=>{
         except Exception as ex:
             self._ac_status_var.set(f"Rename failed: {ex}")
 
+    def _ac_commit_to_voices(self):
+        if not self._ac_output_path or not os.path.isfile(self._ac_output_path):
+            self._ac_status_var.set("No capture file to commit")
+            return
+        if self._ac_recording:
+            self._ac_status_var.set("Stop recording before committing")
+            return
+        os.makedirs(XTTS_VOICES_DIR, exist_ok=True)
+        dst = os.path.join(XTTS_VOICES_DIR, os.path.basename(self._ac_output_path))
+        try:
+            shutil.copy2(self._ac_output_path, dst)
+        except Exception as ex:
+            self._ac_status_var.set(f"Commit failed: {ex}")
+            return
+        self._ac_status_var.set(f"Committed to AVR Lab: {os.path.basename(dst)}")
+        if hasattr(self, "xtts_voices"):
+            self._xtts_refresh_voices()
+
     def _ac_close(self, win):
         if self._ac_recording:
             self._ac_stop()
         win.destroy()
         self._ac_win = None
 
-    # ==================== GEOF TAB ====================
+    # ==================== DOPPLER TAB ====================
 
-    _GEOF_FENCE_PATH = os.path.join(
-        os.path.expanduser("~"), ".openclaw", "fence_config.json")
-    _GEOF_PINS_PATH = os.path.join(
-        os.path.expanduser("~"), ".openclaw", "geof_pins.json")
-    _GEOF_HEARTBEAT_INTERVAL = 20 * 60  # 20 minutes in seconds
+    _DOPPLER_API = "https://api.open-meteo.com/v1/forecast"
+    _DOPPLER_REFRESH_MS = 15 * 60 * 1000  # 15 minutes
+    _DOPPLER_RADAR_REFRESH_MS = 15 * 60 * 1000  # 15 minutes
+    _DOPPLER_ALERT_COOLDOWN = 30 * 60     # 30 min between same alerts
+    _DOPPLER_MOBILE_URL = "http://127.0.0.1:8089/device/chat"
+    _DOPPLER_RADAR_WMS = (
+        "https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0r.cgi"
+        "?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=nexrad-n0r"
+        "&FORMAT=image/png&TRANSPARENT=TRUE&SRS=EPSG:4326"
+    )
+    _DOPPLER_NWR_DEFAULT_FREQ = "162.550M"
+    _DOPPLER_NWR_DEFAULT_URL = "https://wxradio.org/MO-KansasCity-KID77"
 
-    def build_geof(self):
-        f = self.tabs["geof"]
-        self._geof_collars = {}
-        self._geof_fence_vertices = []
-        self._geof_pins = []
-        self._geof_map_drag = None
-        self._geof_map_center = (36.35, -93.2)  # Ozarks default
-        self._geof_map_zoom = 12
-        self._geof_heartbeat_active = False
-        self._geof_lora_bridge_proc = None
+    _WMO_MAP = {
+        0: ("Clear Sky", "\u2600"),
+        1: ("Mainly Clear", "\U0001f324"),
+        2: ("Partly Cloudy", "\u26c5"),
+        3: ("Overcast", "\u2601"),
+        45: ("Fog", "\U0001f32b"),
+        48: ("Rime Fog", "\U0001f32b"),
+        51: ("Light Drizzle", "\U0001f326"),
+        53: ("Drizzle", "\U0001f326"),
+        55: ("Dense Drizzle", "\U0001f326"),
+        56: ("Freezing Drizzle", "\u2744\U0001f327"),
+        57: ("Heavy Freezing Drizzle", "\u2744\U0001f327"),
+        61: ("Light Rain", "\U0001f327"),
+        63: ("Rain", "\U0001f327"),
+        65: ("Heavy Rain", "\U0001f327"),
+        66: ("Freezing Rain", "\u2744\U0001f327"),
+        67: ("Heavy Freezing Rain", "\u2744\U0001f327"),
+        71: ("Light Snow", "\u2744"),
+        73: ("Snow", "\u2744"),
+        75: ("Heavy Snow", "\u2744"),
+        77: ("Snow Grains", "\u2744"),
+        80: ("Light Showers", "\U0001f326"),
+        81: ("Showers", "\U0001f327"),
+        82: ("Violent Showers", "\U0001f327"),
+        85: ("Light Snow Showers", "\U0001f328"),
+        86: ("Heavy Snow Showers", "\U0001f328"),
+        95: ("Thunderstorm", "\u26c8"),
+        96: ("Thunderstorm + Hail", "\u26c8"),
+        99: ("Severe Thunderstorm + Hail", "\u26c8"),
+    }
 
-        # -- Header --
+    _DOPPLER_SEVERE_CODES = {
+        56, 57, 63, 65, 66, 67, 73, 75, 77, 82, 85, 86, 95, 96, 99
+    }
+
+    def _doppler_wmo(self, code):
+        return self._WMO_MAP.get(code, ("Unknown", "?"))
+
+    def _doppler_wind_bearing(self, deg):
+        dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+        return dirs[int((deg % 360) / 22.5 + 0.5) % 16]
+
+    def build_doppler(self):
+        f = self.tabs["doppler"]
+        _ref_lat, _ref_lon = self._get_device_gps_reference()
+        self._doppler_lat = _ref_lat
+        self._doppler_lon = _ref_lon
+        self._doppler_data = None
+        self._doppler_last_alert_code = None
+        self._doppler_last_alert_time = 0
+        self._doppler_map_zoom = 0.0
+        self._doppler_pan_offset = [0.0, 0.0]
+        self._doppler_pan_drag = {
+            "active": False, "sx": 0, "sy": 0, "ox": 0.0, "oy": 0.0}
+        self._doppler_radar_tk = None
+        self._doppler_fetching_radar = False
+        self._doppler_last_radar_fetch_time = 0
+        self._doppler_weather_history = []
+        self._doppler_nwr_proc = None
+
+        # ── Header ──
         header = tk.Frame(f, bg=TH["bg"])
         header.pack(fill="x", padx=12, pady=(10, 0))
-        tk.Label(header, text="GEOF \u2014 GEOFENCE TRACKER",
-                 font=TH["font_title"], fg=TH["green"], bg=TH["bg"]).pack(side="left")
-        self._geof_status_lbl = tk.Label(
-            header, text="OFFLINE", font=(_FONTS["mono"], 9),
-            fg=TH["red"], bg=TH["bg"])
-        self._geof_status_lbl.pack(side="right", padx=8)
+        tk.Label(header, text="DOPPLER FEED", font=TH["font_title"],
+                 fg=TH["btn"], bg=TH["bg"]).pack(side="left")
+        self._doppler_status = tk.Label(header, text="", font=TH["font_sm"],
+                                        fg=TH["fg_dim"], bg=TH["bg"])
+        self._doppler_status.pack(side="right")
 
-        # -- Toolbar --
-        toolbar = tk.Frame(f, bg=TH["bg"])
-        toolbar.pack(fill="x", padx=12, pady=(6, 4))
+        # ── GPS input row ──
+        gps_row = tk.Frame(f, bg=TH["bg"])
+        gps_row.pack(fill="x", padx=12, pady=(6, 0))
+        tk.Label(gps_row, text="LAT", font=TH["font_sm"],
+                 fg=TH["fg2"], bg=TH["bg"]).pack(side="left")
+        self._doppler_lat_var = tk.StringVar(value=str(self._doppler_lat))
+        tk.Entry(gps_row, textvariable=self._doppler_lat_var, width=12,
+                 bg=TH["input"], fg=TH["fg"], insertbackground=TH["fg"],
+                 font=TH["font_mono"], relief="flat",
+                 highlightthickness=1,
+                 highlightbackground=TH["border"]).pack(side="left", padx=(4, 10))
+        tk.Label(gps_row, text="LON", font=TH["font_sm"],
+                 fg=TH["fg2"], bg=TH["bg"]).pack(side="left")
+        self._doppler_lon_var = tk.StringVar(value=str(self._doppler_lon))
+        tk.Entry(gps_row, textvariable=self._doppler_lon_var, width=12,
+                 bg=TH["input"], fg=TH["fg"], insertbackground=TH["fg"],
+                 font=TH["font_mono"], relief="flat",
+                 highlightthickness=1,
+                 highlightbackground=TH["border"]).pack(side="left", padx=(4, 10))
+        RoundedButton(gps_row, text="FETCH",
+                      command=self._doppler_refresh).pack(side="left", padx=4)
+        self._doppler_notify_var = tk.IntVar(value=1)
+        tk.Checkbutton(gps_row, text="Pet Alert \u2192 S22",
+                       variable=self._doppler_notify_var,
+                       bg=TH["bg"], fg=TH["fg"], selectcolor=TH["input"],
+                       activebackground=TH["bg"], activeforeground=TH["fg"],
+                       font=TH["font_sm"]).pack(side="left", padx=(12, 0))
 
-        self._btn(toolbar, "Sync Pins", self._geof_sync_pins).pack(side="left", padx=2)
-        self._btn(toolbar, "Load Fence", self._geof_load_fence).pack(side="left", padx=2)
-        self._btn(toolbar, "Save Fence", self._geof_save_fence).pack(side="left", padx=2)
-        self._btn(toolbar, "Clear Pins", self._geof_clear_pins).pack(side="left", padx=2)
+        # ── Location + Radar station row ──
+        doppler_loc_row = tk.Frame(f, bg=TH["bg"])
+        doppler_loc_row.pack(fill="x", padx=12, pady=(4, 0))
+        tk.Label(doppler_loc_row, text="Location:", bg=TH["bg"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._doppler_loc_combo = ttk.Combobox(doppler_loc_row, state="readonly", width=26)
+        self._doppler_loc_combo.pack(side="left", padx=(4, 8))
+        self._doppler_loc_combo.bind("<<ComboboxSelected>>", self._doppler_go_to_location)
+        self._populate_location_combo(self._doppler_loc_combo)
+        RoundedButton(doppler_loc_row, text="MANAGE",
+                      command=lambda: self._open_location_manager(
+                          on_change_callback=self._doppler_on_locations_changed)
+                      ).pack(side="left", padx=(0, 12))
 
-        tk.Frame(toolbar, bg=TH["border_hi"], width=1).pack(
-            side="left", fill="y", padx=8, pady=2)
+        tk.Label(doppler_loc_row, text="NWS Radar:", bg=TH["bg"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._doppler_station_var = tk.StringVar(value="KSGF")
+        doppler_stations = ttk.Combobox(
+            doppler_loc_row, textvariable=self._doppler_station_var,
+            values=["KSGF - Springfield", "KSRX - Ozarks", "KEAX - Kansas City",
+                    "KLSX - St. Louis", "KILX - Quincy/Lincoln",
+                    "KLZK - Little Rock"],
+            state="readonly", width=22)
+        doppler_stations.pack(side="left", padx=(4, 0))
+        doppler_stations.set("KSGF - Springfield")
 
-        self._btn(toolbar, "Start Bridge", self._geof_start_bridge).pack(side="left", padx=2)
-        self._btn(toolbar, "Stop Bridge", self._geof_stop_bridge).pack(side="left", padx=2)
+        # ── NWR status (compact, next to Pet Alert) ──
+        nwr_compact = tk.Frame(gps_row, bg=TH["bg"])
+        nwr_compact.pack(side="left", padx=(16, 0))
+        tk.Label(nwr_compact, text="NWR", bg=TH["bg"],
+                 fg=TH["btn"], font=(_FONTS["mono"], 8, "bold")).pack(side="left")
+        self._doppler_nwr_status = tk.Label(
+            nwr_compact, text="\u25cf Offline", bg=TH["bg"],
+            fg=TH["red"], font=(_FONTS["ui"], 8, "bold"))
+        self._doppler_nwr_status.pack(side="left", padx=(4, 0))
+        self._doppler_nwr_source = tk.StringVar(value="web")
+        self._doppler_nwr_addr_var = tk.StringVar(
+            value=self._DOPPLER_NWR_DEFAULT_URL)
+        RoundedButton(nwr_compact, text="LISTEN",
+                      command=self._doppler_nwr_play
+                      ).pack(side="left", padx=(8, 2))
+        RoundedButton(nwr_compact, text="STOP",
+                      command=self._doppler_nwr_stop
+                      ).pack(side="left")
 
-        tk.Frame(toolbar, bg=TH["border_hi"], width=1).pack(
-            side="left", fill="y", padx=8, pady=2)
+        # ── Alert banner (hidden by default) ──
+        self._doppler_alert_frame = tk.Frame(f, bg=TH["red"])
+        self._doppler_alert_lbl = tk.Label(
+            self._doppler_alert_frame, text="",
+            font=(_FONTS["ui"], 10, "bold"),
+            fg="#ffffff", bg=TH["red"], wraplength=700)
+        self._doppler_alert_lbl.pack(padx=12, pady=6)
 
-        self._btn(toolbar, "Start Heartbeat", self._geof_start_heartbeat).pack(
-            side="left", padx=2)
-        self._btn(toolbar, "Stop Heartbeat", self._geof_stop_heartbeat).pack(
-            side="left", padx=2)
+        # ── Main body: radar (left) + sidebar (right) ──
+        body = tk.Frame(f, bg=TH["bg"])
+        body.pack(fill="both", expand=True, padx=12, pady=(8, 0))
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=0)
+        body.rowconfigure(0, weight=1)
 
-        self._geof_hb_lbl = tk.Label(
-            toolbar, text="", font=TH["font_xs"], fg=TH["fg_dim"], bg=TH["bg"])
-        self._geof_hb_lbl.pack(side="right", padx=8)
+        # ── LEFT: DOPPLER RADAR MAP ──
+        map_card = tk.Frame(body, bg=TH["card"], highlightthickness=1,
+                            highlightbackground=TH["border"])
+        map_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
-        # -- Main paned area: map (left) + collar table (right) --
-        pane = ttk.PanedWindow(f, orient="horizontal")
-        pane.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        map_hdr = tk.Frame(map_card, bg=TH["card"])
+        map_hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(map_hdr, text="DOPPLER RADAR", bg=TH["card"],
+                 fg=TH["btn"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(side="left")
+        self._doppler_clock_lbl = tk.Label(
+            map_hdr, text="", bg=TH["card"],
+            fg=TH["fg"], font=(_FONTS["mono"], 8, "bold"))
+        self._doppler_clock_lbl.pack(side="left", padx=(10, 0))
+        self._doppler_map_info = tk.Label(
+            map_hdr, text="", bg=TH["card"],
+            fg=TH["fg2"], font=TH["font_xs"])
+        self._doppler_map_info.pack(side="right")
 
-        # === LEFT: Map canvas ===
-        map_frame = tk.Frame(pane, bg=TH["input"])
-        self._geof_canvas = tk.Canvas(
-            map_frame, bg=TH["input"], highlightthickness=0, cursor="crosshair")
-        self._geof_canvas.pack(fill="both", expand=True)
-        self._geof_canvas.bind("<Button-1>", self._geof_canvas_click)
-        self._geof_canvas.bind("<B1-Motion>", self._geof_canvas_drag)
-        self._geof_canvas.bind("<ButtonRelease-1>", self._geof_canvas_release)
-        self._geof_canvas.bind("<MouseWheel>", self._geof_canvas_scroll)
-        self._geof_canvas.bind("<Button-4>", lambda e: self._geof_zoom(1))
-        self._geof_canvas.bind("<Button-5>", lambda e: self._geof_zoom(-1))
-        self._geof_canvas.bind("<Configure>", lambda e: self._geof_redraw())
+        RoundedButton(map_hdr, text=" + ",
+                      command=lambda: self._doppler_zoom_step(1)
+                      ).pack(side="right", padx=(4, 0))
+        RoundedButton(map_hdr, text=" \u2013 ",
+                      command=lambda: self._doppler_zoom_step(-1)
+                      ).pack(side="right", padx=(4, 0))
+        RoundedButton(map_hdr, text="CENTER",
+                      command=self._doppler_center_home
+                      ).pack(side="right", padx=(4, 0))
 
-        map_info = tk.Frame(map_frame, bg=TH["card"])
-        map_info.pack(fill="x")
-        self._geof_coord_lbl = tk.Label(
-            map_info, text="Center: 36.35, -93.20  Zoom: 12",
-            font=TH["font_xs"], fg=TH["fg2"], bg=TH["card"])
-        self._geof_coord_lbl.pack(side="left", padx=8, pady=2)
-        self._geof_pin_count_lbl = tk.Label(
-            map_info, text="Pins: 0  Collars: 0",
-            font=TH["font_xs"], fg=TH["fg2"], bg=TH["card"])
-        self._geof_pin_count_lbl.pack(side="right", padx=8, pady=2)
+        if _HAS_MAP_EMBED:
+            self._doppler_map_embedder = TileMapRenderer()
+            self._doppler_map_embedder.set_redraw_callback(
+                self._doppler_draw_map)
+            self._doppler_map_embedder.set_fallback_callback(
+                self._on_tile_fallback)
+            self._doppler_embed_active = False
+            self._doppler_tile_mode = "street"
+            self._doppler_tile_btn = RoundedButton(
+                map_hdr, text="SATELLITE",
+                command=self._doppler_toggle_tile_mode)
+            self._doppler_tile_btn.pack(side="right", padx=(4, 0))
+            self._doppler_embed_btn = RoundedButton(
+                map_hdr, text="EMBED MAP",
+                command=self._doppler_toggle_embed)
+            self._doppler_embed_btn.pack(side="right", padx=(6, 0))
 
-        pane.add(map_frame, weight=3)
+        tk.Frame(map_card, bg=TH["border_hi"], height=1).pack(
+            fill="x", padx=10, pady=(0, 4))
 
-        # === RIGHT: Collar status table + detail ===
-        right = tk.Frame(pane, bg=TH["bg"])
+        map_container = tk.Frame(map_card, bg=TH["input"])
+        map_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._doppler_canvas = tk.Canvas(
+            map_container, bg=TH["input"], highlightthickness=0)
+        self._doppler_canvas.pack(fill="both", expand=True)
+        self._doppler_canvas.bind(
+            "<Configure>", lambda e: self._doppler_draw_map())
+        self._doppler_canvas.bind(
+            "<ButtonPress-3>", self._doppler_pan_start)
+        self._doppler_canvas.bind(
+            "<B3-Motion>", self._doppler_pan_move)
+        self._doppler_canvas.bind(
+            "<ButtonRelease-3>", self._doppler_pan_end)
+        self._doppler_canvas.bind(
+            "<MouseWheel>", self._doppler_zoom_event)
+        self._doppler_canvas.bind(
+            "<Button-4>", self._doppler_zoom_event)
+        self._doppler_canvas.bind(
+            "<Button-5>", self._doppler_zoom_event)
 
-        tk.Label(right, text="COLLAR STATUS", font=TH["font_title"],
-                 fg=TH["green"], bg=TH["bg"]).pack(anchor="w", padx=8, pady=(4, 2))
+        # ── RIGHT SIDEBAR: conditions + forecast ──
+        sidebar = tk.Frame(body, bg=TH["bg"], width=220)
+        sidebar.grid(row=0, column=1, sticky="nsew")
+        sidebar.grid_propagate(False)
+        sidebar.config(width=220)
 
-        cols = ("id", "name", "status", "battery", "lat", "lon", "last_seen")
-        col_w = {"id": 40, "name": 80, "status": 65, "battery": 50,
-                 "lat": 80, "lon": 80, "last_seen": 110}
-        tree_frame = tk.Frame(right, bg=TH["bg"])
-        tree_frame.pack(fill="both", expand=True, padx=4)
-
-        self._geof_tree = ttk.Treeview(
-            tree_frame, columns=cols, show="headings", selectmode="browse")
-        for c in cols:
-            self._geof_tree.heading(c, text=c.upper())
-            self._geof_tree.column(c, width=col_w.get(c, 70), anchor="center",
-                                    minwidth=30)
-        tree_sb = self._scrollbar(tree_frame, command=self._geof_tree.yview)
-        self._geof_tree.configure(yscrollcommand=tree_sb.set)
-        self._geof_tree.pack(side="left", fill="both", expand=True)
-        tree_sb.pack(side="right", fill="y")
-
-        self._geof_tree.tag_configure("OK", foreground=TH["fg"])
-        self._geof_tree.tag_configure("STALE", foreground="#e0a030")
-        self._geof_tree.tag_configure("OFFLINE", foreground=TH["red"])
-        self._geof_tree.tag_configure("ALERT", foreground="#ff3333")
-
-        # -- Detail panel --
-        detail = tk.Frame(right, bg=TH["card"], bd=0, highlightthickness=1,
-                          highlightbackground=TH["border"])
-        detail.pack(fill="x", padx=4, pady=(4, 4))
-
-        tk.Label(detail, text="DETAIL", font=TH["font_xs"],
-                 fg=TH["fg_dim"], bg=TH["card"]).pack(anchor="w", padx=8, pady=(4, 0))
-        self._geof_detail_text = self._text_widget(detail, height=6, wrap="word")
-        self._geof_detail_text.pack(fill="x", padx=8, pady=4)
-        self._geof_detail_text.insert("1.0", "Select a collar to view details.")
-        self._geof_detail_text.config(state="disabled")
-
-        self._geof_tree.bind("<<TreeviewSelect>>", self._geof_on_collar_select)
-
-        # -- Log panel --
-        log_frame = tk.Frame(right, bg=TH["card"], bd=0, highlightthickness=1,
+        # -- Temperature --
+        temp_card = tk.Frame(sidebar, bg=TH["card"], highlightthickness=1,
                              highlightbackground=TH["border"])
-        log_frame.pack(fill="x", padx=4, pady=(0, 4))
-        tk.Label(log_frame, text="LORA LOG", font=TH["font_xs"],
-                 fg=TH["fg_dim"], bg=TH["card"]).pack(anchor="w", padx=8, pady=(4, 0))
-        self._geof_log = self._text_widget(log_frame, height=5, wrap="word")
-        self._geof_log.pack(fill="x", padx=8, pady=4)
-        self._geof_log.config(state="disabled")
+        temp_card.pack(fill="x", pady=(0, 4))
+        self._doppler_icon_lbl = tk.Label(
+            temp_card, text="\u2600", font=(_FONTS["ui"], 22),
+            fg=TH["btn"], bg=TH["card"])
+        self._doppler_icon_lbl.pack(side="left", padx=(8, 0), pady=4)
+        temp_info = tk.Frame(temp_card, bg=TH["card"])
+        temp_info.pack(side="left", padx=(8, 0), pady=4)
+        self._doppler_temp_lbl = tk.Label(
+            temp_info, text="--\u00b0F", font=(_FONTS["ui"], 18, "bold"),
+            fg=TH["fg"], bg=TH["card"])
+        self._doppler_temp_lbl.pack(anchor="w")
+        self._doppler_desc_lbl = tk.Label(
+            temp_info, text="Loading...", font=(_FONTS["mono"], 8),
+            fg=TH["fg2"], bg=TH["card"])
+        self._doppler_desc_lbl.pack(anchor="w")
+        self._doppler_humid_lbl = tk.Label(
+            temp_info, text="Humidity: --%",
+            font=(_FONTS["mono"], 7), fg=TH["fg2"], bg=TH["card"])
+        self._doppler_humid_lbl.pack(anchor="w")
+        self._doppler_loc_lbl = tk.Label(
+            temp_info, text="",
+            font=(_FONTS["mono"], 7), fg=TH["fg_dim"], bg=TH["card"])
+        self._doppler_loc_lbl.pack(anchor="w")
 
-        pane.add(right, weight=2)
+        # -- Wind / Anemometer --
+        wind_card = tk.Frame(sidebar, bg=TH["card"], highlightthickness=1,
+                             highlightbackground=TH["border"])
+        wind_card.pack(fill="x", pady=(0, 4))
+        tk.Label(wind_card, text="ANEMOMETER", font=(_FONTS["mono"], 7, "bold"),
+                 fg=TH["fg2"], bg=TH["card"]).pack(anchor="w", padx=8, pady=(4, 0))
+        self._doppler_wind_lbl = tk.Label(
+            wind_card, text="-- mph", font=(_FONTS["ui"], 14, "bold"),
+            fg=TH["fg"], bg=TH["card"])
+        self._doppler_wind_lbl.pack(anchor="w", padx=8)
+        self._doppler_dir_lbl = tk.Label(
+            wind_card, text="--", font=(_FONTS["mono"], 8),
+            fg=TH["fg2"], bg=TH["card"])
+        self._doppler_dir_lbl.pack(anchor="w", padx=8, pady=(0, 4))
 
-        self._geof_load_fence()
-        self._geof_load_pins()
+        # -- 7-Day Forecast (compact vertical tiles) --
+        tk.Label(sidebar, text="7-DAY FORECAST", font=(_FONTS["mono"], 7, "bold"),
+                 fg=TH["btn"], bg=TH["bg"]).pack(anchor="w", pady=(4, 2))
 
-    # -- GeoF map helpers --
+        forecast_outer = tk.Frame(sidebar, bg=TH["bg"])
+        forecast_outer.pack(fill="both", expand=True)
+        self._doppler_day_frames = []
+        for i in range(7):
+            day_f = tk.Frame(forecast_outer, bg=TH["card"],
+                             highlightthickness=1,
+                             highlightbackground=TH["border"])
+            day_f.pack(fill="x", pady=1)
+            day_inner = tk.Frame(day_f, bg=TH["card"])
+            day_inner.pack(fill="x", padx=4, pady=2)
+            date_col = tk.Frame(day_inner, bg=TH["card"])
+            date_col.pack(side="left")
+            d_lbl = tk.Label(date_col, text="--",
+                             font=(_FONTS["mono"], 7, "bold"),
+                             fg=TH["fg2"], bg=TH["card"], width=6,
+                             anchor="w")
+            d_lbl.pack()
+            day_lbl = tk.Label(date_col, text="",
+                               font=(_FONTS["mono"], 6, "bold"),
+                               fg=TH["btn"], bg=TH["card"], width=6,
+                               anchor="w")
+            day_lbl.pack()
+            ico_lbl = tk.Label(day_inner, text="?",
+                               font=(_FONTS["ui"], 10),
+                               fg=TH["btn"], bg=TH["card"])
+            ico_lbl.pack(side="left", padx=(2, 4))
+            hi_lbl = tk.Label(day_inner, text="--\u00b0",
+                              font=(_FONTS["ui"], 9, "bold"),
+                              fg=TH["fg"], bg=TH["card"])
+            hi_lbl.pack(side="left")
+            lo_lbl = tk.Label(day_inner, text="--\u00b0",
+                              font=(_FONTS["mono"], 8),
+                              fg=TH["fg2"], bg=TH["card"])
+            lo_lbl.pack(side="left", padx=(4, 0))
+            desc_lbl = tk.Label(day_inner, text="",
+                                font=(_FONTS["mono"], 6),
+                                fg=TH["fg_dim"], bg=TH["card"])
+            desc_lbl.pack(side="right")
+            pct_lbl = tk.Label(day_inner, text="",
+                               font=(_FONTS["mono"], 6),
+                               fg=TH["fg_dim"], bg=TH["card"])
+            pct_lbl.pack(side="right", padx=(0, 4))
+            self._doppler_day_frames.append(
+                {"date": d_lbl, "day": day_lbl, "icon": ico_lbl,
+                 "desc": desc_lbl, "hi": hi_lbl, "lo": lo_lbl,
+                 "precip": pct_lbl})
 
-    def _geof_latlon_to_xy(self, lat, lon):
-        cw = self._geof_canvas.winfo_width() or 800
-        ch = self._geof_canvas.winfo_height() or 600
-        clat, clon = self._geof_map_center
-        scale = 2 ** self._geof_map_zoom * 2.0
-        x = cw / 2 + (lon - clon) * scale
-        y = ch / 2 - (lat - clat) * scale
-        return x, y
+        # ── NWR Audio Settings (collapsed into sidebar bottom) ──
+        nwr_settings = tk.Frame(sidebar, bg=TH["card"], highlightthickness=1,
+                                highlightbackground=TH["border"])
+        nwr_settings.pack(fill="x", pady=(4, 0))
+        tk.Label(nwr_settings, text="NWR SOURCE", font=(_FONTS["mono"], 7, "bold"),
+                 fg=TH["fg2"], bg=TH["card"]).pack(anchor="w", padx=6, pady=(4, 0))
+        nwr_s_row = tk.Frame(nwr_settings, bg=TH["card"])
+        nwr_s_row.pack(fill="x", padx=6, pady=(0, 4))
+        nwr_combo = ttk.Combobox(
+            nwr_s_row, textvariable=self._doppler_nwr_source,
+            values=["web", "rtl-sdr"], state="readonly", width=8)
+        nwr_combo.pack(side="left")
+        nwr_combo.bind("<<ComboboxSelected>>",
+                        self._doppler_nwr_source_changed)
+        self._doppler_nwr_addr_lbl = tk.Label(
+            nwr_settings, text="URL:", bg=TH["card"],
+            fg=TH["fg2"], font=(_FONTS["mono"], 7))
+        self._doppler_nwr_addr_lbl.pack(anchor="w", padx=6)
+        self._doppler_nwr_addr_entry = tk.Entry(
+            nwr_settings, textvariable=self._doppler_nwr_addr_var, width=24,
+            bg=TH["input"], fg=TH["fg"], insertbackground=TH["fg"],
+            font=(_FONTS["mono"], 7), relief="flat",
+            highlightthickness=1, highlightbackground=TH["border"])
+        self._doppler_nwr_addr_entry.pack(fill="x", padx=6, pady=(0, 4))
 
-    def _geof_xy_to_latlon(self, x, y):
-        cw = self._geof_canvas.winfo_width() or 800
-        ch = self._geof_canvas.winfo_height() or 600
-        clat, clon = self._geof_map_center
-        scale = 2 ** self._geof_map_zoom * 2.0
-        lon = clon + (x - cw / 2) / scale
-        lat = clat - (y - ch / 2) / scale
-        return lat, lon
+        # ── Feed Log ──
+        tk.Label(f, text="FEED LOG", font=TH["font_sm"],
+                 fg=TH["fg2"], bg=TH["bg"]).pack(
+            anchor="w", padx=12, pady=(6, 2))
+        self._doppler_log = tk.Text(
+            f, height=3, bg=TH["input"], fg=TH["fg"],
+            font=TH["font_mono"], relief="flat",
+            highlightthickness=1, highlightbackground=TH["border"],
+            state="disabled", wrap="word")
+        self._doppler_log.pack(fill="x", padx=12, pady=(0, 8))
 
-    def _geof_redraw(self):
-        c = self._geof_canvas
-        c.delete("all")
-        cw = c.winfo_width() or 800
-        ch = c.winfo_height() or 600
+        # ── Kick off data + map + clock ──
+        self.after(400, self._doppler_refresh)
+        self.after(self._DOPPLER_REFRESH_MS, self._doppler_auto_refresh)
+        self.after(self._DOPPLER_RADAR_REFRESH_MS,
+                   self._doppler_radar_auto_refresh)
+        self.after(100, self._doppler_update_clock)
+        if _HAS_MAP_EMBED:
+            self.after(200, self._doppler_embed_map)
 
-        # Grid lines
-        for gx in range(0, cw, 80):
-            c.create_line(gx, 0, gx, ch, fill="#1a1a18", dash=(2, 4))
-        for gy in range(0, ch, 80):
-            c.create_line(0, gy, cw, gy, fill="#1a1a18", dash=(2, 4))
+    # ── Doppler clock ──
 
-        # Fence polygon
-        if len(self._geof_fence_vertices) >= 3:
-            pts = []
-            for v in self._geof_fence_vertices:
-                pts.extend(self._geof_latlon_to_xy(v[0], v[1]))
-            c.create_polygon(pts, outline="#e8793a", fill="", width=2,
-                             dash=(6, 3), tags="fence")
+    def _doppler_update_clock(self):
+        import datetime as _dt
+        now = _dt.datetime.now()
+        self._doppler_clock_lbl.config(
+            text=now.strftime("%a %b %d, %Y  %I:%M %p"))
+        self.after(60_000, self._doppler_update_clock)
 
-        # Pins
-        for i, pin in enumerate(self._geof_pins):
-            x, y = self._geof_latlon_to_xy(pin["lat"], pin["lon"])
-            c.create_oval(x - 5, y - 5, x + 5, y + 5,
-                          fill="#e8793a", outline="#f5e6d3", tags="pin")
-            c.create_text(x, y - 10, text=str(i + 1),
-                          fill="#f5e6d3", font=(_FONTS["mono"], 7))
+    # ── Doppler logging ──
 
-        # Collars
-        for cid, collar in self._geof_collars.items():
-            x, y = self._geof_latlon_to_xy(collar["lat"], collar["lon"])
-            color_map = {"OK": "#2fa572", "STALE": "#e0a030",
-                         "OFFLINE": TH["red"], "ALERT": "#ff3333"}
-            color = color_map.get(collar.get("status", "OFFLINE"), TH["red"])
-            c.create_rectangle(x - 6, y - 6, x + 6, y + 6,
-                               fill=color, outline="#f5e6d3", tags="collar")
-            c.create_text(x, y - 12, text=collar.get("name", cid),
-                          fill="#f5e6d3", font=(_FONTS["mono"], 7))
+    def _doppler_log_msg(self, msg):
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime("%H:%M:%S")
+        self._doppler_log.config(state="normal")
+        self._doppler_log.insert("end", f"[{ts}] {msg}\n")
+        self._doppler_log.see("end")
+        self._doppler_log.config(state="disabled")
 
-        # Update info labels
-        clat, clon = self._geof_map_center
-        self._geof_coord_lbl.config(
-            text=f"Center: {clat:.4f}, {clon:.4f}  Zoom: {self._geof_map_zoom}")
-        self._geof_pin_count_lbl.config(
-            text=f"Pins: {len(self._geof_pins)}  Collars: {len(self._geof_collars)}")
+    # ── Doppler weather data fetch ──
 
-    def _geof_canvas_click(self, event):
-        self._geof_map_drag = (event.x, event.y)
+    def _doppler_auto_refresh(self):
+        self._doppler_refresh()
+        self.after(self._DOPPLER_REFRESH_MS, self._doppler_auto_refresh)
 
-    def _geof_canvas_drag(self, event):
-        if self._geof_map_drag is None:
+    def _doppler_refresh(self):
+        try:
+            self._doppler_lat = float(self._doppler_lat_var.get().strip())
+            self._doppler_lon = float(self._doppler_lon_var.get().strip())
+        except ValueError:
+            self._doppler_log_msg("Invalid coordinates")
             return
-        dx = event.x - self._geof_map_drag[0]
-        dy = event.y - self._geof_map_drag[1]
-        self._geof_map_drag = (event.x, event.y)
-        scale = 2 ** self._geof_map_zoom * 2.0
-        clat, clon = self._geof_map_center
-        clon -= dx / scale
-        clat += dy / scale
-        self._geof_map_center = (clat, clon)
-        self._geof_redraw()
+        self._doppler_status.config(text="fetching...")
+        threading.Thread(target=self._doppler_fetch_worker,
+                         daemon=True).start()
 
-    def _geof_canvas_release(self, event):
-        self._geof_map_drag = None
+    def _doppler_fetch_worker(self):
+        import urllib.request
+        import json as _json
+        self.after(0, lambda: self._obs_start_event("Doppler fetch"))
+        try:
+            params = (
+                f"?latitude={self._doppler_lat}&longitude={self._doppler_lon}"
+                "&current=temperature_2m,wind_speed_10m,wind_direction_10m,"
+                "weather_code,relative_humidity_2m"
+                "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+                "precipitation_probability_max"
+                "&timezone=auto&temperature_unit=fahrenheit"
+                "&wind_speed_unit=mph&forecast_days=7"
+            )
+            url = self._DOPPLER_API + params
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "WhimTerminal/3.4"})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = _json.loads(resp.read().decode())
+            self._doppler_data = data
+            self.after(0, self._doppler_update_ui)
+        except Exception as exc:
+            self.after(0, lambda: self._doppler_log_msg(
+                f"Fetch error: {exc}"))
+            self.after(0, lambda: self._doppler_status.config(text="error"))
+        finally:
+            self.after(0, self._obs_end_event)
 
-    def _geof_canvas_scroll(self, event):
-        if event.delta > 0:
-            self._geof_zoom(1)
+    def _doppler_update_ui(self):
+        import datetime as _dt
+        data = self._doppler_data
+        if not data:
+            return
+
+        cur = data.get("current", {})
+        temp = cur.get("temperature_2m")
+        wind = cur.get("wind_speed_10m")
+        wind_dir = cur.get("wind_direction_10m", 0)
+        wcode = cur.get("weather_code", 0)
+        humid = cur.get("relative_humidity_2m")
+
+        desc, icon = self._doppler_wmo(wcode)
+        self._doppler_icon_lbl.config(text=icon)
+        self._doppler_temp_lbl.config(
+            text=f"{temp:.0f}\u00b0F" if temp is not None else "--\u00b0F")
+        self._doppler_desc_lbl.config(text=desc)
+        self._doppler_wind_lbl.config(
+            text=f"{wind:.0f} mph" if wind is not None else "-- mph")
+        bearing = (self._doppler_wind_bearing(wind_dir)
+                   if wind_dir is not None else "--")
+        self._doppler_dir_lbl.config(
+            text=f"{bearing} ({wind_dir:.0f}\u00b0)")
+        self._doppler_humid_lbl.config(
+            text=f"Humidity: {humid:.0f}%"
+            if humid is not None else "Humidity: --%")
+        self._doppler_loc_lbl.config(
+            text=f"{self._doppler_lat:.4f}, {self._doppler_lon:.4f}")
+        self._doppler_status.config(
+            text=_dt.datetime.now().strftime("updated %H:%M"))
+
+        # Severe weather alert
+        if wcode in self._DOPPLER_SEVERE_CODES:
+            self._doppler_alert_frame.pack(
+                fill="x", padx=12, pady=(8, 0),
+                before=self._doppler_log)
+            self._doppler_alert_lbl.config(
+                text=f"\u26a0 SEVERE WEATHER: {desc} (WMO {wcode}) \u2014 "
+                     "Pets may be at risk outdoors")
+            self._doppler_send_pet_alert(wcode, desc)
         else:
-            self._geof_zoom(-1)
+            self._doppler_alert_frame.pack_forget()
 
-    def _geof_zoom(self, direction):
-        self._geof_map_zoom = max(1, min(20, self._geof_map_zoom + direction))
-        self._geof_redraw()
+        # 7-day forecast
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        codes = daily.get("weather_code", [])
+        hi_temps = daily.get("temperature_2m_max", [])
+        lo_temps = daily.get("temperature_2m_min", [])
+        precip = daily.get("precipitation_probability_max", [])
 
-    # -- GeoF pin / fence management --
-
-    def _geof_sync_pins(self):
-        path = filedialog.askopenfilename(
-            title="Select GPS Pins JSON",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
-        if not path:
-            return
-        try:
-            with open(path, "r") as fp:
-                data = json.load(fp)
-            if isinstance(data, list):
-                pins = data
-            elif isinstance(data, dict) and "pins" in data:
-                pins = data["pins"]
+        for i, df in enumerate(self._doppler_day_frames):
+            if i < len(dates):
+                dt = _dt.datetime.strptime(dates[i], "%Y-%m-%d")
+                df["date"].config(text=dt.strftime("%m/%d"))
+                df["day"].config(text=dt.strftime("%a"))
+                d, ic = self._doppler_wmo(
+                    codes[i] if i < len(codes) else 0)
+                df["icon"].config(text=ic)
+                df["desc"].config(text=d[:14])
+                df["hi"].config(
+                    text=f"{hi_temps[i]:.0f}\u00b0"
+                    if i < len(hi_temps) else "--\u00b0")
+                df["lo"].config(
+                    text=f"{lo_temps[i]:.0f}\u00b0"
+                    if i < len(lo_temps) else "--\u00b0")
+                df["precip"].config(
+                    text=f"{precip[i]:.0f}% precip"
+                    if i < len(precip) else "")
             else:
-                pins = []
-            self._geof_pins = []
-            for p in pins:
-                lat = p.get("lat") or p.get("latitude")
-                lon = p.get("lon") or p.get("lng") or p.get("longitude")
-                if lat is not None and lon is not None:
-                    self._geof_pins.append({
-                        "lat": float(lat), "lon": float(lon),
-                        "label": p.get("label", "")})
-            # Auto-build fence from pins
-            if len(self._geof_pins) >= 3:
-                self._geof_fence_vertices = [
-                    (p["lat"], p["lon"]) for p in self._geof_pins]
-            self._geof_save_pins()
-            self._geof_redraw()
-            self._geof_log_msg(
-                f"Synced {len(self._geof_pins)} pins from {os.path.basename(path)}")
-        except Exception as ex:
-            self._geof_log_msg(f"Pin sync error: {ex}")
+                df["date"].config(text="--")
+                df["day"].config(text="")
+                df["icon"].config(text="?")
+                df["desc"].config(text="")
+                df["hi"].config(text="--\u00b0")
+                df["lo"].config(text="--\u00b0")
+                df["precip"].config(text="")
 
-    def _geof_load_fence(self):
-        if os.path.isfile(self._GEOF_FENCE_PATH):
-            try:
-                with open(self._GEOF_FENCE_PATH, "r") as fp:
-                    data = json.load(fp)
-                verts = data.get("vertices", [])
-                self._geof_fence_vertices = [(v[0], v[1]) for v in verts]
-                self._geof_collars = {}
-                for collar in data.get("collars", []):
-                    cid = collar.get("id", str(len(self._geof_collars)))
-                    self._geof_collars[cid] = collar
-                self._geof_redraw()
-                self._geof_refresh_collar_tree()
-                self._geof_log_msg("Fence config loaded.")
-            except Exception as ex:
-                self._geof_log_msg(f"Load fence error: {ex}")
+        # Rolling 5-hour history (max 20 samples at 15-min intervals)
+        self._doppler_weather_history.append({
+            "time": _dt.datetime.now().strftime("%H:%M"),
+            "temp": temp, "humid": humid, "wind": wind,
+            "bearing": bearing, "desc": desc, "wcode": wcode,
+        })
+        if len(self._doppler_weather_history) > 20:
+            self._doppler_weather_history = self._doppler_weather_history[-20:]
 
-    def _geof_save_fence(self):
-        os.makedirs(os.path.dirname(self._GEOF_FENCE_PATH), exist_ok=True)
-        data = {
-            "vertices": list(self._geof_fence_vertices),
-            "collars": list(self._geof_collars.values()),
-        }
+        self._doppler_log_msg(
+            f"Updated: {desc}, {temp:.0f}\u00b0F, "
+            f"wind {wind:.0f} mph {bearing} "
+            f"[{len(self._doppler_weather_history)}/20 samples]")
+        self._doppler_draw_map()
+
+    # ── Doppler pet alert ──
+
+    def _doppler_send_pet_alert(self, wcode, desc):
+        if not self._doppler_notify_var.get():
+            return
+        now = time.time()
+        if (wcode == self._doppler_last_alert_code
+                and now - self._doppler_last_alert_time
+                < self._DOPPLER_ALERT_COOLDOWN):
+            return
+        self._doppler_last_alert_code = wcode
+        self._doppler_last_alert_time = now
+        msg = (f"\u26a0 WHIM WEATHER ALERT: {desc} (WMO {wcode}) at "
+               f"({self._doppler_lat:.4f}, {self._doppler_lon:.4f}). "
+               "Pets may be outside \u2014 check collars and bring them in.")
+        threading.Thread(target=self._doppler_post_alert,
+                         args=(msg,), daemon=True).start()
+        self._doppler_log_msg(f"Pet alert sent to S22: {desc}")
+
+    def _doppler_post_alert(self, text):
+        import urllib.request
+        import json as _json
+        payload = _json.dumps({
+            "sender": "WHIM-WEATHER",
+            "text": text,
+            "type": "text"
+        }).encode()
         try:
-            with open(self._GEOF_FENCE_PATH, "w") as fp:
-                json.dump(data, fp, indent=2)
-            self._geof_log_msg("Fence config saved.")
-        except Exception as ex:
-            self._geof_log_msg(f"Save fence error: {ex}")
-
-    def _geof_clear_pins(self):
-        self._geof_pins = []
-        self._geof_fence_vertices = []
-        self._geof_save_pins()
-        self._geof_redraw()
-        self._geof_log_msg("Pins and fence cleared.")
-
-    def _geof_load_pins(self):
-        if os.path.isfile(self._GEOF_PINS_PATH):
-            try:
-                with open(self._GEOF_PINS_PATH, "r") as fp:
-                    self._geof_pins = json.load(fp)
-                self._geof_redraw()
-            except Exception:
-                pass
-
-    def _geof_save_pins(self):
-        os.makedirs(os.path.dirname(self._GEOF_PINS_PATH), exist_ok=True)
-        try:
-            with open(self._GEOF_PINS_PATH, "w") as fp:
-                json.dump(self._geof_pins, fp, indent=2)
+            req = urllib.request.Request(
+                self._DOPPLER_MOBILE_URL, data=payload,
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "WhimTerminal/3.4"},
+                method="POST")
+            urllib.request.urlopen(req, timeout=5)
         except Exception:
             pass
 
-    # -- GeoF collar table --
+    # ── Doppler Radar Map ──
 
-    def _geof_refresh_collar_tree(self):
-        self._geof_tree.delete(*self._geof_tree.get_children())
-        now = time.time()
-        for cid, col in self._geof_collars.items():
-            last = col.get("last_seen", 0)
-            age = now - last if last else float("inf")
-            if col.get("status") == "ALERT":
-                tag = "ALERT"
-            elif age > self._GEOF_HEARTBEAT_INTERVAL * 2:
-                tag = "OFFLINE"
-                col["status"] = "OFFLINE"
-            elif age > self._GEOF_HEARTBEAT_INTERVAL:
-                tag = "STALE"
-                col["status"] = "STALE"
+    def _doppler_go_to_location(self, event=None):
+        val = self._doppler_loc_combo.get()
+        if not val:
+            return
+        locs = self._load_locations()
+        for loc in locs:
+            tag = f"{loc['name']} ({loc['lat']:.4f}, {loc['lon']:.4f})"
+            if val == tag:
+                self._doppler_lat = loc["lat"]
+                self._doppler_lon = loc["lon"]
+                self._doppler_lat_var.set(str(loc["lat"]))
+                self._doppler_lon_var.set(str(loc["lon"]))
+                self._doppler_pan_offset = [0.0, 0.0]
+                self._doppler_draw_map()
+                self._doppler_log_msg(f"Jumped to {loc['name']}")
+                self._doppler_refresh()
+                break
+
+    def _doppler_on_locations_changed(self):
+        self._populate_location_combo(self._doppler_loc_combo)
+        self._doppler_draw_map()
+
+    def _doppler_draw_map(self):
+        c = self._doppler_canvas
+        c.delete("all")
+        cw = c.winfo_width()
+        ch = c.winfo_height()
+        if cw < 80 or ch < 80:
+            return
+
+        lat = self._doppler_lat
+        lon = self._doppler_lon
+        lats = [lat]
+        lons = [lon]
+
+        embed_active = (_HAS_MAP_EMBED
+                        and getattr(self, "_doppler_embed_active", False))
+        if embed_active:
+            to_px = self._doppler_map_embedder.draw_tiles(
+                c, lats, lons, cw, ch,
+                zoom_offset=self._doppler_map_zoom,
+                pan_offset=self._doppler_pan_offset)
+        else:
+            to_px = None
+
+        if to_px is None:
+            pad = 40
+            scale = min(cw, ch) / 0.02
+            zoom_mult = 2.0 ** self._doppler_map_zoom
+            scale *= zoom_mult
+            ox, oy = self._doppler_pan_offset
+
+            def to_px(lt, ln):
+                x = cw / 2.0 + (ln - lon) * scale + ox
+                y = ch / 2.0 - (lt - lat) * scale + oy
+                return x, y
+
+            c.create_text(cw // 2, ch // 2,
+                          text="Tile map loading...",
+                          fill=TH["fg_dim"], font=(_FONTS["ui"], 10))
+
+        # Radar overlay (drawn on top of tiles, behind crosshair)
+        if self._doppler_radar_tk:
+            c.create_image(0, 0, anchor="nw",
+                           image=self._doppler_radar_tk)
+
+        # Crosshair at assigned GPS
+        cx, cy = to_px(lat, lon)
+        arm = 12
+        c.create_line(cx - arm, cy, cx + arm, cy,
+                      fill=TH["btn"], width=2)
+        c.create_line(cx, cy - arm, cx, cy + arm,
+                      fill=TH["btn"], width=2)
+        c.create_oval(cx - 5, cy - 5, cx + 5, cy + 5,
+                      outline=TH["btn"], width=2)
+        c.create_text(cx + 14, cy - 10,
+                      text=f"{lat:.4f}, {lon:.4f}", anchor="w",
+                      fill=TH["btn"], font=(_FONTS["mono"], 7, "bold"))
+
+        # Named location fences
+        self._draw_location_fences_on_canvas(c, to_px)
+
+        # Weather text overlay
+        data = self._doppler_data
+        if data:
+            cur = data.get("current", {})
+            wcode = cur.get("weather_code", 0)
+            desc, ico = self._doppler_wmo(wcode)
+            c.create_text(10, 10, anchor="nw",
+                          text=f"{ico} {desc}",
+                          fill=TH["fg"], font=(_FONTS["ui"], 9, "bold"))
+
+        self._doppler_map_info.config(
+            text=f"zoom {self._doppler_map_zoom:+.1f}")
+
+        # Fetch radar overlay in background (15-min gate + concurrency guard)
+        import time as _time_mod
+        _radar_elapsed = _time_mod.time() - self._doppler_last_radar_fetch_time
+        if (embed_active and not self._doppler_fetching_radar
+                and _radar_elapsed >= self._DOPPLER_RADAR_REFRESH_MS / 1000):
+            self._doppler_fetching_radar = True
+            threading.Thread(target=self._doppler_fetch_radar,
+                             args=(cw, ch), daemon=True).start()
+
+    def _doppler_fetch_radar(self, cw, ch):
+        import urllib.request
+        import time as _time_mod
+        self._doppler_last_radar_fetch_time = _time_mod.time()
+        self.after(0, lambda: self._obs_start_event("Doppler radar"))
+        try:
+            span_deg = 2.0 / (2.0 ** self._doppler_map_zoom)
+            lat = self._doppler_lat
+            lon = self._doppler_lon
+            ox, oy = self._doppler_pan_offset
+            lon_shift = -ox / max(cw, 1) * span_deg
+            lat_shift = oy / max(ch, 1) * span_deg
+            min_lon = lon + lon_shift - span_deg
+            max_lon = lon + lon_shift + span_deg
+            min_lat = lat + lat_shift - span_deg * (ch / max(cw, 1))
+            max_lat = lat + lat_shift + span_deg * (ch / max(cw, 1))
+            bbox = f"{min_lon},{min_lat},{max_lon},{max_lat}"
+            url = (f"{self._DOPPLER_RADAR_WMS}"
+                   f"&BBOX={bbox}&WIDTH={cw}&HEIGHT={ch}")
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "WhimTerminal/3.4"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read()
+            pil = Image.open(io.BytesIO(raw)).convert("RGBA")
+            self.after(0, lambda: self._doppler_apply_radar(pil))
+        except Exception as exc:
+            self.after(0, lambda: self._doppler_log_msg(
+                f"Radar fetch: {exc}"))
+        finally:
+            self._doppler_fetching_radar = False
+            self.after(0, self._obs_end_event)
+
+    def _doppler_apply_radar(self, pil_img):
+        try:
+            self._doppler_radar_tk = ImageTk.PhotoImage(pil_img)
+            self._doppler_draw_map()
+            self._doppler_log_msg("Radar overlay updated")
+        except Exception:
+            pass
+
+    def _doppler_radar_auto_refresh(self):
+        import time as _time_mod
+        if (_HAS_MAP_EMBED
+                and getattr(self, "_doppler_embed_active", False)
+                and not self._doppler_fetching_radar):
+            _elapsed = _time_mod.time() - self._doppler_last_radar_fetch_time
+            if _elapsed >= self._DOPPLER_RADAR_REFRESH_MS / 1000:
+                cw = self._doppler_canvas.winfo_width()
+                ch = self._doppler_canvas.winfo_height()
+                if cw > 80 and ch > 80:
+                    self._doppler_fetching_radar = True
+                    threading.Thread(
+                        target=self._doppler_fetch_radar,
+                        args=(cw, ch), daemon=True).start()
+        self.after(self._DOPPLER_RADAR_REFRESH_MS,
+                   self._doppler_radar_auto_refresh)
+
+    # ── Doppler map embed toggle ──
+
+    def _doppler_toggle_embed(self):
+        if not _HAS_MAP_EMBED:
+            return
+        if getattr(self, "_doppler_embed_active", False):
+            self._doppler_detach_map()
+        else:
+            self._doppler_embed_map()
+
+    def _doppler_embed_map(self):
+        if not _HAS_MAP_EMBED:
+            return
+        self._doppler_map_embedder.activate()
+        self._doppler_embed_active = True
+        try:
+            self._doppler_embed_btn._text = "DETACH MAP"
+            self._doppler_embed_btn._draw(self._doppler_embed_btn._bg)
+        except Exception:
+            pass
+        self._doppler_draw_map()
+        self._doppler_log_msg("Offline tile map enabled")
+
+    def _doppler_detach_map(self):
+        if not _HAS_MAP_EMBED:
+            return
+        self._doppler_map_embedder.deactivate()
+        self._doppler_embed_active = False
+        self._doppler_radar_tk = None
+        try:
+            self._doppler_embed_btn._text = "EMBED MAP"
+            self._doppler_embed_btn._draw(self._doppler_embed_btn._bg)
+        except Exception:
+            pass
+        self._doppler_draw_map()
+        self._doppler_log_msg("Tile map disabled")
+
+    # ── Doppler map zoom / pan ──
+
+    def _doppler_zoom_step(self, direction):
+        if direction > 0:
+            self._doppler_map_zoom = min(
+                self._doppler_map_zoom + 0.5, 4.0)
+        else:
+            self._doppler_map_zoom = max(
+                self._doppler_map_zoom - 0.5, -12.0)
+        self._doppler_draw_map()
+
+    def _doppler_zoom_event(self, event):
+        if (event.num == 4
+                or (hasattr(event, "delta") and event.delta > 0)):
+            self._doppler_map_zoom = min(
+                self._doppler_map_zoom + 0.25, 4.0)
+        elif (event.num == 5
+              or (hasattr(event, "delta") and event.delta < 0)):
+            self._doppler_map_zoom = max(
+                self._doppler_map_zoom - 0.25, -12.0)
+        self._doppler_draw_map()
+
+    def _doppler_pan_start(self, event):
+        self._doppler_pan_drag = {
+            "active": True, "sx": event.x, "sy": event.y,
+            "ox": self._doppler_pan_offset[0],
+            "oy": self._doppler_pan_offset[1]}
+
+    def _doppler_pan_move(self, event):
+        pd = self._doppler_pan_drag
+        if pd.get("active"):
+            self._doppler_pan_offset[0] = (
+                pd["ox"] + (event.x - pd["sx"]))
+            self._doppler_pan_offset[1] = (
+                pd["oy"] + (event.y - pd["sy"]))
+            self._doppler_draw_map()
+
+    def _doppler_pan_end(self, event):
+        self._doppler_pan_drag["active"] = False
+
+    def _doppler_center_home(self):
+        self._doppler_pan_offset = [0.0, 0.0]
+        self._doppler_map_zoom = 0.0
+        self._doppler_draw_map()
+        self._doppler_log_msg("Centered on assigned GPS")
+
+    def _on_tile_fallback(self, old_mode, new_mode):
+        """Auto-fallback triggered by TileMapRenderer after repeated failures."""
+        for attr, btn_attr, log_fn in [
+            ("_doppler_tile_mode", "_doppler_tile_btn", getattr(self, "_doppler_log_msg", None)),
+            ("_geof_tile_mode", "_geof_tile_btn", None),
+            ("_ham_tile_mode", "_ham_tile_btn", None),
+        ]:
+            if hasattr(self, attr) and getattr(self, attr) == old_mode:
+                setattr(self, attr, new_mode)
+                btn = getattr(self, btn_attr, None)
+                if btn:
+                    try:
+                        btn._text = "SATELLITE" if new_mode == "street" else "STREET"
+                        btn._draw(btn._bg)
+                    except Exception:
+                        pass
+        if hasattr(self, "_doppler_log_msg"):
+            try:
+                self._doppler_log_msg(
+                    f"Satellite tiles failed — fell back to street view")
+            except Exception:
+                pass
+
+    def _doppler_toggle_tile_mode(self):
+        if not _HAS_MAP_EMBED:
+            return
+        if self._doppler_tile_mode == "street":
+            self._doppler_tile_mode = "satellite"
+            self._doppler_map_embedder.set_tile_mode("satellite")
+            try:
+                self._doppler_tile_btn._text = "STREET"
+                self._doppler_tile_btn._draw(self._doppler_tile_btn._bg)
+            except Exception:
+                pass
+            self._doppler_log_msg("Switched to satellite view")
+        else:
+            self._doppler_tile_mode = "street"
+            self._doppler_map_embedder.set_tile_mode("street")
+            try:
+                self._doppler_tile_btn._text = "SATELLITE"
+                self._doppler_tile_btn._draw(self._doppler_tile_btn._bg)
+            except Exception:
+                pass
+            self._doppler_log_msg("Switched to street view")
+
+    # ── NWR Audio Controls ──
+
+    def _doppler_nwr_source_changed(self, event=None):
+        src = self._doppler_nwr_source.get()
+        if src == "rtl-sdr":
+            self._doppler_nwr_addr_lbl.config(text="Freq:")
+            self._doppler_nwr_addr_var.set(self._DOPPLER_NWR_DEFAULT_FREQ)
+        else:
+            self._doppler_nwr_addr_lbl.config(text="URL:")
+            self._doppler_nwr_addr_var.set(self._DOPPLER_NWR_DEFAULT_URL)
+
+    def _doppler_nwr_play(self):
+        self._doppler_nwr_stop()
+        src = self._doppler_nwr_source.get()
+        addr = self._doppler_nwr_addr_var.get().strip()
+        if not addr:
+            self._doppler_log_msg("NWR: no address specified")
+            return
+        try:
+            if src == "rtl-sdr":
+                self._doppler_nwr_proc = subprocess.Popen(
+                    f"rtl_fm -f {addr} -M fm -s 22050 - | "
+                    "ffplay -f s16le -ar 22050 -ac 1 "
+                    "-nodisp -loglevel warning -",
+                    shell=True, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True)
+                self._doppler_log_msg(
+                    f"NWR: RTL-SDR tuned to {addr}")
             else:
-                tag = "OK"
-                col["status"] = "OK"
-            seen_str = datetime.fromtimestamp(last).strftime(
-                "%H:%M:%S") if last else "never"
+                self._doppler_nwr_proc = subprocess.Popen(
+                    ["ffplay", "-nodisp", "-loglevel", "warning",
+                     "-autoexit", addr],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True)
+                self._doppler_log_msg(
+                    f"NWR: streaming {addr}")
+            self._doppler_nwr_status.config(
+                text="\u25cf Online", fg=TH["btn"])
+            threading.Thread(
+                target=self._doppler_nwr_monitor, daemon=True).start()
+        except FileNotFoundError as exc:
+            self._doppler_log_msg(f"NWR: {exc}")
+            self._doppler_nwr_status.config(
+                text="\u25cf Error", fg=TH["red"])
+        except Exception as exc:
+            self._doppler_log_msg(f"NWR: {exc}")
+
+    def _doppler_nwr_monitor(self):
+        proc = self._doppler_nwr_proc
+        if not proc:
+            return
+        rc = proc.wait()
+        stderr_out = ""
+        try:
+            stderr_out = proc.stderr.read().decode("utf-8", errors="replace")
+            stderr_out = stderr_out.strip()[-200:]
+        except Exception:
+            pass
+        if rc != 0 and proc is self._doppler_nwr_proc:
+            msg = f"NWR: ffplay exited ({rc})"
+            if stderr_out:
+                msg += f" - {stderr_out}"
+            self.after(0, lambda: self._doppler_log_msg(msg))
+            self.after(0, lambda: self._doppler_nwr_status.config(
+                text="\u25cf Error", fg=TH["red"]))
+
+    def _doppler_nwr_stop(self):
+        proc = self._doppler_nwr_proc
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._doppler_nwr_proc = None
+        self._doppler_nwr_status.config(
+            text="\u25cf Offline", fg=TH["red"])
+        self._doppler_log_msg("NWR: audio stopped")
+
+    # ==================== NAMED LOCATIONS (shared with Whim.V) ====================
+    LOCATIONS_FILE = os.path.expanduser("~/.openclaw/whimv_locations.json")
+    DEFAULT_LOCATIONS = [
+        {"id": "parents_house", "name": "Parents' House",
+         "lat": 39.6335, "lon": -92.0033, "address": "",
+         "fence_type": "rectangle", "acres": 1, "direction": "ns"},
+        {"id": "lake_house", "name": "Parents' Lake House",
+         "lat": 39.6965089, "lon": -92.015889, "address": "Lake of the Ozarks, MO",
+         "fence_type": "rectangle", "acres": 2, "direction": "ns"},
+        {"id": "jasons_house", "name": "Jason's House",
+         "lat": 39.325519892068, "lon": -92.41546784880909, "address": "",
+         "fence_type": "square", "acres": 5, "direction": "ns"},
+    ]
+
+    def _load_locations(self):
+        if os.path.isfile(self.LOCATIONS_FILE):
+            try:
+                with open(self.LOCATIONS_FILE, "r") as fh:
+                    return json.load(fh)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return list(self.DEFAULT_LOCATIONS)
+
+    def _save_locations(self, locs):
+        os.makedirs(os.path.dirname(self.LOCATIONS_FILE), exist_ok=True)
+        with open(self.LOCATIONS_FILE, "w") as fh:
+            json.dump(locs, fh, indent=2)
+
+    def _ensure_locations_file(self):
+        if not os.path.isfile(self.LOCATIONS_FILE):
+            self._save_locations(list(self.DEFAULT_LOCATIONS))
+
+    def _geocode_address(self, address, callback):
+        """Geocode address via Nominatim in a background thread. callback(lat, lon, display) or callback(None, None, error)."""
+        def _worker():
+            try:
+                import urllib.request, urllib.parse
+                q = urllib.parse.quote(address)
+                url = f"https://nominatim.openstreetmap.org/search?q={q}&format=json&limit=1"
+                req = urllib.request.Request(url, headers={"User-Agent": "WhimTerminal/3.4"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    results = json.loads(resp.read().decode())
+                if results:
+                    lat = float(results[0]["lat"])
+                    lon = float(results[0]["lon"])
+                    display = results[0].get("display_name", "")
+                    self.after(0, lambda: callback(lat, lon, display))
+                else:
+                    self.after(0, lambda: callback(None, None, "No results found"))
+            except Exception as e:
+                self.after(0, lambda: callback(None, None, str(e)))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _open_location_manager(self, on_change_callback=None):
+        """Open a Toplevel dialog for managing named locations."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Location Manager")
+        dlg.geometry("560x520")
+        dlg.configure(bg=TH["bg"])
+        dlg.transient(self)
+        dlg.grab_set()
+
+        self._loc_mgr_callback = on_change_callback
+
+        tk.Label(dlg, text="NAMED LOCATIONS", bg=TH["bg"], fg=TH["green"],
+                 font=(_FONTS["ui"], 14, "bold")).pack(anchor="w", padx=16, pady=(12, 6))
+
+        list_frame = tk.Frame(dlg, bg=TH["bg"])
+        list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+        cols = ("name", "lat", "lon", "fence", "acres")
+        tree = ttk.Treeview(list_frame, columns=cols, show="headings", height=8)
+        for col, hdr, w in [
+            ("name", "Name", 140), ("lat", "Latitude", 100), ("lon", "Longitude", 100),
+            ("fence", "Fence", 80), ("acres", "Acres", 60),
+        ]:
+            tree.heading(col, text=hdr)
+            tree.column(col, width=w, minwidth=40)
+        tree.pack(side="left", fill="both", expand=True)
+        sb = self._scrollbar(list_frame, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+
+        def refresh_tree():
+            for item in tree.get_children():
+                tree.delete(item)
+            for loc in self._load_locations():
+                tree.insert("", "end", iid=loc["id"], values=(
+                    loc["name"], f"{loc['lat']:.5f}", f"{loc['lon']:.5f}",
+                    loc.get("fence_type", "none"), loc.get("acres", 0)))
+
+        refresh_tree()
+
+        # ── Form section ──
+        form = tk.Frame(dlg, bg=TH["card"], highlightthickness=1,
+                        highlightbackground=TH["border"])
+        form.pack(fill="x", padx=16, pady=(0, 12))
+
+        tk.Label(form, text="ADD / EDIT", bg=TH["card"], fg=TH["btn"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(anchor="w", padx=12, pady=(8, 4))
+
+        row1 = tk.Frame(form, bg=TH["card"])
+        row1.pack(fill="x", padx=12, pady=2)
+        tk.Label(row1, text="Name:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        name_var = tk.StringVar()
+        tk.Entry(row1, textvariable=name_var, bg=TH["input"], fg=TH["fg"],
+                 insertbackground=TH["fg"], font=TH["font_mono"], relief="flat",
+                 width=20).pack(side="left", padx=(4, 8))
+        tk.Label(row1, text="Address:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        addr_var = tk.StringVar()
+        addr_entry = tk.Entry(row1, textvariable=addr_var, bg=TH["input"], fg=TH["fg"],
+                              insertbackground=TH["fg"], font=TH["font_mono"], relief="flat",
+                              width=24)
+        addr_entry.pack(side="left", padx=(4, 4))
+
+        geocode_status = tk.Label(form, text="", bg=TH["card"], fg=TH["fg_dim"],
+                                  font=TH["font_xs"])
+        geocode_status.pack(anchor="w", padx=12)
+
+        row2 = tk.Frame(form, bg=TH["card"])
+        row2.pack(fill="x", padx=12, pady=2)
+        tk.Label(row2, text="Lat:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        lat_var = tk.StringVar()
+        tk.Entry(row2, textvariable=lat_var, bg=TH["input"], fg=TH["fg"],
+                 insertbackground=TH["fg"], font=TH["font_mono"], relief="flat",
+                 width=14).pack(side="left", padx=(4, 8))
+        tk.Label(row2, text="Lon:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        lon_var = tk.StringVar()
+        tk.Entry(row2, textvariable=lon_var, bg=TH["input"], fg=TH["fg"],
+                 insertbackground=TH["fg"], font=TH["font_mono"], relief="flat",
+                 width=14).pack(side="left", padx=(4, 8))
+        tk.Label(row2, text="Fence:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        fence_var = tk.StringVar(value="rectangle")
+        ttk.Combobox(row2, textvariable=fence_var, values=["rectangle", "square", "none"],
+                     width=10, state="readonly").pack(side="left", padx=(4, 8))
+        tk.Label(row2, text="Acres:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        acres_var = tk.StringVar(value="2")
+        tk.Entry(row2, textvariable=acres_var, bg=TH["input"], fg=TH["fg"],
+                 insertbackground=TH["fg"], font=TH["font_mono"], relief="flat",
+                 width=6).pack(side="left", padx=(4, 0))
+
+        edit_id_var = tk.StringVar()
+
+        def on_tree_select(event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            loc_id = sel[0]
+            locs = self._load_locations()
+            loc = next((l for l in locs if l["id"] == loc_id), None)
+            if loc:
+                edit_id_var.set(loc["id"])
+                name_var.set(loc["name"])
+                addr_var.set(loc.get("address", ""))
+                lat_var.set(str(loc["lat"]))
+                lon_var.set(str(loc["lon"]))
+                fence_var.set(loc.get("fence_type", "rectangle"))
+                acres_var.set(str(loc.get("acres", 2)))
+
+        tree.bind("<<TreeviewSelect>>", on_tree_select)
+
+        def do_geocode():
+            addr = addr_var.get().strip()
+            if not addr:
+                return
+            geocode_status.config(text="Looking up...", fg=TH["fg_dim"])
+            def _cb(lat, lon, display):
+                if lat is not None:
+                    lat_var.set(str(lat))
+                    lon_var.set(str(lon))
+                    geocode_status.config(text=f"Found: {display[:60]}", fg=TH["green"])
+                else:
+                    geocode_status.config(text=f"Not found: {display}", fg=TH["red"])
+            self._geocode_address(addr, _cb)
+
+        def do_save():
+            name = name_var.get().strip()
+            try:
+                lat = float(lat_var.get())
+                lon = float(lon_var.get())
+            except ValueError:
+                geocode_status.config(text="Invalid coordinates", fg=TH["red"])
+                return
+            if not name:
+                geocode_status.config(text="Name required", fg=TH["red"])
+                return
+            locs = self._load_locations()
+            eid = edit_id_var.get()
+            existing = next((l for l in locs if l["id"] == eid), None) if eid else None
+            if existing:
+                existing.update({
+                    "name": name, "lat": lat, "lon": lon,
+                    "address": addr_var.get().strip(),
+                    "fence_type": fence_var.get(),
+                    "acres": float(acres_var.get() or 2),
+                })
+            else:
+                locs.append({
+                    "id": f"loc_{int(time.time())}",
+                    "name": name, "lat": lat, "lon": lon,
+                    "address": addr_var.get().strip(),
+                    "fence_type": fence_var.get(),
+                    "acres": float(acres_var.get() or 2),
+                    "direction": "ns",
+                })
+            self._save_locations(locs)
+            refresh_tree()
+            clear_form()
+            geocode_status.config(text="Saved", fg=TH["green"])
+            if self._loc_mgr_callback:
+                self._loc_mgr_callback()
+
+        def do_delete():
+            sel = tree.selection()
+            if not sel:
+                return
+            loc_id = sel[0]
+            locs = [l for l in self._load_locations() if l["id"] != loc_id]
+            self._save_locations(locs)
+            refresh_tree()
+            clear_form()
+            if self._loc_mgr_callback:
+                self._loc_mgr_callback()
+
+        def clear_form():
+            edit_id_var.set("")
+            name_var.set("")
+            addr_var.set("")
+            lat_var.set("")
+            lon_var.set("")
+            fence_var.set("rectangle")
+            acres_var.set("2")
+            geocode_status.config(text="")
+
+        btn_row = tk.Frame(form, bg=TH["card"])
+        btn_row.pack(fill="x", padx=12, pady=(6, 10))
+        RoundedButton(btn_row, text="LOOKUP ADDRESS",
+                      command=do_geocode).pack(side="left", padx=(0, 6))
+        RoundedButton(btn_row, text="SAVE",
+                      command=do_save).pack(side="left", padx=(0, 6))
+        RoundedButton(btn_row, text="DELETE",
+                      command=do_delete).pack(side="left", padx=(0, 6))
+        RoundedButton(btn_row, text="CLEAR",
+                      command=clear_form).pack(side="left")
+
+    def _draw_location_fences_on_canvas(self, canvas, to_px, locs=None):
+        """Draw named location fences on any canvas using a to_px(lat,lon)->(x,y) function."""
+        if locs is None:
+            locs = self._load_locations()
+        for loc in locs:
+            ft = loc.get("fence_type", "none")
+            if ft == "none":
+                continue
+            acres = loc.get("acres", 2)
+            sq_meters = acres * 4046.86
+            if ft == "square":
+                side = math.sqrt(sq_meters)
+                lat_d = (side / 2) / 111320
+                lon_d = (side / 2) / (111320 * math.cos(math.radians(loc["lat"])))
+            else:
+                ratio = 0.5 if loc.get("direction") == "ew" else 2.0
+                h = math.sqrt(sq_meters * ratio)
+                w = sq_meters / h
+                lat_d = (h / 2) / 111320
+                lon_d = (w / 2) / (111320 * math.cos(math.radians(loc["lat"])))
+            corners = [
+                (loc["lat"] - lat_d, loc["lon"] - lon_d),
+                (loc["lat"] - lat_d, loc["lon"] + lon_d),
+                (loc["lat"] + lat_d, loc["lon"] + lon_d),
+                (loc["lat"] + lat_d, loc["lon"] - lon_d),
+            ]
+            pts = []
+            for lt, ln in corners:
+                px = to_px(lt, ln)
+                if px:
+                    pts.extend(px)
+            if len(pts) >= 8:
+                canvas.create_polygon(pts, outline="#e8793a", fill="",
+                                      width=2, dash=(6, 4))
+            cx, cy = to_px(loc["lat"], loc["lon"])
+            if cx and cy:
+                canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4,
+                                   fill="#e8793a", outline="")
+                canvas.create_text(cx, cy - 12, text=loc["name"],
+                                   fill="#e8793a", font=(_FONTS["mono"], 8, "bold"))
+
+    def _populate_location_combo(self, combo):
+        """Populate a ttk.Combobox with named location entries."""
+        locs = self._load_locations()
+        values = [""] + [f"{l['name']} ({l['lat']:.4f}, {l['lon']:.4f})" for l in locs]
+        combo["values"] = values
+        combo.set("")
+
+    # ==================== GEOF TAB ====================
+    GEOF_FENCE_PATH = os.path.expanduser("~/.openclaw/fence_config.json")
+    GEOF_LORA_BRIDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "whim-terminal", "services", "lora_bridge.py")
+    GEOF_HEARTBEAT_INTERVAL = 20 * 60  # 20 minutes
+    GEOF_STALE_THRESHOLD = 25 * 60     # 25 minutes -> yellow
+    GEOF_OFFLINE_THRESHOLD = 45 * 60   # 45 minutes -> red
+
+    def build_geof(self):
+        f = self.tabs["geof"]
+        self._geof_bridge_proc = None
+        self._geof_collars = {}
+        self._geof_alerts = []
+        self._geof_poll_active = False
+        self._geof_selected_collar = None
+        self._geof_selected_vertex = None
+        self._geof_map_zoom = 0.0
+        self._geof_pan_offset = [0.0, 0.0]
+        self._geof_pan_drag = {"active": False, "sx": 0, "sy": 0, "ox": 0.0, "oy": 0.0}
+
+        fence_data = self._geof_load_fence()
+        self._geof_vertices = fence_data.get("vertices", [])
+
+        # Initialize a 5-acre rectangle around device GPS if no real boundary exists
+        if len(self._geof_vertices) < 4:
+            ref_lat, ref_lon = self._get_device_gps_reference()
+            # 5 acres = 20,234 m^2, ~142m side square
+            half_lat = 0.000641  # ~71m in latitude
+            half_lon = 0.000832  # ~71m in longitude at ~39.6N
+            self._geof_vertices = [
+                [ref_lat + half_lat, ref_lon - half_lon, "NW"],
+                [ref_lat + half_lat, ref_lon + half_lon, "NE"],
+                [ref_lat - half_lat, ref_lon + half_lon, "SE"],
+                [ref_lat - half_lat, ref_lon - half_lon, "SW"],
+            ]
+            self._geof_save_fence()
+
+        for c in fence_data.get("collars", []):
+            self._geof_collars[c["id"]] = {
+                "name": c.get("name", c["id"]),
+                "lat": c.get("lat", 0),
+                "lon": c.get("lon", 0),
+                "battery": c.get("battery", 0),
+                "status": c.get("status", "Unknown"),
+                "last_seen": c.get("last_seen", 0),
+                "emoji": c.get("emoji", ""),
+            }
+
+        self._geof_animal_emojis = [
+            "\U0001F404", "\U0001F402", "\U0001F403",  # cow, ox, water buffalo
+            "\U0001F408", "\U0001F431",                 # cat, cat face
+            "\U0001F415", "\U0001F436",                 # dog, dog face
+            "\U0001F40E", "\U0001F434",                 # horse, horse face
+            "\U0001F410", "\U0001F411",                 # goat, ewe
+            "\U0001F416", "\U0001F437",                 # pig, pig face
+            "\U0001F413", "\U0001F414",                 # rooster, chicken
+            "\U0001F407", "\U0001F430",                 # rabbit, rabbit face
+            "\U0001F985", "\U0001F986",                 # eagle, duck
+            "\U0001F9AC",                                # bison
+        ]
+
+        wrap = tk.Frame(f, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=16, pady=12)
+
+        hdr = tk.Frame(wrap, bg=TH["bg"])
+        hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(hdr, text="GEOF \u2014 GEOFENCE MONITOR", bg=TH["bg"], fg=TH["green"],
+                 font=(_FONTS["ui"], 16, "bold")).pack(side="left")
+        self._geof_bridge_status = tk.Label(hdr, text="\u25cf Offline", bg=TH["bg"],
+                                             fg=TH["red"], font=(_FONTS["ui"], 10, "bold"))
+        self._geof_bridge_status.pack(side="right")
+
+        tk.Label(wrap, text="LoRa collar tracking \u2022 20-min heartbeat \u2022 Point-in-polygon geofence",
+                 bg=TH["bg"], fg=TH["fg2"], font=TH["font_sm"]).pack(anchor="w", pady=(0, 12))
+
+        cols = tk.Frame(wrap, bg=TH["bg"])
+        cols.pack(fill="both", expand=True)
+        cols.columnconfigure(0, weight=2)
+        cols.columnconfigure(1, weight=3)
+        cols.rowconfigure(0, weight=1)
+
+        # ── Left column: Sub-tabbed controls ──
+        left = tk.Frame(cols, bg=TH["bg"])
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        geof_nb = ttk.Notebook(left)
+        geof_nb.pack(fill="both", expand=True)
+
+        bridge_tab = tk.Frame(geof_nb, bg=TH["bg"])
+        collars_tab = tk.Frame(geof_nb, bg=TH["bg"])
+        editor_tab = tk.Frame(geof_nb, bg=TH["bg"])
+        points_tab = tk.Frame(geof_nb, bg=TH["bg"])
+
+        geof_nb.add(bridge_tab, text="  BRIDGE  ")
+        geof_nb.add(editor_tab, text="  EDITOR  ")
+
+        # Bridge controls
+        ctrl_card = tk.Frame(bridge_tab, bg=TH["card"], highlightthickness=1,
+                              highlightbackground=TH["border"])
+        ctrl_card.pack(fill="both", expand=True, pady=(0, 6))
+        tk.Label(ctrl_card, text="LORA BRIDGE", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        tk.Frame(ctrl_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 6))
+
+        mode_frame = tk.Frame(ctrl_card, bg=TH["card"])
+        mode_frame.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(mode_frame, text="Mode:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._geof_mode_var = tk.StringVar(value="simulate")
+        for m in ["simulate", "serial", "tcp"]:
+            tk.Radiobutton(mode_frame, text=m.upper(), variable=self._geof_mode_var,
+                           value=m, bg=TH["card"], fg=TH["fg"],
+                           selectcolor=TH["input"], activebackground=TH["card"],
+                           activeforeground=TH["fg"], font=TH["font_sm"]
+                           ).pack(side="left", padx=4)
+
+        serial_frame = tk.Frame(ctrl_card, bg=TH["card"])
+        serial_frame.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(serial_frame, text="Serial Port:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._geof_serial_var = tk.StringVar(value="/dev/ttyUSB0")
+        tk.Entry(serial_frame, textvariable=self._geof_serial_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=16).pack(side="left", padx=(4, 8))
+        tk.Label(serial_frame, text="TCP:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._geof_tcp_var = tk.StringVar(value="0.0.0.0:9600")
+        tk.Entry(serial_frame, textvariable=self._geof_tcp_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=16).pack(side="left", padx=(4, 0))
+
+        sf_frame = tk.Frame(ctrl_card, bg=TH["card"])
+        sf_frame.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(sf_frame, text="Spreading Factor:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._geof_sf_var = tk.IntVar(value=12)
+        tk.Spinbox(sf_frame, from_=7, to=12, textvariable=self._geof_sf_var,
+                   bg=TH["input"], fg=TH["fg"], font=TH["font_mono"],
+                   width=4, buttonbackground=TH["card"]).pack(side="left", padx=(4, 8))
+        tk.Label(sf_frame, text="(SF12 = best range for hilly terrain)",
+                 bg=TH["card"], fg=TH["fg_dim"], font=TH["font_xs"]).pack(side="left")
+
+        btn_frame = tk.Frame(ctrl_card, bg=TH["card"])
+        btn_frame.pack(fill="x", padx=12, pady=(0, 10))
+        RoundedButton(btn_frame, text="START BRIDGE",
+                      command=self._geof_start_bridge).pack(side="left", padx=(0, 6))
+        RoundedButton(btn_frame, text="STOP BRIDGE",
+                      command=self._geof_stop_bridge).pack(side="left", padx=(0, 6))
+        RoundedButton(btn_frame, text="SYNC PINS",
+                      command=self._geof_reload_fence).pack(side="left")
+
+        # Collar status table (below notebook)
+        collar_card = tk.Frame(left, bg=TH["card"], highlightthickness=1,
+                                highlightbackground=TH["border"])
+        collar_card.pack(fill="x", pady=(6, 6))
+        tk.Label(collar_card, text="COLLAR STATUS", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        tk.Frame(collar_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 4))
+
+        tree_frame = tk.Frame(collar_card, bg=TH["card"])
+        tree_frame.pack(fill="x", padx=8, pady=(0, 8))
+
+        tree_cols = ("id", "name", "emoji", "lat", "lon", "dist_home", "battery", "status", "last_seen")
+        self._geof_tree = ttk.Treeview(tree_frame, columns=tree_cols, show="headings",
+                                        height=3)
+        for col, hdr_text, w in [
+            ("id", "ID", 60), ("name", "Name", 80), ("emoji", "Icon", 40),
+            ("lat", "Lat", 80), ("lon", "Lon", 80), ("dist_home", "Dist Home", 70),
+            ("battery", "Batt %", 50), ("status", "Status", 80), ("last_seen", "Last Seen", 110),
+        ]:
+            self._geof_tree.heading(col, text=hdr_text)
+            self._geof_tree.column(col, width=w, minwidth=40)
+        self._geof_tree.pack(side="left", fill="both", expand=True)
+        sb = self._scrollbar(tree_frame, command=self._geof_tree.yview)
+        self._geof_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+
+        self._geof_tree.bind("<Button-3>", self._geof_collar_context_menu)
+        self._geof_tree.bind("<<TreeviewSelect>>", self._geof_on_collar_select)
+
+        self._geof_refresh_tree()
+
+        # GPS Coordinate Editor panel
+        gps_card = tk.Frame(editor_tab, bg=TH["card"], highlightthickness=1,
+                             highlightbackground=TH["border"])
+        gps_card.pack(fill="both", expand=True, pady=(0, 6))
+
+        gps_hdr = tk.Frame(gps_card, bg=TH["card"])
+        gps_hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(gps_hdr, text="GPS COORDINATE EDITOR", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(side="left")
+        RoundedButton(gps_hdr, text="ADD TEST COLLAR",
+                      command=self._geof_add_test_collar).pack(side="right")
+        tk.Frame(gps_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 6))
+
+        self._geof_edit_info = tk.Label(gps_card, text="Select a collar or enter an ID below",
+                                         bg=TH["card"], fg=TH["fg_dim"], font=TH["font_sm"])
+        self._geof_edit_info.pack(anchor="w", padx=12, pady=(0, 4))
+
+        id_row = tk.Frame(gps_card, bg=TH["card"])
+        id_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(id_row, text="Collar ID:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._geof_edit_id_var = tk.StringVar()
+        tk.Entry(id_row, textvariable=self._geof_edit_id_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=14).pack(side="left", padx=(6, 0))
+
+        coord_row = tk.Frame(gps_card, bg=TH["card"])
+        coord_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(coord_row, text="Lat:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._geof_edit_lat_var = tk.StringVar()
+        tk.Entry(coord_row, textvariable=self._geof_edit_lat_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=14).pack(side="left", padx=(6, 8))
+        tk.Label(coord_row, text="Lon:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._geof_edit_lon_var = tk.StringVar()
+        tk.Entry(coord_row, textvariable=self._geof_edit_lon_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=14).pack(side="left", padx=(6, 0))
+
+        gps_btn_row = tk.Frame(gps_card, bg=TH["card"])
+        gps_btn_row.pack(fill="x", padx=12, pady=(4, 10))
+        RoundedButton(gps_btn_row, text="APPLY GPS",
+                      command=self._geof_apply_manual_gps).pack(side="left", padx=(0, 6))
+        RoundedButton(gps_btn_row, text="VERIFY FENCE",
+                      command=self._geof_verify_fence_check).pack(side="left", padx=(0, 6))
+        RoundedButton(gps_btn_row, text="CLEAR",
+                      command=self._geof_clear_editor).pack(side="left")
+
+        # Boundary Points editor (below collars)
+        bp_card = tk.Frame(left, bg=TH["card"], highlightthickness=1,
+                            highlightbackground=TH["border"])
+        bp_card.pack(fill="both", expand=True)
+
+        bp_hdr = tk.Frame(bp_card, bg=TH["card"])
+        bp_hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(bp_hdr, text="BOUNDARY POINTS", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(side="left")
+        RoundedButton(bp_hdr, text="ADD POINT",
+                      command=self._geof_add_vertex).pack(side="right", padx=(4, 0))
+        RoundedButton(bp_hdr, text="DELETE POINT",
+                      command=self._geof_delete_vertex).pack(side="right")
+        tk.Frame(bp_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 4))
+
+        bp_tree_frame = tk.Frame(bp_card, bg=TH["card"])
+        bp_tree_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        bp_cols = ("point", "lat", "lon", "label")
+        self._geof_bp_tree = ttk.Treeview(bp_tree_frame, columns=bp_cols,
+                                           show="headings", height=5)
+        for col, hdr_text, w in [
+            ("point", "Point", 50), ("lat", "Latitude", 100),
+            ("lon", "Longitude", 100), ("label", "Label", 90),
+        ]:
+            self._geof_bp_tree.heading(col, text=hdr_text)
+            self._geof_bp_tree.column(col, width=w, minwidth=40)
+        self._geof_bp_tree.pack(side="left", fill="both", expand=True)
+        bp_sb = self._scrollbar(bp_tree_frame, command=self._geof_bp_tree.yview)
+        self._geof_bp_tree.configure(yscrollcommand=bp_sb.set)
+        bp_sb.pack(side="right", fill="y")
+
+        self._geof_bp_tree.bind("<<TreeviewSelect>>", self._geof_on_vertex_select)
+        self._geof_bp_tree.bind("<Button-3>", self._geof_vertex_context_menu)
+        self._geof_bp_tree.bind("<Double-1>", self._geof_bp_inline_edit)
+
+        self._geof_refresh_bp_tree()
+
+        # ── Right column: Map Canvas + Alert Log ──
+        right = tk.Frame(cols, bg=TH["bg"])
+        right.grid(row=0, column=1, sticky="nsew")
+
+        map_card = tk.Frame(right, bg=TH["card"], highlightthickness=1,
+                             highlightbackground=TH["border"])
+        map_card.pack(fill="both", expand=True, pady=(0, 6))
+        map_hdr = tk.Frame(map_card, bg=TH["card"])
+        map_hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(map_hdr, text="GEOFENCE MAP", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(side="left")
+        self._geof_map_info = tk.Label(map_hdr, text="", bg=TH["card"],
+                                        fg=TH["fg2"], font=TH["font_xs"])
+        self._geof_map_info.pack(side="right")
+
+        RoundedButton(map_hdr, text=" + ",
+                      command=lambda: self._geof_zoom_step(1)).pack(side="right", padx=(4, 0))
+        RoundedButton(map_hdr, text=" \u2013 ",
+                      command=lambda: self._geof_zoom_step(-1)).pack(side="right", padx=(4, 0))
+        RoundedButton(map_hdr, text="CENTER GPS",
+                      command=self._geof_center_gps).pack(side="right", padx=(4, 0))
+
+        if _HAS_MAP_EMBED:
+            self._geof_map_embedder = TileMapRenderer()
+            self._geof_map_embedder.set_redraw_callback(self._geof_draw_map)
+            self._geof_map_embedder.set_fallback_callback(
+                self._on_tile_fallback)
+            self._geof_embed_active = False
+            self._geof_tile_mode = "street"
+            self._geof_tile_btn = RoundedButton(
+                map_hdr, text="SATELLITE",
+                command=self._geof_toggle_tile_mode)
+            self._geof_tile_btn.pack(side="right", padx=(4, 0))
+            self._geof_embed_btn = RoundedButton(
+                map_hdr, text="EMBED MAP",
+                command=self._geof_toggle_embed)
+            self._geof_embed_btn.pack(side="right", padx=(6, 0))
+
+        tk.Frame(map_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 4))
+
+        loc_row = tk.Frame(map_card, bg=TH["card"])
+        loc_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(loc_row, text="Location:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._geof_loc_combo = ttk.Combobox(loc_row, state="readonly", width=30)
+        self._geof_loc_combo.pack(side="left", padx=(4, 8))
+        self._geof_loc_combo.bind("<<ComboboxSelected>>", self._geof_go_to_location)
+        self._populate_location_combo(self._geof_loc_combo)
+        RoundedButton(loc_row, text="MANAGE LOCATIONS",
+                      command=lambda: self._open_location_manager(
+                          on_change_callback=self._geof_on_locations_changed)
+                      ).pack(side="left", padx=(0, 4))
+
+        self._geof_map_container = tk.Frame(map_card, bg=TH["input"])
+        self._geof_map_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        self._geof_canvas = tk.Canvas(self._geof_map_container, bg=TH["input"],
+                                       highlightthickness=0)
+        self._geof_canvas.pack(fill="both", expand=True)
+        self._geof_canvas.bind("<Configure>", lambda e: self._geof_draw_map())
+        self._geof_canvas.bind("<Button-1>", self._geof_map_click)
+        self._geof_canvas.bind("<ButtonPress-3>", self._geof_pan_start)
+        self._geof_canvas.bind("<B3-Motion>", self._geof_pan_move)
+        self._geof_canvas.bind("<ButtonRelease-3>", self._geof_pan_end)
+        self._geof_canvas.bind("<MouseWheel>", self._geof_zoom_event)
+        self._geof_canvas.bind("<Button-4>", self._geof_zoom_event)
+        self._geof_canvas.bind("<Button-5>", self._geof_zoom_event)
+
+        # Alert log
+        alert_card = tk.Frame(right, bg=TH["card"], highlightthickness=1,
+                               highlightbackground=TH["border"])
+        alert_card.pack(fill="x")
+        alert_hdr = tk.Frame(alert_card, bg=TH["card"])
+        alert_hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(alert_hdr, text="ALERT LOG", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(side="left")
+        RoundedButton(alert_hdr, text="CLEAR",
+                      command=self._geof_clear_alerts).pack(side="right")
+        tk.Frame(alert_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 4))
+
+        alert_wrap = tk.Frame(alert_card, bg=TH["card"])
+        alert_wrap.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self._geof_alert_box = self._text_widget(alert_wrap, font=(_FONTS["mono"], 9),
+                                                  state="disabled", wrap="word", height=6)
+        asb = self._scrollbar(alert_wrap, command=self._geof_alert_box.yview)
+        self._geof_alert_box.configure(yscrollcommand=asb.set)
+        self._geof_alert_box.pack(side="left", fill="both", expand=True)
+        asb.pack(side="right", fill="y")
+
+        self._geof_alert_box.tag_configure("alert", foreground=TH["red"],
+                                            font=(_FONTS["mono"], 9, "bold"))
+        self._geof_alert_box.tag_configure("ok", foreground=TH["green"])
+        self._geof_alert_box.tag_configure("stale", foreground=TH["yellow"])
+        self._geof_alert_box.tag_configure("ts", foreground=TH["fg_dim"])
+        self._geof_alert_box.tag_configure("info", foreground=TH["fg2"])
+
+        # Auto-embed map on load
+        if _HAS_MAP_EMBED:
+            self.after(200, self._geof_embed_map)
+
+    # ── GeoF helpers ──
+
+    def _geof_load_fence(self):
+        if not os.path.isfile(self.GEOF_FENCE_PATH):
+            return {"vertices": [], "collars": []}
+        try:
+            with open(self.GEOF_FENCE_PATH, "r") as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, IOError):
+            return {"vertices": [], "collars": []}
+
+    def _geof_save_fence(self):
+        data = {
+            "vertices": self._geof_vertices,
+            "collars": [
+                {"id": cid, "name": c["name"], "lat": c["lat"], "lon": c["lon"],
+                 "battery": c["battery"], "status": c["status"],
+                 "last_seen": c["last_seen"], "emoji": c.get("emoji", "")}
+                for cid, c in self._geof_collars.items()
+            ],
+        }
+        os.makedirs(os.path.dirname(self.GEOF_FENCE_PATH), exist_ok=True)
+        with open(self.GEOF_FENCE_PATH, "w") as fh:
+            json.dump(data, fh, indent=2)
+
+    def _geof_reload_fence(self):
+        fence_data = self._geof_load_fence()
+        self._geof_vertices = fence_data.get("vertices", [])
+        for c in fence_data.get("collars", []):
+            if c["id"] not in self._geof_collars:
+                self._geof_collars[c["id"]] = {
+                    "name": c.get("name", c["id"]),
+                    "lat": c.get("lat", 0), "lon": c.get("lon", 0),
+                    "battery": c.get("battery", 0),
+                    "status": c.get("status", "Unknown"),
+                    "last_seen": c.get("last_seen", 0),
+                    "emoji": c.get("emoji", ""),
+                }
+            else:
+                self._geof_collars[c["id"]]["emoji"] = c.get("emoji",
+                    self._geof_collars[c["id"]].get("emoji", ""))
+        self._geof_refresh_tree()
+        self._geof_refresh_bp_tree()
+        self._geof_draw_map()
+        self._geof_log_alert("Fence config reloaded from disk", tag="info")
+
+    def _geof_refresh_tree(self):
+        for item in self._geof_tree.get_children():
+            self._geof_tree.delete(item)
+        now = time.time()
+        ref_lat, ref_lon = self._get_device_gps_reference()
+        self._geof_tree.tag_configure("dist_close", foreground=TH["green"])
+        self._geof_tree.tag_configure("dist_mid", foreground="#e8793a")
+        self._geof_tree.tag_configure("dist_far", foreground="#c4382a")
+        for cid, c in sorted(self._geof_collars.items()):
+            ls = c["last_seen"]
+            if ls == 0:
+                seen_text = "Never"
+            else:
+                age = now - ls
+                if age < 60:
+                    seen_text = f"{int(age)}s ago"
+                elif age < 3600:
+                    seen_text = f"{int(age / 60)}m ago"
+                else:
+                    seen_text = datetime.fromtimestamp(ls).strftime("%H:%M:%S")
+            dist_ft = 0.0
+            dist_text = "--"
+            dist_tag = "dist_close"
+            if c["lat"] != 0 or c["lon"] != 0:
+                dist_mi = self._haversine_miles(ref_lat, ref_lon, c["lat"], c["lon"])
+                dist_ft = dist_mi * 5280
+                if dist_ft < 1000:
+                    dist_text = f"{dist_ft:.0f}ft"
+                else:
+                    dist_text = f"{dist_mi:.2f}mi"
+                if dist_ft > 2640:  # > 0.5 mile
+                    dist_tag = "dist_far"
+                elif dist_ft > 500:
+                    dist_tag = "dist_mid"
             self._geof_tree.insert("", "end", iid=cid, values=(
-                cid, col.get("name", ""), col.get("status", ""),
-                f'{col.get("battery", 0)}%',
-                f'{col.get("lat", 0):.5f}', f'{col.get("lon", 0):.5f}',
-                seen_str), tags=(tag,))
+                cid, c["name"], c.get("emoji", ""), f"{c['lat']:.4f}",
+                f"{c['lon']:.4f}", dist_text, f"{c['battery']}%", c["status"],
+                seen_text), tags=(dist_tag,))
+
+    def _geof_draw_map(self):
+        c = self._geof_canvas
+        c.delete("all")
+        cw = c.winfo_width()
+        ch = c.winfo_height()
+        if cw < 80 or ch < 80:
+            return
+
+        pad = 40
+        all_pts = list(self._geof_vertices)
+        for col in self._geof_collars.values():
+            all_pts.append([col["lat"], col["lon"]])
+
+        if not all_pts:
+            c.create_text(cw // 2, ch // 2, text="No fence or collar data",
+                          fill=TH["fg_dim"], font=(_FONTS["ui"], 12))
+            return
+
+        lats = [p[0] for p in all_pts]
+        lons = [p[1] for p in all_pts]
+
+        if _HAS_MAP_EMBED and self._geof_embed_active:
+            to_px = self._geof_map_embedder.draw_tiles(
+                c, lats, lons, cw, ch,
+                zoom_offset=self._geof_map_zoom,
+                pan_offset=self._geof_pan_offset)
+        else:
+            to_px = None
+
+        if to_px is None:
+            min_lat, max_lat = min(lats), max(lats)
+            min_lon, max_lon = min(lons), max(lons)
+            dlat = max_lat - min_lat or 0.001
+            dlon = max_lon - min_lon or 0.001
+            scale = min((cw - 2 * pad) / dlon, (ch - 2 * pad) / dlat)
+            zoom_mult = 2.0 ** self._geof_map_zoom
+            scale *= zoom_mult
+            ox, oy = self._geof_pan_offset
+            def to_px(lat, lon):
+                x = pad + (lon - min_lon) * scale + ox
+                y = pad + (max_lat - lat) * scale + oy
+                return x, y
+
+        self._geof_to_px = to_px
+
+        sel_collar = self._geof_selected_collar
+        sel_vertex = self._geof_selected_vertex
+        highlight_color = "#e8793a"
+
+        # Draw fence polygon
+        if len(self._geof_vertices) >= 3:
+            poly_pts = []
+            for v in self._geof_vertices:
+                poly_pts.extend(to_px(v[0], v[1]))
+            c.create_polygon(poly_pts, outline=TH["green"], fill="",
+                             width=2, dash=(6, 3))
+            first = to_px(self._geof_vertices[0][0], self._geof_vertices[0][1])
+            last = to_px(self._geof_vertices[-1][0], self._geof_vertices[-1][1])
+            c.create_line(last[0], last[1], first[0], first[1],
+                          fill=TH["green"], width=2, dash=(6, 3))
+
+        # Vertex markers with selection highlight
+        for i, v in enumerate(self._geof_vertices):
+            vx, vy = to_px(v[0], v[1])
+            is_selected = (sel_vertex is not None and sel_vertex == i)
+            if is_selected:
+                c.create_oval(vx - 12, vy - 12, vx + 12, vy + 12,
+                              outline=highlight_color, width=3)
+                c.create_oval(vx - 6, vy - 6, vx + 6, vy + 6,
+                              fill=highlight_color, outline="")
+                c.create_text(vx, vy - 16, text=f"P{i+1}",
+                              fill=highlight_color, font=(_FONTS["mono"], 9, "bold"))
+            else:
+                c.create_oval(vx - 4, vy - 4, vx + 4, vy + 4,
+                              fill=TH["green"], outline="")
+                c.create_text(vx, vy - 10, text=f"P{i+1}",
+                              fill=TH["green"], font=(_FONTS["mono"], 7))
+
+        # Draw collar positions with selection highlight
+        status_colors = {"OK": TH["green"], "Stale": TH["yellow"],
+                         "Offline": TH["red"], "OUTSIDE": TH["red"],
+                         "Unknown": TH["fg_dim"]}
+        now = time.time()
+        self._geof_map_info.config(text=f"{len(self._geof_collars)} collars \u2022 "
+                                         f"{len(self._geof_vertices)} vertices")
+        for cid, col in self._geof_collars.items():
+            cx, cy = to_px(col["lat"], col["lon"])
+            st = col["status"]
+            if col["last_seen"] > 0:
+                age = now - col["last_seen"]
+                if age > self.GEOF_OFFLINE_THRESHOLD:
+                    st = "Offline"
+                elif age > self.GEOF_STALE_THRESHOLD:
+                    st = "Stale"
+            color = status_colors.get(st, TH["fg_dim"])
+            is_selected = (sel_collar is not None and sel_collar == cid)
+
+            emoji = col.get("emoji", "")
+            r = 8
+
+            # Selection glow ring (drawn first, behind the icon)
+            if is_selected:
+                glow_r = 20 if emoji else 14
+                c.create_oval(cx - glow_r, cy - glow_r, cx + glow_r, cy + glow_r,
+                              outline=highlight_color, width=3)
+
+            if emoji:
+                c.create_text(cx, cy, text=emoji, font=(_FONTS["ui"], 18))
+                c.create_text(cx, cy - 18, text=col["name"],
+                              fill=highlight_color if is_selected else TH["fg"],
+                              font=(_FONTS["ui"], 8, "bold"))
+                c.create_text(cx, cy + 18, text=f"{col['battery']}%",
+                              fill=TH["fg2"], font=(_FONTS["mono"], 7))
+            else:
+                c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                              fill=color, outline=highlight_color if is_selected else TH["fg"],
+                              width=2 if is_selected else 1)
+                c.create_text(cx, cy - r - 8, text=col["name"],
+                              fill=highlight_color if is_selected else TH["fg"],
+                              font=(_FONTS["ui"], 8, "bold"))
+                c.create_text(cx, cy + r + 8, text=f"{col['battery']}%",
+                              fill=TH["fg2"], font=(_FONTS["mono"], 7))
+
+            if not is_selected and emoji and st in ("Stale", "Offline", "OUTSIDE"):
+                c.create_oval(cx - 14, cy - 14, cx + 14, cy + 14,
+                              outline=color, width=2)
+
+        # Named location fences
+        self._draw_location_fences_on_canvas(c, to_px)
+
+        # Legend
+        lx, ly = 10, ch - 30
+        for lbl, clr in [("OK", TH["green"]), ("Stale", TH["yellow"]),
+                          ("Offline/Outside", TH["red"]), ("Selected", highlight_color)]:
+            c.create_oval(lx, ly, lx + 8, ly + 8, fill=clr, outline="")
+            c.create_text(lx + 14, ly + 4, text=lbl, anchor="w",
+                          fill=TH["fg2"], font=(_FONTS["mono"], 7))
+            lx += 100
+
+    def _geof_go_to_location(self, event=None):
+        val = self._geof_loc_combo.get()
+        if not val:
+            return
+        locs = self._load_locations()
+        for loc in locs:
+            tag = f"{loc['name']} ({loc['lat']:.4f}, {loc['lon']:.4f})"
+            if val == tag:
+                self._geof_pan_offset = [0.0, 0.0]
+                self._geof_map_zoom = 0.0
+                ref = [loc["lat"], loc["lon"]]
+                self._geof_vertices = [
+                    [ref[0] + 0.0006, ref[1] - 0.0008, "NW"],
+                    [ref[0] + 0.0006, ref[1] + 0.0008, "NE"],
+                    [ref[0] - 0.0006, ref[1] + 0.0008, "SE"],
+                    [ref[0] - 0.0006, ref[1] - 0.0008, "SW"],
+                ]
+                self._geof_draw_map()
+                self._geof_log_alert(f"Jumped to {loc['name']}", tag="info")
+                break
+
+    def _geof_on_locations_changed(self):
+        self._populate_location_combo(self._geof_loc_combo)
+        self._geof_draw_map()
+
+    def _geof_log_alert(self, msg, tag="info"):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._geof_alert_box.config(state="normal")
+        self._geof_alert_box.insert("end", f"[{ts}] ", "ts")
+        self._geof_alert_box.insert("end", f"{msg}\n", tag)
+        self._geof_alert_box.see("end")
+        self._geof_alert_box.config(state="disabled")
+
+    def _geof_clear_alerts(self):
+        self._geof_alert_box.config(state="normal")
+        self._geof_alert_box.delete("1.0", "end")
+        self._geof_alert_box.config(state="disabled")
+
+    # ── GeoF Tile Map embed ──
+
+    def _geof_toggle_embed(self):
+        if not _HAS_MAP_EMBED:
+            return
+        if self._geof_embed_active:
+            self._geof_detach_map()
+        else:
+            self._geof_embed_map()
+
+    def _geof_embed_map(self):
+        if not _HAS_MAP_EMBED:
+            return
+        self._geof_map_embedder.activate()
+        self._geof_embed_active = True
+        try:
+            self._geof_embed_btn._text = "DETACH MAP"
+            self._geof_embed_btn._draw(self._geof_embed_btn._bg)
+        except Exception:
+            pass
+        self._geof_draw_map()
+        self._geof_log_alert("Offline tile map enabled", "ok")
+
+    def _geof_detach_map(self):
+        if not _HAS_MAP_EMBED:
+            return
+        self._geof_map_embedder.deactivate()
+        self._geof_embed_active = False
+        try:
+            self._geof_embed_btn._text = "EMBED MAP"
+            self._geof_embed_btn._draw(self._geof_embed_btn._bg)
+        except Exception:
+            pass
+        self._geof_draw_map()
+        self._geof_log_alert("Tile map disabled", "info")
+
+    def _geof_on_embed_resize(self, event):
+        if _HAS_MAP_EMBED and self._geof_embed_active:
+            self._geof_draw_map()
+
+    def _geof_cleanup_embed(self):
+        if _HAS_MAP_EMBED and hasattr(self, "_geof_map_embedder"):
+            self._geof_map_embedder.deactivate()
+
+    # ── GeoF pan / zoom ──
+
+    def _geof_pan_start(self, event):
+        self._geof_pan_drag = {"active": True, "sx": event.x, "sy": event.y,
+                                "ox": self._geof_pan_offset[0],
+                                "oy": self._geof_pan_offset[1]}
+
+    def _geof_pan_move(self, event):
+        pd = self._geof_pan_drag
+        if pd.get("active"):
+            self._geof_pan_offset[0] = pd["ox"] + (event.x - pd["sx"])
+            self._geof_pan_offset[1] = pd["oy"] + (event.y - pd["sy"])
+            self._geof_draw_map()
+
+    def _geof_pan_end(self, event):
+        self._geof_pan_drag["active"] = False
+
+    def _geof_zoom_event(self, event):
+        if event.num == 4 or (hasattr(event, "delta") and event.delta > 0):
+            self._geof_map_zoom = min(self._geof_map_zoom + 0.25, 4.0)
+        elif event.num == 5 or (hasattr(event, "delta") and event.delta < 0):
+            self._geof_map_zoom = max(self._geof_map_zoom - 0.25, -2.0)
+        self._geof_draw_map()
+
+    def _geof_zoom_step(self, direction):
+        if direction > 0:
+            self._geof_map_zoom = min(self._geof_map_zoom + 0.5, 4.0)
+        else:
+            self._geof_map_zoom = max(self._geof_map_zoom - 0.5, -2.0)
+        self._geof_draw_map()
+
+    def _geof_center_gps(self):
+        self._geof_pan_offset = [0.0, 0.0]
+        self._geof_map_zoom = 0.0
+        self._geof_draw_map()
+        self._geof_log_alert("Centered on GPS", "info")
+
+    def _geof_toggle_tile_mode(self):
+        if not _HAS_MAP_EMBED:
+            return
+        if self._geof_tile_mode == "street":
+            self._geof_tile_mode = "satellite"
+            self._geof_map_embedder.set_tile_mode("satellite")
+            try:
+                self._geof_tile_btn._text = "STREET"
+                self._geof_tile_btn._draw(self._geof_tile_btn._bg)
+            except Exception:
+                pass
+            self._geof_log_alert("Switched to satellite view", "ok")
+        else:
+            self._geof_tile_mode = "street"
+            self._geof_map_embedder.set_tile_mode("street")
+            try:
+                self._geof_tile_btn._text = "SATELLITE"
+                self._geof_tile_btn._draw(self._geof_tile_btn._bg)
+            except Exception:
+                pass
+            self._geof_log_alert("Switched to street view", "ok")
+
+    # ── GeoF bidirectional selection + boundary points ──
+
+    def _geof_on_vertex_select(self, event):
+        sel = self._geof_bp_tree.selection()
+        if not sel:
+            return
+        self._geof_selected_vertex = int(sel[0])
+        self._geof_selected_collar = None
+        # Clear collar selection
+        self._geof_tree.selection_remove(*self._geof_tree.selection())
+        self._geof_draw_map()
+
+    def _geof_map_click(self, event):
+        """Hit-test collars and vertices on the canvas, sync selection to tables."""
+        to_px = getattr(self, "_geof_to_px", None)
+        if to_px is None:
+            return
+
+        hit_radius = 16
+
+        # Check collars first
+        for cid, col in self._geof_collars.items():
+            cx, cy = to_px(col["lat"], col["lon"])
+            if abs(event.x - cx) < hit_radius and abs(event.y - cy) < hit_radius:
+                self._geof_selected_collar = cid
+                self._geof_selected_vertex = None
+                self._geof_bp_tree.selection_remove(*self._geof_bp_tree.selection())
+                # Select in collar tree
+                if self._geof_tree.exists(cid):
+                    self._geof_tree.selection_set(cid)
+                    self._geof_tree.see(cid)
+                self._geof_draw_map()
+                return
+
+        # Check vertices
+        for i, v in enumerate(self._geof_vertices):
+            vx, vy = to_px(v[0], v[1])
+            if abs(event.x - vx) < hit_radius and abs(event.y - vy) < hit_radius:
+                self._geof_selected_vertex = i
+                self._geof_selected_collar = None
+                self._geof_tree.selection_remove(*self._geof_tree.selection())
+                iid = str(i)
+                if self._geof_bp_tree.exists(iid):
+                    self._geof_bp_tree.selection_set(iid)
+                    self._geof_bp_tree.see(iid)
+                self._geof_draw_map()
+                return
+
+        # Clicked empty space -- deselect all
+        self._geof_selected_collar = None
+        self._geof_selected_vertex = None
+        self._geof_tree.selection_remove(*self._geof_tree.selection())
+        self._geof_bp_tree.selection_remove(*self._geof_bp_tree.selection())
+        self._geof_draw_map()
+
+    def _geof_refresh_bp_tree(self):
+        for item in self._geof_bp_tree.get_children():
+            self._geof_bp_tree.delete(item)
+        for i, v in enumerate(self._geof_vertices):
+            lat, lon = v[0], v[1]
+            label = v[2] if len(v) > 2 else ""
+            self._geof_bp_tree.insert("", "end", iid=str(i), values=(
+                f"P{i + 1}", f"{lat:.6f}", f"{lon:.6f}", label))
+
+    def _geof_add_vertex(self):
+        """Add a new boundary point at the center of the current fence or device GPS."""
+        if self._geof_vertices:
+            avg_lat = sum(v[0] for v in self._geof_vertices) / len(self._geof_vertices)
+            avg_lon = sum(v[1] for v in self._geof_vertices) / len(self._geof_vertices)
+        else:
+            avg_lat, avg_lon = self._get_device_gps_reference()
+        self._geof_vertices.append([avg_lat, avg_lon, ""])
+        self._geof_save_fence()
+        self._geof_refresh_bp_tree()
+        self._geof_draw_map()
+        self._geof_log_alert(f"Added P{len(self._geof_vertices)}", "info")
+
+    def _geof_delete_vertex(self):
+        """Delete the selected boundary point."""
+        sel = self._geof_bp_tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self._geof_vertices):
+            removed = self._geof_vertices.pop(idx)
+            self._geof_selected_vertex = None
+            self._geof_save_fence()
+            self._geof_refresh_bp_tree()
+            self._geof_draw_map()
+            self._geof_log_alert(f"Deleted P{idx + 1}", "info")
+
+    def _geof_vertex_context_menu(self, event):
+        """Right-click a boundary point row to edit name, lat/lon, or delete."""
+        row_id = self._geof_bp_tree.identify_row(event.y)
+        if row_id is None or row_id == "":
+            return
+        self._geof_bp_tree.selection_set(row_id)
+        idx = int(row_id)
+        if idx < 0 or idx >= len(self._geof_vertices):
+            return
+
+        menu = tk.Menu(self._geof_bp_tree, tearoff=0, bg=TH["card"], fg=TH["fg"],
+                       activebackground=TH["input"], activeforeground=TH["fg"])
+        menu.add_command(label=f"Edit Name (P{idx + 1})",
+                         command=lambda: self._geof_edit_vertex_field(idx, "name"))
+        menu.add_command(label="Edit Latitude",
+                         command=lambda: self._geof_edit_vertex_field(idx, "lat"))
+        menu.add_command(label="Edit Longitude",
+                         command=lambda: self._geof_edit_vertex_field(idx, "lon"))
+        menu.add_separator()
+        menu.add_command(label="Delete Point",
+                         command=lambda: self._geof_delete_vertex_by_idx(idx))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _treeview_inline_edit(self, tree, row_id, column, cur_val, on_save):
+        """Place an Entry widget directly over a Treeview cell for inline editing."""
+        col_idx = tree["columns"].index(column)
+        bbox = tree.bbox(row_id, column)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        var = tk.StringVar(value=cur_val)
+        entry = tk.Entry(tree, textvariable=var, bg=TH["input"], fg=TH["fg"],
+                         insertbackground=TH["fg"], font=TH["font_mono"],
+                         relief="solid", bd=1)
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        def _commit(_event=None):
+            new_val = var.get().strip()
+            entry.destroy()
+            on_save(new_val)
+
+        def _cancel(_event=None):
+            entry.destroy()
+
+        def _focus_out(_event=None):
+            _commit()
+
+        entry.bind("<Return>", _commit)
+        entry.bind("<Escape>", _cancel)
+        entry.bind("<FocusOut>", _focus_out)
+
+    def _geof_bp_inline_edit(self, event):
+        """Handle double-click on boundary points tree for inline cell editing."""
+        row_id = self._geof_bp_tree.identify_row(event.y)
+        col_id = self._geof_bp_tree.identify_column(event.x)
+        if not row_id or not col_id:
+            return
+        col_idx = int(col_id.replace("#", "")) - 1
+        columns = self._geof_bp_tree["columns"]
+        if col_idx < 0 or col_idx >= len(columns):
+            return
+        column = columns[col_idx]
+        if column == "point":
+            return
+        idx = int(row_id)
+        if idx < 0 or idx >= len(self._geof_vertices):
+            return
+        v = self._geof_vertices[idx]
+        if column == "lat":
+            cur_val = f"{v[0]:.6f}"
+        elif column == "lon":
+            cur_val = f"{v[1]:.6f}"
+        elif column == "label":
+            cur_val = v[2] if len(v) > 2 else ""
+        else:
+            return
+
+        def _save(new_val):
+            if column == "label":
+                if len(v) > 2:
+                    self._geof_vertices[idx][2] = new_val
+                else:
+                    self._geof_vertices[idx].append(new_val)
+            else:
+                try:
+                    num = float(new_val)
+                except ValueError:
+                    self._geof_log_alert("Invalid coordinate value", "alert")
+                    return
+                if column == "lat":
+                    self._geof_vertices[idx][0] = num
+                else:
+                    self._geof_vertices[idx][1] = num
+            self._geof_save_fence()
+            self._geof_refresh_bp_tree()
+            self._geof_draw_map()
+            self._geof_log_alert(f"Updated P{idx + 1} {column}: {new_val}", "ok")
+
+        self._treeview_inline_edit(self._geof_bp_tree, row_id, column, cur_val, _save)
+
+    def _geof_edit_vertex_field(self, idx, field):
+        """Edit a boundary vertex field (called from context menu)."""
+        v = self._geof_vertices[idx]
+        if field == "name":
+            column = "label"
+            cur_val = v[2] if len(v) > 2 else ""
+        elif field == "lat":
+            column = "lat"
+            cur_val = f"{v[0]:.6f}"
+        elif field == "lon":
+            column = "lon"
+            cur_val = f"{v[1]:.6f}"
+        else:
+            return
+        row_id = str(idx)
+        if not self._geof_bp_tree.exists(row_id):
+            return
+        self._geof_bp_tree.see(row_id)
+        self._geof_bp_tree.selection_set(row_id)
+        self.after(50, lambda: self._treeview_inline_edit(
+            self._geof_bp_tree, row_id, column, cur_val,
+            lambda new_val: self._geof_vertex_field_save(idx, field, new_val)))
+
+    def _geof_vertex_field_save(self, idx, field, new_val):
+        """Save callback for context-menu-triggered inline edit."""
+        v = self._geof_vertices[idx]
+        if field == "name":
+            if len(v) > 2:
+                self._geof_vertices[idx][2] = new_val
+            else:
+                self._geof_vertices[idx].append(new_val)
+        else:
+            try:
+                num = float(new_val)
+            except ValueError:
+                self._geof_log_alert("Invalid coordinate value", "alert")
+                return
+            if field == "lat":
+                self._geof_vertices[idx][0] = num
+            else:
+                self._geof_vertices[idx][1] = num
+        self._geof_save_fence()
+        self._geof_refresh_bp_tree()
+        self._geof_draw_map()
+        self._geof_log_alert(f"Updated P{idx + 1} {field}: {new_val}", "ok")
+
+    def _geof_delete_vertex_by_idx(self, idx):
+        """Delete a boundary vertex by index (from context menu)."""
+        if 0 <= idx < len(self._geof_vertices):
+            self._geof_vertices.pop(idx)
+            self._geof_selected_vertex = None
+            self._geof_save_fence()
+            self._geof_refresh_bp_tree()
+            self._geof_draw_map()
+            self._geof_log_alert(f"Deleted P{idx + 1}", "info")
+
+    def _geof_collar_context_menu(self, event):
+        row_id = self._geof_tree.identify_row(event.y)
+        if not row_id or row_id not in self._geof_collars:
+            return
+        self._geof_tree.selection_set(row_id)
+        menu = tk.Menu(self._geof_tree, tearoff=0, bg=TH["card"], fg=TH["fg"],
+                       activebackground=TH["input"], activeforeground=TH["fg"])
+        emoji_menu = tk.Menu(menu, tearoff=0, bg=TH["card"], fg=TH["fg"],
+                             activebackground=TH["input"], activeforeground=TH["fg"])
+        emoji_menu.add_command(
+            label="(none) - use dot",
+            command=lambda cid=row_id: self._geof_set_collar_emoji(cid, ""))
+        for em in self._geof_animal_emojis:
+            emoji_menu.add_command(
+                label=em,
+                command=lambda cid=row_id, e=em: self._geof_set_collar_emoji(cid, e))
+        menu.add_cascade(label="Set Animal Icon", menu=emoji_menu)
+        menu.add_command(
+            label="Rename Collar",
+            command=lambda cid=row_id: self._geof_rename_collar(cid))
+        menu.add_separator()
+        menu.add_command(
+            label="Edit GPS Coordinates",
+            command=lambda cid=row_id: self._geof_load_collar_to_editor(cid))
+        menu.add_command(
+            label="Verify Geofence Position",
+            command=lambda cid=row_id: self._geof_verify_collar_fence(cid))
+        menu.add_separator()
+        menu.add_command(
+            label="Delete Collar",
+            command=lambda cid=row_id: self._geof_delete_collar(cid))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _geof_set_collar_emoji(self, collar_id, emoji):
+        if collar_id in self._geof_collars:
+            self._geof_collars[collar_id]["emoji"] = emoji
+            self._geof_refresh_tree()
+            self._geof_draw_map()
+            self._geof_save_fence()
+            label = emoji if emoji else "dot"
+            self._geof_log_alert(
+                f"Collar {collar_id} icon set to {label}", tag="info")
+
+    def _geof_rename_collar(self, collar_id):
+        if collar_id not in self._geof_collars:
+            return
+        current = self._geof_collars[collar_id].get("name", collar_id)
+        new_name = simpledialog.askstring(
+            "Rename Collar", f"Enter new name for {collar_id}:",
+            initialvalue=current, parent=self)
+        if new_name and new_name.strip():
+            new_name = new_name.strip()
+            self._geof_collars[collar_id]["name"] = new_name
+            self._geof_refresh_tree()
+            self._geof_draw_map()
+            self._geof_save_fence()
+            self._geof_log_alert(
+                f"Collar {collar_id} renamed to {new_name}", tag="info")
+
+    # ── GeoF GPS Coordinate Editor ──
 
     def _geof_on_collar_select(self, event):
         sel = self._geof_tree.selection()
         if not sel:
             return
         cid = sel[0]
-        collar = self._geof_collars.get(cid, {})
-        self._geof_detail_text.config(state="normal")
-        self._geof_detail_text.delete("1.0", "end")
-        lines = [
-            f"Collar ID:  {cid}",
-            f"Name:       {collar.get('name', '')}",
-            f"Status:     {collar.get('status', 'UNKNOWN')}",
-            f"Battery:    {collar.get('battery', 0)}%",
-            f"Position:   {collar.get('lat', 0):.6f}, {collar.get('lon', 0):.6f}",
-            f"Last Seen:  {datetime.fromtimestamp(collar.get('last_seen', 0)).strftime('%Y-%m-%d %H:%M:%S') if collar.get('last_seen') else 'never'}",
-        ]
-        self._geof_detail_text.insert("1.0", "\n".join(lines))
-        self._geof_detail_text.config(state="disabled")
+        self._geof_selected_collar = cid
+        self._geof_selected_vertex = None
+        self._geof_bp_tree.selection_remove(*self._geof_bp_tree.selection())
+        self._geof_load_collar_to_editor(cid)
+        self._geof_draw_map()
 
-    # -- GeoF LoRa bridge --
+    def _geof_load_collar_to_editor(self, collar_id):
+        if collar_id not in self._geof_collars:
+            return
+        c = self._geof_collars[collar_id]
+        self._geof_edit_id_var.set(collar_id)
+        self._geof_edit_lat_var.set(f"{c['lat']:.6f}")
+        self._geof_edit_lon_var.set(f"{c['lon']:.6f}")
+        name = c.get("name", collar_id)
+        self._geof_edit_info.config(
+            text=f"Editing: {name} ({collar_id})", fg=TH["fg"])
+
+    def _geof_apply_manual_gps(self):
+        cid = self._geof_edit_id_var.get().strip()
+        if not cid:
+            self._geof_log_alert("No collar ID specified", "alert")
+            return
+        try:
+            lat = float(self._geof_edit_lat_var.get().strip())
+            lon = float(self._geof_edit_lon_var.get().strip())
+        except ValueError:
+            self._geof_log_alert("Invalid coordinate — enter numeric lat/lon", "alert")
+            return
+        if not (-90 <= lat <= 90):
+            self._geof_log_alert(f"Latitude {lat} out of range (-90 to 90)", "alert")
+            return
+        if not (-180 <= lon <= 180):
+            self._geof_log_alert(f"Longitude {lon} out of range (-180 to 180)", "alert")
+            return
+        if cid in self._geof_collars:
+            old_lat, old_lon = self._geof_collars[cid]["lat"], self._geof_collars[cid]["lon"]
+            self._geof_collars[cid]["lat"] = lat
+            self._geof_collars[cid]["lon"] = lon
+            self._geof_refresh_tree()
+            self._geof_draw_map()
+            self._geof_save_fence()
+            self._geof_log_alert(
+                f"GPS updated: {cid} ({old_lat:.4f},{old_lon:.4f}) -> ({lat:.4f},{lon:.4f})", "ok")
+        else:
+            self._geof_log_alert(f"Collar '{cid}' not found — use ADD TEST COLLAR first", "alert")
+
+    def _geof_clear_editor(self):
+        self._geof_edit_id_var.set("")
+        self._geof_edit_lat_var.set("")
+        self._geof_edit_lon_var.set("")
+        self._geof_edit_info.config(
+            text="Select a collar or enter an ID below", fg=TH["fg_dim"])
+
+    def _geof_add_test_collar(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Add Test Collar")
+        dlg.configure(bg=TH["bg"])
+        dlg.geometry("320x200")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        fields = {}
+        for label, key, default in [
+            ("Collar ID:", "id", f"TEST-{len(self._geof_collars) + 1:03d}"),
+            ("Name:", "name", "Test Collar"),
+            ("Latitude:", "lat", "0.000000"),
+            ("Longitude:", "lon", "0.000000"),
+        ]:
+            row = tk.Frame(dlg, bg=TH["bg"])
+            row.pack(fill="x", padx=12, pady=3)
+            tk.Label(row, text=label, bg=TH["bg"], fg=TH["fg"],
+                     font=TH["font_sm"], width=10, anchor="w").pack(side="left")
+            var = tk.StringVar(value=default)
+            tk.Entry(row, textvariable=var, bg=TH["input"], fg=TH["fg"],
+                     insertbackground=TH["fg"], font=TH["font_mono"],
+                     relief="flat", width=22).pack(side="left", padx=(4, 0))
+            fields[key] = var
+
+        def _create(_event=None):
+            cid = fields["id"].get().strip()
+            name = fields["name"].get().strip()
+            if not cid:
+                self._geof_log_alert("Collar ID required", "alert")
+                return
+            if cid in self._geof_collars:
+                self._geof_log_alert(f"Collar '{cid}' already exists", "alert")
+                return
+            try:
+                lat = float(fields["lat"].get().strip())
+                lon = float(fields["lon"].get().strip())
+            except ValueError:
+                self._geof_log_alert("Invalid lat/lon values", "alert")
+                return
+            self._geof_collars[cid] = {
+                "name": name or cid,
+                "lat": lat, "lon": lon,
+                "battery": 100, "status": "Test",
+                "last_seen": 0, "emoji": "",
+            }
+            self._geof_refresh_tree()
+            self._geof_draw_map()
+            self._geof_save_fence()
+            self._geof_load_collar_to_editor(cid)
+            self._geof_log_alert(f"Test collar added: {cid} at ({lat:.4f},{lon:.4f})", "ok")
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg, bg=TH["bg"])
+        btn_row.pack(fill="x", padx=12, pady=(8, 12))
+        RoundedButton(btn_row, text="CREATE", command=_create).pack(side="left", padx=(0, 6))
+        RoundedButton(btn_row, text="CANCEL",
+                      command=dlg.destroy).pack(side="left")
+        dlg.bind("<Return>", _create)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    def _geof_delete_collar(self, collar_id):
+        if collar_id not in self._geof_collars:
+            return
+        name = self._geof_collars[collar_id].get("name", collar_id)
+        if not messagebox.askyesno("Delete Collar",
+                                    f"Remove collar '{name}' ({collar_id})?",
+                                    parent=self):
+            return
+        del self._geof_collars[collar_id]
+        if self._geof_selected_collar == collar_id:
+            self._geof_selected_collar = None
+            self._geof_clear_editor()
+        self._geof_refresh_tree()
+        self._geof_draw_map()
+        self._geof_save_fence()
+        self._geof_log_alert(f"Collar {collar_id} ({name}) deleted", "info")
+
+    def _geof_point_in_polygon(self, lat, lon):
+        verts = self._geof_vertices
+        n = len(verts)
+        if n < 3:
+            return None
+        inside = False
+        j = n - 1
+        for i in range(n):
+            yi, xi = verts[i][0], verts[i][1]
+            yj, xj = verts[j][0], verts[j][1]
+            if ((yi > lon) != (yj > lon)) and \
+               (lat < (xj - xi) * (lon - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    def _geof_verify_collar_fence(self, collar_id):
+        if collar_id not in self._geof_collars:
+            return
+        c = self._geof_collars[collar_id]
+        result = self._geof_point_in_polygon(c["lat"], c["lon"])
+        name = c.get("name", collar_id)
+        if result is None:
+            self._geof_log_alert(
+                f"VERIFY {name}: Cannot check — need >= 3 boundary points", "stale")
+        elif result:
+            self._geof_log_alert(
+                f"VERIFY {name}: INSIDE fence at ({c['lat']:.4f},{c['lon']:.4f})", "ok")
+        else:
+            self._geof_log_alert(
+                f"VERIFY {name}: OUTSIDE fence at ({c['lat']:.4f},{c['lon']:.4f})", "alert")
+
+    def _geof_verify_fence_check(self):
+        cid = self._geof_edit_id_var.get().strip()
+        if not cid:
+            self._geof_log_alert("No collar selected for fence check", "alert")
+            return
+        lat_str = self._geof_edit_lat_var.get().strip()
+        lon_str = self._geof_edit_lon_var.get().strip()
+        try:
+            lat = float(lat_str)
+            lon = float(lon_str)
+        except ValueError:
+            self._geof_log_alert("Invalid coordinates in editor", "alert")
+            return
+        result = self._geof_point_in_polygon(lat, lon)
+        if result is None:
+            self._geof_log_alert(
+                f"VERIFY ({lat:.4f},{lon:.4f}): Need >= 3 boundary points", "stale")
+        elif result:
+            self._geof_log_alert(
+                f"VERIFY ({lat:.4f},{lon:.4f}): INSIDE geofence boundary", "ok")
+        else:
+            self._geof_log_alert(
+                f"VERIFY ({lat:.4f},{lon:.4f}): OUTSIDE geofence boundary", "alert")
 
     def _geof_start_bridge(self):
-        bridge_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "services", "lora_bridge.py")
-        if not os.path.isfile(bridge_path):
-            self._geof_log_msg("lora_bridge.py not found in services/")
+        if self._geof_bridge_proc and self._geof_bridge_proc.poll() is None:
+            self._geof_log_alert("Bridge already running", tag="stale")
             return
-        if self._geof_lora_bridge_proc is not None:
-            self._geof_log_msg("Bridge already running.")
+        if not os.path.isfile(self.GEOF_LORA_BRIDGE):
+            self._geof_log_alert(f"lora_bridge.py not found at {self.GEOF_LORA_BRIDGE}", tag="alert")
             return
+
+        cmd = [sys.executable, self.GEOF_LORA_BRIDGE,
+               "--fence", self.GEOF_FENCE_PATH,
+               "--sf", str(self._geof_sf_var.get())]
+        mode = self._geof_mode_var.get()
+        if mode == "simulate":
+            cmd.append("--simulate")
+        elif mode == "tcp":
+            cmd.extend(["--tcp", self._geof_tcp_var.get()])
+        else:
+            cmd.extend(["--port", self._geof_serial_var.get()])
+
         try:
-            self._geof_lora_bridge_proc = subprocess.Popen(
-                [sys.executable, bridge_path, "--fence", self._GEOF_FENCE_PATH],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            self._geof_status_lbl.config(text="BRIDGE ONLINE", fg=TH["green"])
-            self._geof_log_msg("LoRa bridge started.")
-            threading.Thread(target=self._geof_bridge_reader, daemon=True).start()
+            self._geof_bridge_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                bufsize=1, text=True)
+            self._geof_bridge_status.config(text="\u25cf Running", fg=TH["green"])
+            self._geof_poll_active = True
+            self._geof_log_alert(f"Bridge started ({mode} mode, SF={self._geof_sf_var.get()})", tag="ok")
+            threading.Thread(target=self._geof_read_bridge_output, daemon=True).start()
         except Exception as ex:
-            self._geof_log_msg(f"Bridge start error: {ex}")
+            self._geof_log_alert(f"Failed to start bridge: {ex}", tag="alert")
 
     def _geof_stop_bridge(self):
-        if self._geof_lora_bridge_proc is None:
-            return
-        try:
-            self._geof_lora_bridge_proc.terminate()
-        except Exception:
-            pass
-        self._geof_lora_bridge_proc = None
-        self._geof_status_lbl.config(text="OFFLINE", fg=TH["red"])
-        self._geof_log_msg("LoRa bridge stopped.")
+        self._geof_poll_active = False
+        if self._geof_bridge_proc and self._geof_bridge_proc.poll() is None:
+            self._geof_bridge_proc.terminate()
+            self._geof_bridge_proc = None
+            self._geof_bridge_status.config(text="\u25cf Offline", fg=TH["red"])
+            self._geof_log_alert("Bridge stopped", tag="info")
+        else:
+            self._geof_log_alert("Bridge not running", tag="stale")
 
-    def _geof_bridge_reader(self):
-        proc = self._geof_lora_bridge_proc
+    def _geof_read_bridge_output(self):
+        proc = self._geof_bridge_proc
         if proc is None:
             return
-        for line in iter(proc.stdout.readline, b""):
-            text = line.decode("utf-8", errors="replace").strip()
-            if not text:
-                continue
-            self.after(0, self._geof_process_bridge_line, text)
-        self.after(0, self._geof_stop_bridge)
-
-    def _geof_process_bridge_line(self, line):
-        self._geof_log_msg(line)
         try:
-            pkt = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            return
-        cid = pkt.get("collar_id")
-        if not cid:
-            return
-        if cid not in self._geof_collars:
-            self._geof_collars[cid] = {"id": cid, "name": pkt.get("name", cid)}
-        collar = self._geof_collars[cid]
-        collar["lat"] = pkt.get("lat", collar.get("lat", 0))
-        collar["lon"] = pkt.get("lon", collar.get("lon", 0))
-        collar["battery"] = pkt.get("battery", collar.get("battery", 0))
-        collar["last_seen"] = time.time()
-        if pkt.get("alert") == "OUTSIDE_FENCE":
-            collar["status"] = "ALERT"
-            self._geof_log_msg(f"*** ALERT: Collar {cid} OUTSIDE fence! ***")
-        self._geof_refresh_collar_tree()
-        self._geof_redraw()
+            for line in proc.stdout:
+                if not self._geof_poll_active:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pkt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-    # -- GeoF heartbeat monitor --
+                if "error" in pkt:
+                    self.after(0, self._geof_log_alert, f"ERROR: {pkt['error']}", "alert")
+                    continue
+                if "info" in pkt:
+                    self.after(0, self._geof_log_alert, pkt["info"], "info")
+                    continue
 
-    def _geof_start_heartbeat(self):
-        if self._geof_heartbeat_active:
-            return
-        self._geof_heartbeat_active = True
-        self._geof_hb_lbl.config(text="Heartbeat: ACTIVE", fg=TH["green"])
-        self._geof_log_msg("Heartbeat monitor started (20 min interval).")
-        self._geof_heartbeat_tick()
+                cid = pkt.get("collar_id")
+                if not cid:
+                    continue
 
-    def _geof_stop_heartbeat(self):
-        self._geof_heartbeat_active = False
-        self._geof_hb_lbl.config(text="Heartbeat: OFF", fg=TH["fg_dim"])
-        self._geof_log_msg("Heartbeat monitor stopped.")
+                now = time.time()
+                status = "OK"
+                if pkt.get("alert") == "OUTSIDE_FENCE":
+                    status = "OUTSIDE"
 
-    def _geof_heartbeat_tick(self):
-        if not self._geof_heartbeat_active:
-            return
-        now = time.time()
-        alerts = []
-        for cid, collar in self._geof_collars.items():
-            last = collar.get("last_seen", 0)
-            age = now - last if last else float("inf")
-            if age > self._GEOF_HEARTBEAT_INTERVAL * 2:
-                collar["status"] = "OFFLINE"
-                alerts.append(f"{collar.get('name', cid)}: OFFLINE")
-            elif age > self._GEOF_HEARTBEAT_INTERVAL:
-                collar["status"] = "STALE"
-                alerts.append(f"{collar.get('name', cid)}: STALE")
-        if alerts:
-            self._geof_log_msg("Heartbeat check: " + ", ".join(alerts))
-        self._geof_refresh_collar_tree()
-        self._geof_redraw()
-        self.after(self._GEOF_HEARTBEAT_INTERVAL * 1000, self._geof_heartbeat_tick)
+                if cid in self._geof_collars:
+                    self._geof_collars[cid].update({
+                        "lat": pkt.get("lat", 0),
+                        "lon": pkt.get("lon", 0),
+                        "battery": pkt.get("battery", 0),
+                        "status": status,
+                        "last_seen": now,
+                    })
+                else:
+                    self._geof_collars[cid] = {
+                        "name": pkt.get("name", cid),
+                        "lat": pkt.get("lat", 0),
+                        "lon": pkt.get("lon", 0),
+                        "battery": pkt.get("battery", 0),
+                        "status": status,
+                        "last_seen": now,
+                        "emoji": "",
+                    }
 
-    # -- GeoF logging --
+                display_name = self._geof_collars[cid].get("name", cid)
+                if status == "OUTSIDE":
+                    self.after(0, self._geof_log_alert,
+                               f"\u26a0 {display_name} ({cid}) OUTSIDE FENCE "
+                               f"@ {pkt.get('lat', 0):.4f}, {pkt.get('lon', 0):.4f}",
+                               "alert")
+                else:
+                    self.after(0, self._geof_log_alert,
+                               f"\u2713 {display_name} ({cid}) OK "
+                               f"Batt={pkt.get('battery', '?')}%",
+                               "ok")
 
-    def _geof_log_msg(self, msg):
+                self.after(0, self._geof_refresh_tree)
+                self.after(0, self._geof_draw_map)
+                self.after(0, self._geof_save_fence)
+        except Exception:
+            pass
+        finally:
+            self.after(0, lambda: self._geof_bridge_status.config(
+                text="\u25cf Offline", fg=TH["red"]))
+
+    # ── Device GPS reference ──
+
+    def _get_device_gps_reference(self):
+        """Read reference GPS from device_locations.json, fallback to Macon MO."""
+        dev_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "config", "device_locations.json")
+        dev_path = os.path.normpath(dev_path)
+        try:
+            if os.path.isfile(dev_path):
+                with open(dev_path, "r") as fh:
+                    data = json.load(fh)
+                ref = data.get("reference_point", {})
+                if ref.get("lat") and ref.get("lon"):
+                    return ref["lat"], ref["lon"]
+        except (json.JSONDecodeError, IOError):
+            pass
+        return 39.6335, -92.0033
+
+    # ── Haversine distance (miles) ──
+
+    @staticmethod
+    def _haversine_miles(lat1, lon1, lat2, lon2):
+        R = 3958.8  # Earth radius in miles
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (math.sin(dlat / 2) ** 2 +
+             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+             math.sin(dlon / 2) ** 2)
+        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    # ==================== HAM / APRS TAB ====================
+    APRS_CONFIG_PATH = os.path.expanduser("~/.openclaw/aprs_config.json")
+    APRS_BRIDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "whim-terminal", "services", "aprs_bridge.py")
+    APRS_STALE_THRESHOLD = 30 * 60
+    APRS_OFFLINE_THRESHOLD = 60 * 60
+
+    def build_ham(self):
+        f = self.tabs["ham"]
+        self._ham_bridge_proc = None
+        self._ham_stations = {}
+        self._ham_messages = []
+        self._ham_poll_active = False
+        self._ham_selected_station = None
+        self._ham_to_px = None
+        self._ham_map_zoom = 0.0
+        self._ham_map_center = None
+        self._ham_pan_offset = [0.0, 0.0]
+        self._ham_pan_drag = {"active": False, "sx": 0, "sy": 0, "ox": 0.0, "oy": 0.0}
+
+        wrap = tk.Frame(f, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=16, pady=12)
+
+        hdr = tk.Frame(wrap, bg=TH["bg"])
+        hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(hdr, text="HAM \u2014 APRS MONITOR", bg=TH["bg"], fg=TH["green"],
+                 font=(_FONTS["ui"], 16, "bold")).pack(side="left")
+        self._ham_bridge_status = tk.Label(hdr, text="\u25cf Offline", bg=TH["bg"],
+                                            fg=TH["red"], font=(_FONTS["ui"], 10, "bold"))
+        self._ham_bridge_status.pack(side="right")
+
+        tk.Label(wrap, text="APRS station monitoring \u2022 Direwolf integration \u2022 144.390 MHz",
+                 bg=TH["bg"], fg=TH["fg2"], font=TH["font_sm"]).pack(anchor="w", pady=(0, 12))
+
+        cols = tk.Frame(wrap, bg=TH["bg"])
+        cols.pack(fill="both", expand=True)
+        cols.columnconfigure(0, weight=2)
+        cols.columnconfigure(1, weight=3)
+        cols.rowconfigure(0, weight=1)
+
+        # ── Left column: Sub-tabbed controls ──
+        left = tk.Frame(cols, bg=TH["bg"])
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        ham_nb = ttk.Notebook(left)
+        ham_nb.pack(fill="both", expand=True)
+
+        link_tab = tk.Frame(ham_nb, bg=TH["bg"])
+        base_tab = tk.Frame(ham_nb, bg=TH["bg"])
+        search_tab = tk.Frame(ham_nb, bg=TH["bg"])
+        stations_tab = tk.Frame(ham_nb, bg=TH["bg"])
+
+        ham_nb.add(link_tab, text="  LINK  ")
+        ham_nb.add(base_tab, text="  BASE  ")
+        ham_nb.add(search_tab, text="  SEARCH  ")
+
+        ctrl_card = tk.Frame(link_tab, bg=TH["card"], highlightthickness=1,
+                              highlightbackground=TH["border"])
+        ctrl_card.pack(fill="both", expand=True)
+        tk.Label(ctrl_card, text="DIREWOLF CONNECTION", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        tk.Frame(ctrl_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 6))
+
+        mode_frame = tk.Frame(ctrl_card, bg=TH["card"])
+        mode_frame.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(mode_frame, text="Mode:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_mode_var = tk.StringVar(value="kiss")
+        for m in ["simulate", "kiss", "agwpe"]:
+            tk.Radiobutton(mode_frame, text=m.upper(), variable=self._ham_mode_var,
+                           value=m, bg=TH["card"], fg=TH["fg"],
+                           selectcolor=TH["input"], activebackground=TH["card"],
+                           activeforeground=TH["fg"], font=TH["font_sm"]
+                           ).pack(side="left", padx=4)
+
+        host_frame = tk.Frame(ctrl_card, bg=TH["card"])
+        host_frame.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(host_frame, text="Host:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_host_var = tk.StringVar(value="127.0.0.1")
+        tk.Entry(host_frame, textvariable=self._ham_host_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=16).pack(side="left", padx=(4, 8))
+        tk.Label(host_frame, text="Port:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_port_var = tk.StringVar(value="8001")
+        tk.Entry(host_frame, textvariable=self._ham_port_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=8).pack(side="left", padx=(4, 0))
+
+        callsign_frame = tk.Frame(ctrl_card, bg=TH["card"])
+        callsign_frame.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(callsign_frame, text="My Callsign:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_callsign_var = tk.StringVar(value="KCMQ23")
+        tk.Entry(callsign_frame, textvariable=self._ham_callsign_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=12).pack(side="left", padx=(4, 0))
+
+        btn_frame = tk.Frame(ctrl_card, bg=TH["card"])
+        btn_frame.pack(fill="x", padx=12, pady=(0, 6))
+        RoundedButton(btn_frame, text="CONNECT",
+                      command=self._ham_start_bridge).pack(side="left", padx=(0, 6))
+        RoundedButton(btn_frame, text="DISCONNECT",
+                      command=self._ham_stop_bridge).pack(side="left")
+
+        # Signal activity histogram
+        tk.Label(ctrl_card, text="SIGNAL ACTIVITY", bg=TH["card"], fg=TH["fg2"],
+                 font=(_FONTS["mono"], 7, "bold")).pack(anchor="w", padx=12, pady=(2, 0))
+        self._ham_signal_canvas = tk.Canvas(ctrl_card, bg=TH["input"], height=40,
+                                             highlightthickness=0)
+        self._ham_signal_canvas.pack(fill="x", padx=12, pady=(2, 8))
+        self._ham_signal_history = []
+
+        # Base Station editor
+        bs_card = tk.Frame(base_tab, bg=TH["card"], highlightthickness=1,
+                            highlightbackground=TH["border"])
+        bs_card.pack(fill="both", expand=True)
+
+        bs_hdr = tk.Frame(bs_card, bg=TH["card"])
+        bs_hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(bs_hdr, text="BASE STATION", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(side="left")
+        self._ham_bs_status = tk.Label(bs_hdr, text="", bg=TH["card"],
+                                        fg=TH["fg_dim"], font=TH["font_xs"])
+        self._ham_bs_status.pack(side="right")
+        tk.Frame(bs_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 6))
+
+        bs_name_row = tk.Frame(bs_card, bg=TH["card"])
+        bs_name_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(bs_name_row, text="Name:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_bs_name_var = tk.StringVar(value="Home Station")
+        tk.Entry(bs_name_row, textvariable=self._ham_bs_name_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=20).pack(side="left", padx=(4, 0))
+
+        bs_coord_row = tk.Frame(bs_card, bg=TH["card"])
+        bs_coord_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(bs_coord_row, text="Lat:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_bs_lat_var = tk.StringVar(value="0.000000")
+        tk.Entry(bs_coord_row, textvariable=self._ham_bs_lat_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=12).pack(side="left", padx=(4, 8))
+        tk.Label(bs_coord_row, text="Lon:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_bs_lon_var = tk.StringVar(value="0.000000")
+        tk.Entry(bs_coord_row, textvariable=self._ham_bs_lon_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=12).pack(side="left", padx=(4, 0))
+
+        bs_btn_row = tk.Frame(bs_card, bg=TH["card"])
+        bs_btn_row.pack(fill="x", padx=12, pady=(4, 10))
+        RoundedButton(bs_btn_row, text="SAVE",
+                      command=self._ham_save_base_station).pack(side="left", padx=(0, 6))
+        RoundedButton(bs_btn_row, text="LOAD DEVICE GPS",
+                      command=self._ham_load_device_gps).pack(side="left")
+
+        self._ham_load_aprs_config()
+
+        # Search & filter
+        search_card = tk.Frame(search_tab, bg=TH["card"], highlightthickness=1,
+                                highlightbackground=TH["border"])
+        search_card.pack(fill="both", expand=True)
+        tk.Label(search_card, text="SEARCH & FILTER", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        tk.Frame(search_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 6))
+
+        center_row = tk.Frame(search_card, bg=TH["card"])
+        center_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(center_row, text="Center:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_search_lat_var = tk.StringVar()
+        tk.Entry(center_row, textvariable=self._ham_search_lat_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=11).pack(side="left", padx=(4, 4))
+        tk.Label(center_row, text=",", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_search_lon_var = tk.StringVar()
+        tk.Entry(center_row, textvariable=self._ham_search_lon_var, bg=TH["input"],
+                 fg=TH["fg"], insertbackground=TH["fg"], font=TH["font_mono"],
+                 relief="flat", width=11).pack(side="left", padx=(4, 0))
+
+        radius_row = tk.Frame(search_card, bg=TH["card"])
+        radius_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(radius_row, text="Radius:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_radius_var = tk.IntVar(value=100)
+        self._ham_radius_scale = tk.Scale(
+            radius_row, from_=5, to=500, orient="horizontal",
+            variable=self._ham_radius_var, bg=TH["card"], fg=TH["fg"],
+            troughcolor=TH["input"], highlightthickness=0,
+            font=TH["font_xs"], length=140, showvalue=False)
+        self._ham_radius_scale.pack(side="left", padx=(4, 4))
+        self._ham_radius_label = tk.Label(radius_row, text="100 mi", bg=TH["card"],
+                                           fg=TH["fg2"], font=TH["font_mono"])
+        self._ham_radius_label.pack(side="left")
+        self._ham_radius_scale.config(command=self._ham_on_radius_change)
+
+        search_btn_row = tk.Frame(search_card, bg=TH["card"])
+        search_btn_row.pack(fill="x", padx=12, pady=(4, 10))
+        RoundedButton(search_btn_row, text="GO TO",
+                      command=self._ham_search_go).pack(side="left", padx=(0, 6))
+        RoundedButton(search_btn_row, text="FILTER",
+                      command=self._ham_filter_by_radius).pack(side="left", padx=(0, 6))
+        RoundedButton(search_btn_row, text="SHOW ALL",
+                      command=self._ham_show_all_stations).pack(side="left")
+
+        # Station list (below tabs, always visible)
+        station_src_frame = tk.Frame(left, bg=TH["card"], highlightthickness=1,
+                                      highlightbackground=TH["border"])
+        station_src_frame.pack(fill="both", expand=True, pady=(6, 0))
+
+        station_hdr = tk.Frame(station_src_frame, bg=TH["card"])
+        station_hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(station_hdr, text="STATION LIST", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(side="left")
+
+        # BASE / SEARCH source checkboxes
+        self._ham_station_source = tk.StringVar(value="base")
+        src_row = tk.Frame(station_src_frame, bg=TH["card"])
+        src_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Radiobutton(src_row, text="BASE", variable=self._ham_station_source,
+                        value="base", bg=TH["card"], fg=TH["fg"],
+                        selectcolor=TH["input"], activebackground=TH["card"],
+                        activeforeground=TH["fg"], font=TH["font_sm"],
+                        command=self._ham_apply_station_source).pack(side="left", padx=(0, 8))
+        tk.Radiobutton(src_row, text="SEARCH", variable=self._ham_station_source,
+                        value="search", bg=TH["card"], fg=TH["fg"],
+                        selectcolor=TH["input"], activebackground=TH["card"],
+                        activeforeground=TH["fg"], font=TH["font_sm"],
+                        command=self._ham_apply_station_source).pack(side="left")
+
+        station_card = station_src_frame
+        tk.Frame(station_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 4))
+
+        tree_frame = tk.Frame(station_card, bg=TH["card"])
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        tree_cols = ("callsign", "lat", "lon", "dist", "comment", "last_heard")
+        self._ham_tree = ttk.Treeview(tree_frame, columns=tree_cols, show="headings",
+                                       height=8)
+        for col, hdr_text, w in [
+            ("callsign", "Callsign", 90), ("lat", "Lat", 70), ("lon", "Lon", 70),
+            ("dist", "Dist (mi)", 60), ("comment", "Comment", 110), ("last_heard", "Last Heard", 90),
+        ]:
+            self._ham_tree.heading(col, text=hdr_text)
+            self._ham_tree.column(col, width=w, minwidth=40)
+        self._ham_tree.pack(side="left", fill="both", expand=True)
+        sb = self._scrollbar(tree_frame, command=self._ham_tree.yview)
+        self._ham_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+
+        self._ham_tree.bind("<<TreeviewSelect>>", self._ham_on_station_select)
+        self._ham_tree.bind("<Double-1>", self._ham_station_inline_edit)
+        self._ham_station_info = tk.Label(station_card, text="0 stations heard",
+                                           bg=TH["card"], fg=TH["fg2"], font=TH["font_xs"])
+        self._ham_station_info.pack(anchor="w", padx=12, pady=(0, 8))
+
+        # ── Right column: Map + Packet Log ──
+        right = tk.Frame(cols, bg=TH["bg"])
+        right.grid(row=0, column=1, sticky="nsew")
+
+        map_card = tk.Frame(right, bg=TH["card"], highlightthickness=1,
+                             highlightbackground=TH["border"])
+        map_card.pack(fill="both", expand=True, pady=(0, 6))
+        map_hdr = tk.Frame(map_card, bg=TH["card"])
+        map_hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(map_hdr, text="APRS MAP", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(side="left")
+        self._ham_map_info = tk.Label(map_hdr, text="", bg=TH["card"],
+                                       fg=TH["fg2"], font=TH["font_xs"])
+        self._ham_map_info.pack(side="right")
+
+        RoundedButton(map_hdr, text=" + ",
+                      command=lambda: self._ham_zoom_step(1)).pack(side="right", padx=(4, 0))
+        RoundedButton(map_hdr, text=" \u2013 ",
+                      command=lambda: self._ham_zoom_step(-1)).pack(side="right", padx=(4, 0))
+        RoundedButton(map_hdr, text="CENTER GPS",
+                      command=self._ham_center_gps).pack(side="right", padx=(4, 0))
+
+        if _HAS_MAP_EMBED:
+            self._ham_map_embedder = TileMapRenderer()
+            self._ham_map_embedder.set_redraw_callback(self._ham_draw_map)
+            self._ham_map_embedder.set_fallback_callback(
+                self._on_tile_fallback)
+            self._ham_embed_active = False
+            self._ham_tile_mode = "street"
+            self._ham_tile_btn = RoundedButton(
+                map_hdr, text="SATELLITE",
+                command=self._ham_toggle_tile_mode)
+            self._ham_tile_btn.pack(side="right", padx=(4, 0))
+            self._ham_embed_btn = RoundedButton(
+                map_hdr, text="EMBED MAP",
+                command=self._ham_toggle_embed)
+            self._ham_embed_btn.pack(side="right", padx=(6, 0))
+
+        tk.Frame(map_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 4))
+
+        ham_loc_row = tk.Frame(map_card, bg=TH["card"])
+        ham_loc_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(ham_loc_row, text="Location:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._ham_loc_combo = ttk.Combobox(ham_loc_row, state="readonly", width=30)
+        self._ham_loc_combo.pack(side="left", padx=(4, 8))
+        self._ham_loc_combo.bind("<<ComboboxSelected>>", self._ham_go_to_location)
+        self._populate_location_combo(self._ham_loc_combo)
+        RoundedButton(ham_loc_row, text="MANAGE",
+                      command=lambda: self._open_location_manager(
+                          on_change_callback=self._ham_on_locations_changed)
+                      ).pack(side="left")
+
+        map_container = tk.Frame(map_card, bg=TH["input"])
+        map_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._ham_canvas = tk.Canvas(map_container, bg=TH["input"], highlightthickness=0)
+        self._ham_canvas.pack(fill="both", expand=True)
+        self._ham_canvas.bind("<Configure>", lambda e: self._ham_draw_map())
+        self._ham_canvas.bind("<Button-1>", self._ham_map_click)
+        self._ham_canvas.bind("<ButtonPress-3>", self._ham_pan_start)
+        self._ham_canvas.bind("<B3-Motion>", self._ham_pan_move)
+        self._ham_canvas.bind("<ButtonRelease-3>", self._ham_pan_end)
+        self._ham_canvas.bind("<MouseWheel>", self._ham_zoom_event)
+        self._ham_canvas.bind("<Button-4>", self._ham_zoom_event)
+        self._ham_canvas.bind("<Button-5>", self._ham_zoom_event)
+
+        # Packet log
+        log_card = tk.Frame(right, bg=TH["card"], highlightthickness=1,
+                             highlightbackground=TH["border"])
+        log_card.pack(fill="x")
+        log_hdr = tk.Frame(log_card, bg=TH["card"])
+        log_hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(log_hdr, text="RAW PACKETS", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(side="left")
+        RoundedButton(log_hdr, text="CLEAR",
+                      command=self._ham_clear_log).pack(side="right")
+        tk.Frame(log_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 4))
+
+        log_wrap = tk.Frame(log_card, bg=TH["card"])
+        log_wrap.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self._ham_log_box = self._text_widget(log_wrap, font=(_FONTS["mono"], 9),
+                                               state="disabled", wrap="word", height=6)
+        lsb = self._scrollbar(log_wrap, command=self._ham_log_box.yview)
+        self._ham_log_box.configure(yscrollcommand=lsb.set)
+        self._ham_log_box.pack(side="left", fill="both", expand=True)
+        lsb.pack(side="right", fill="y")
+
+        self._ham_log_box.tag_configure("alert", foreground=TH["red"],
+                                         font=(_FONTS["mono"], 9, "bold"))
+        self._ham_log_box.tag_configure("ok", foreground=TH["green"])
+        self._ham_log_box.tag_configure("ts", foreground=TH["fg_dim"])
+        self._ham_log_box.tag_configure("info", foreground=TH["fg2"])
+        self._ham_log_box.tag_configure("packet", foreground=TH["yellow"])
+
+        # Auto-embed map on load
+        if _HAS_MAP_EMBED:
+            self.after(300, lambda: (
+                self._ham_map_embedder.activate(),
+                setattr(self, "_ham_embed_active", True),
+                self._ham_draw_map(),
+            ))
+            self.after(350, lambda: self._try_update_embed_btn(
+                "_ham_embed_btn", "DETACH MAP"))
+
+    def _try_update_embed_btn(self, attr, text):
+        btn = getattr(self, attr, None)
+        if btn:
+            try:
+                btn._text = text
+                btn._draw(btn._bg)
+            except Exception:
+                pass
+
+    # ── HAM helpers ──
+
+    def _ham_log_packet(self, msg, tag="info"):
         ts = datetime.now().strftime("%H:%M:%S")
-        self._geof_log.config(state="normal")
-        self._geof_log.insert("end", f"[{ts}] {msg}\n")
-        self._geof_log.see("end")
-        self._geof_log.config(state="disabled")
+        self._ham_log_box.config(state="normal")
+        self._ham_log_box.insert("end", f"[{ts}] ", "ts")
+        self._ham_log_box.insert("end", f"{msg}\n", tag)
+        self._ham_log_box.see("end")
+        self._ham_log_box.config(state="disabled")
+
+    def _ham_clear_log(self):
+        self._ham_log_box.config(state="normal")
+        self._ham_log_box.delete("1.0", "end")
+        self._ham_log_box.config(state="disabled")
+
+    def _ham_record_signal(self):
+        self._ham_signal_history.append(time.time())
+        cutoff = time.time() - 300
+        self._ham_signal_history = [t for t in self._ham_signal_history if t > cutoff]
+        self._ham_draw_signal_histogram()
+
+    def _ham_draw_signal_histogram(self):
+        c = self._ham_signal_canvas
+        c.delete("all")
+        cw = c.winfo_width() or 200
+        ch = c.winfo_height() or 40
+        num_bars = 30
+        bar_w = max(cw / num_bars, 2)
+        now = time.time()
+        window = 300
+        counts = [0] * num_bars
+        for t in self._ham_signal_history:
+            age = now - t
+            idx = int((1 - age / window) * num_bars)
+            if 0 <= idx < num_bars:
+                counts[idx] += 1
+        max_c = max(max(counts), 1)
+        for i, cnt in enumerate(counts):
+            h = (cnt / max_c) * (ch - 4)
+            x = i * bar_w
+            color = TH["green"] if cnt > 0 else "#1a1a1a"
+            c.create_rectangle(x + 1, ch - h, x + bar_w - 1, ch,
+                               fill=color, outline="")
+
+    # ── HAM Base Station config ──
+
+    def _ham_load_aprs_config(self):
+        try:
+            if os.path.isfile(self.APRS_CONFIG_PATH):
+                with open(self.APRS_CONFIG_PATH, "r") as fh:
+                    cfg = json.load(fh)
+                bs = cfg.get("base_station", {})
+                if bs.get("name"):
+                    self._ham_bs_name_var.set(bs["name"])
+                if bs.get("callsign"):
+                    self._ham_callsign_var.set(bs["callsign"])
+                if "lat" in bs:
+                    self._ham_bs_lat_var.set(f"{bs['lat']:.6f}")
+                if "lon" in bs:
+                    self._ham_bs_lon_var.set(f"{bs['lon']:.6f}")
+                if "lat" in bs and "lon" in bs:
+                    self._ham_map_center = (bs["lat"], bs["lon"])
+                    self._ham_pan_offset = [0.0, 0.0]
+                self._ham_bs_status.config(text="Loaded", fg=TH["green"])
+                return
+        except (json.JSONDecodeError, IOError):
+            pass
+        self._ham_load_device_gps_silent()
+
+    def _ham_load_device_gps_silent(self):
+        dev_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "config", "device_locations.json")
+        dev_path = os.path.normpath(dev_path)
+        try:
+            if os.path.isfile(dev_path):
+                with open(dev_path, "r") as fh:
+                    data = json.load(fh)
+                ref = data.get("reference_point", {})
+                if ref.get("lat") and ref.get("lon"):
+                    self._ham_bs_lat_var.set(f"{ref['lat']:.6f}")
+                    self._ham_bs_lon_var.set(f"{ref['lon']:.6f}")
+                    locality = ref.get("locality", "")
+                    if locality and self._ham_bs_name_var.get() == "Home Station":
+                        self._ham_bs_name_var.set(locality)
+                    self._ham_bs_status.config(text="From device GPS", fg=TH["yellow"])
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    def _ham_load_device_gps(self):
+        self._ham_load_device_gps_silent()
+        try:
+            lat = float(self._ham_bs_lat_var.get().strip())
+            lon = float(self._ham_bs_lon_var.get().strip())
+            if lat != 0.0 or lon != 0.0:
+                self._ham_pan_offset = [0.0, 0.0]
+                self._ham_map_center = (lat, lon)
+                self._ham_search_lat_var.set(f"{lat:.6f}")
+                self._ham_search_lon_var.set(f"{lon:.6f}")
+        except ValueError:
+            pass
+        self._ham_draw_map()
+        self._ham_log_packet("Base station coords loaded from device_locations.json", "info")
+        if self._ham_stations:
+            self._ham_filter_by_radius()
+            self._ham_log_packet("Auto-filtered stations to base station radius", "info")
+
+    def _ham_save_base_station(self):
+        name = self._ham_bs_name_var.get().strip()
+        callsign = self._ham_callsign_var.get().strip()
+        try:
+            lat = float(self._ham_bs_lat_var.get().strip())
+            lon = float(self._ham_bs_lon_var.get().strip())
+        except ValueError:
+            self._ham_log_packet("Invalid base station coordinates", "alert")
+            return
+        if not (-90 <= lat <= 90):
+            self._ham_log_packet(f"Latitude {lat} out of range (-90 to 90)", "alert")
+            return
+        if not (-180 <= lon <= 180):
+            self._ham_log_packet(f"Longitude {lon} out of range (-180 to 180)", "alert")
+            return
+        cfg = {}
+        try:
+            if os.path.isfile(self.APRS_CONFIG_PATH):
+                with open(self.APRS_CONFIG_PATH, "r") as fh:
+                    cfg = json.load(fh)
+        except (json.JSONDecodeError, IOError):
+            pass
+        cfg["base_station"] = {
+            "name": name or "Home Station",
+            "callsign": callsign,
+            "lat": lat,
+            "lon": lon,
+        }
+        os.makedirs(os.path.dirname(self.APRS_CONFIG_PATH), exist_ok=True)
+        with open(self.APRS_CONFIG_PATH, "w") as fh:
+            json.dump(cfg, fh, indent=2)
+        self._ham_bs_status.config(text="Saved", fg=TH["green"])
+        self._ham_pan_offset = [0.0, 0.0]
+        self._ham_map_center = (lat, lon)
+        self._ham_draw_map()
+        self._ham_log_packet(
+            f"Base station saved: {name} ({lat:.4f}, {lon:.4f})", "ok")
+
+    def _ham_get_base_station(self):
+        try:
+            lat = float(self._ham_bs_lat_var.get().strip())
+            lon = float(self._ham_bs_lon_var.get().strip())
+            if lat == 0.0 and lon == 0.0:
+                return None
+            return {
+                "name": self._ham_bs_name_var.get().strip() or "Base",
+                "lat": lat, "lon": lon,
+            }
+        except (ValueError, AttributeError):
+            return None
+
+    def _ham_refresh_tree(self):
+        for item in self._ham_tree.get_children():
+            self._ham_tree.delete(item)
+        now = time.time()
+        bs = self._ham_get_base_station()
+        visible = getattr(self, "_ham_filtered_stations", None)
+        for cs, s in sorted(self._ham_stations.items()):
+            if visible is not None and cs not in visible:
+                continue
+            ls = s.get("last_seen", 0)
+            if ls == 0:
+                heard = "Never"
+            else:
+                age = now - ls
+                if age < 60:
+                    heard = f"{int(age)}s ago"
+                elif age < 3600:
+                    heard = f"{int(age / 60)}m ago"
+                else:
+                    heard = datetime.fromtimestamp(ls).strftime("%H:%M:%S")
+            dist_str = ""
+            if bs and s.get("lat") and s.get("lon"):
+                d = self._haversine_miles(bs["lat"], bs["lon"], s["lat"], s["lon"])
+                dist_str = f"{d:.1f}"
+            self._ham_tree.insert("", "end", iid=cs, values=(
+                cs, f"{s.get('lat', 0):.4f}", f"{s.get('lon', 0):.4f}",
+                dist_str, s.get("comment", ""), heard))
+        shown = len(self._ham_tree.get_children())
+        total = len(self._ham_stations)
+        if visible is not None and shown < total:
+            self._ham_station_info.config(
+                text=f"{shown}/{total} stations (filtered)")
+        else:
+            self._ham_station_info.config(
+                text=f"{total} stations heard")
+
+    def _ham_go_to_location(self, event=None):
+        val = self._ham_loc_combo.get()
+        if not val:
+            return
+        locs = self._load_locations()
+        for loc in locs:
+            tag = f"{loc['name']} ({loc['lat']:.4f}, {loc['lon']:.4f})"
+            if val == tag:
+                self._ham_pan_offset = [0.0, 0.0]
+                self._ham_map_zoom = 0.0
+                if hasattr(self, "_ham_map_center"):
+                    self._ham_map_center = [loc["lat"], loc["lon"]]
+                self._ham_draw_map()
+                self._ham_log_packet(f"Jumped to {loc['name']}", "ok")
+                break
+
+    def _ham_on_locations_changed(self):
+        self._populate_location_combo(self._ham_loc_combo)
+        self._ham_draw_map()
+
+    def _ham_draw_map(self):
+        c = self._ham_canvas
+        c.delete("all")
+        cw = c.winfo_width()
+        ch = c.winfo_height()
+        if cw < 80 or ch < 80:
+            return
+
+        pad = 40
+        all_pts = []
+        bs = self._ham_get_base_station()
+        if bs:
+            all_pts.append([bs["lat"], bs["lon"]])
+        vis = getattr(self, "_ham_filtered_stations", None)
+        for cs, s in self._ham_stations.items():
+            if s.get("lat") and s.get("lon"):
+                if vis is None or cs in vis:
+                    all_pts.append([s["lat"], s["lon"]])
+
+        if not all_pts:
+            c.create_text(cw // 2, ch // 2, text="No APRS stations received",
+                          fill=TH["fg_dim"], font=(_FONTS["ui"], 12))
+            self._ham_to_px = None
+            return
+
+        lats = [p[0] for p in all_pts]
+        lons = [p[1] for p in all_pts]
+
+        embed_active = _HAS_MAP_EMBED and getattr(self, "_ham_embed_active", False)
+        if embed_active:
+            to_px = self._ham_map_embedder.draw_tiles(
+                c, lats, lons, cw, ch,
+                zoom_offset=self._ham_map_zoom,
+                pan_offset=self._ham_pan_offset)
+        else:
+            to_px = None
+
+        if to_px is None:
+            min_lat, max_lat = min(lats), max(lats)
+            min_lon, max_lon = min(lons), max(lons)
+            dlat = max_lat - min_lat or 0.001
+            dlon = max_lon - min_lon or 0.001
+            scale = min((cw - 2 * pad) / dlon, (ch - 2 * pad) / dlat)
+            zoom_mult = 2.0 ** self._ham_map_zoom
+            scale *= zoom_mult
+            cx = pad + (dlon / 2.0) * scale
+            cy = pad + (dlat / 2.0) * scale
+            ox, oy = self._ham_pan_offset
+
+            def to_px(lat, lon):
+                x = pad + (lon - min_lon) * scale + ox
+                y = pad + (max_lat - lat) * scale + oy
+                return x, y
+
+        self._ham_to_px = to_px
+        sel = self._ham_selected_station
+        highlight_color = "#e8793a"
+        now = time.time()
+        visible = getattr(self, "_ham_filtered_stations", None)
+
+        for cs, s in self._ham_stations.items():
+            if not s.get("lat") or not s.get("lon"):
+                continue
+            if visible is not None and cs not in visible:
+                continue
+            sx, sy = to_px(s["lat"], s["lon"])
+            age = now - s.get("last_seen", 0) if s.get("last_seen", 0) > 0 else 9999
+            if age > self.APRS_OFFLINE_THRESHOLD:
+                color = TH["red"]
+            elif age > self.APRS_STALE_THRESHOLD:
+                color = TH["yellow"]
+            else:
+                color = TH["green"]
+
+            is_sel = (sel == cs)
+            r = 6
+            if is_sel:
+                c.create_oval(sx - 14, sy - 14, sx + 14, sy + 14,
+                              outline=highlight_color, width=3)
+            c.create_oval(sx - r, sy - r, sx + r, sy + r,
+                          fill=color, outline=highlight_color if is_sel else TH["fg"],
+                          width=2 if is_sel else 1)
+            c.create_text(sx, sy - r - 10, text=cs,
+                          fill=highlight_color if is_sel else TH["fg"],
+                          font=(_FONTS["mono"], 7, "bold"))
+            comment = s.get("comment", "")
+            if comment and is_sel:
+                c.create_text(sx, sy + r + 10, text=comment[:30],
+                              fill=TH["fg2"], font=(_FONTS["mono"], 7))
+
+        # Draw base station marker
+        bs_color = "#00bfff"
+        if bs:
+            bx, by = to_px(bs["lat"], bs["lon"])
+            r = 8
+            c.create_rectangle(bx - r, by - r, bx + r, by + r,
+                               fill=bs_color, outline=TH["fg"], width=2)
+            c.create_line(bx, by - r - 4, bx, by - r, fill=bs_color, width=2)
+            c.create_text(bx, by - r - 12, text=bs["name"],
+                          fill=bs_color, font=(_FONTS["mono"], 8, "bold"))
+            c.create_text(bx, by + r + 8,
+                          text=f"{bs['lat']:.4f}, {bs['lon']:.4f}",
+                          fill=TH["fg_dim"], font=(_FONTS["mono"], 7))
+
+        # Named location fences
+        self._draw_location_fences_on_canvas(c, to_px)
+
+        bs_label = f" + base" if bs else ""
+        self._ham_map_info.config(
+            text=f"{len(self._ham_stations)} stations{bs_label}")
+
+        # Scale bar
+        if to_px and lats and len(lats) >= 1:
+            ref_lat = lats[0]
+            ref_lon = lons[0]
+            px1_x, _ = to_px(ref_lat, ref_lon)
+            px2_x, _ = to_px(ref_lat, ref_lon + 0.01)
+            px_per_deg = abs(px2_x - px1_x) / 0.01 if abs(px2_x - px1_x) > 0 else 1
+            miles_per_deg = self._haversine_miles(ref_lat, ref_lon, ref_lat, ref_lon + 1.0)
+            target_px = 80
+            scale_miles = (target_px / px_per_deg) * miles_per_deg
+            for nice in [1, 2, 5, 10, 20, 25, 50, 100, 200, 500]:
+                if nice >= scale_miles * 0.7:
+                    scale_miles = nice
+                    break
+            bar_px = int((scale_miles / miles_per_deg) * px_per_deg)
+            bar_px = max(20, min(bar_px, 200))
+            sx, sy = cw - bar_px - 16, ch - 40
+            c.create_line(sx, sy, sx + bar_px, sy, fill=TH["fg"], width=2)
+            c.create_line(sx, sy - 4, sx, sy + 4, fill=TH["fg"], width=1)
+            c.create_line(sx + bar_px, sy - 4, sx + bar_px, sy + 4, fill=TH["fg"], width=1)
+            c.create_text(sx + bar_px // 2, sy - 8, text=f"{scale_miles} mi",
+                          fill=TH["fg"], font=(_FONTS["mono"], 7))
+
+        lx, ly = 10, ch - 20
+        legend = [("Active", TH["green"]), ("Stale", TH["yellow"]),
+                  ("Offline", TH["red"]), ("Selected", highlight_color),
+                  ("Base", bs_color)]
+        for lbl, clr in legend:
+            c.create_oval(lx, ly, lx + 8, ly + 8, fill=clr, outline="")
+            c.create_text(lx + 14, ly + 4, text=lbl, anchor="w",
+                          fill=TH["fg2"], font=(_FONTS["mono"], 7))
+            lx += 70
+
+    def _ham_map_click(self, event):
+        to_px = getattr(self, "_ham_to_px", None)
+        if to_px is None:
+            return
+        hit_radius = 16
+        for cs, s in self._ham_stations.items():
+            if not s.get("lat") or not s.get("lon"):
+                continue
+            sx, sy = to_px(s["lat"], s["lon"])
+            if abs(event.x - sx) < hit_radius and abs(event.y - sy) < hit_radius:
+                self._ham_selected_station = cs
+                if self._ham_tree.exists(cs):
+                    self._ham_tree.selection_set(cs)
+                    self._ham_tree.see(cs)
+                self._ham_draw_map()
+                return
+        self._ham_selected_station = None
+        self._ham_tree.selection_remove(*self._ham_tree.selection())
+        self._ham_draw_map()
+
+    def _ham_on_station_select(self, event):
+        sel = self._ham_tree.selection()
+        if not sel:
+            return
+        self._ham_selected_station = sel[0]
+        self._ham_draw_map()
+
+    def _ham_station_inline_edit(self, event):
+        """Handle double-click on station list for inline lat/lon editing."""
+        row_id = self._ham_tree.identify_row(event.y)
+        col_id = self._ham_tree.identify_column(event.x)
+        if not row_id or not col_id:
+            return
+        col_idx = int(col_id.replace("#", "")) - 1
+        columns = self._ham_tree["columns"]
+        if col_idx < 0 or col_idx >= len(columns):
+            return
+        column = columns[col_idx]
+        if column not in ("lat", "lon", "comment"):
+            return
+        cs = row_id
+        if cs not in self._ham_stations:
+            return
+        s = self._ham_stations[cs]
+        if column == "lat":
+            cur_val = f"{s.get('lat', 0):.4f}"
+        elif column == "lon":
+            cur_val = f"{s.get('lon', 0):.4f}"
+        else:
+            cur_val = s.get("comment", "")
+
+        def _save(new_val):
+            if column in ("lat", "lon"):
+                try:
+                    num = float(new_val)
+                except ValueError:
+                    self._ham_log_packet("Invalid coordinate value", "alert")
+                    return
+                self._ham_stations[cs][column] = num
+            else:
+                self._ham_stations[cs]["comment"] = new_val
+            self._ham_refresh_tree()
+            self._ham_draw_map()
+            self._ham_log_packet(f"Updated {cs} {column}: {new_val}", "ok")
+
+        self._treeview_inline_edit(self._ham_tree, row_id, column, cur_val, _save)
+
+    # ── HAM search / filter ──
+
+    def _ham_on_radius_change(self, val):
+        self._ham_radius_label.config(text=f"{int(float(val))} mi")
+
+    def _ham_search_go(self):
+        try:
+            lat = float(self._ham_search_lat_var.get().strip())
+            lon = float(self._ham_search_lon_var.get().strip())
+        except ValueError:
+            self._ham_log_packet("Enter valid lat, lon to search", "alert")
+            return
+        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            self._ham_log_packet("Coordinates out of range", "alert")
+            return
+        self._ham_bs_lat_var.set(f"{lat:.6f}")
+        self._ham_bs_lon_var.set(f"{lon:.6f}")
+        self._ham_pan_offset = [0.0, 0.0]
+        self._ham_map_center = (lat, lon)
+        self._ham_draw_map()
+        self._ham_refresh_tree()
+        self._ham_log_packet(f"Map centered on ({lat:.4f}, {lon:.4f})", "ok")
+
+    def _ham_filter_by_radius(self):
+        bs = self._ham_get_base_station()
+        if not bs:
+            self._ham_log_packet("Set a base station first", "alert")
+            return
+        radius = self._ham_radius_var.get()
+        filtered = set()
+        for cs, s in self._ham_stations.items():
+            if s.get("lat") and s.get("lon"):
+                d = self._haversine_miles(bs["lat"], bs["lon"], s["lat"], s["lon"])
+                if d <= radius:
+                    filtered.add(cs)
+        self._ham_filtered_stations = filtered
+        self._ham_refresh_tree()
+        self._ham_draw_map()
+        self._ham_log_packet(
+            f"Filtered to {len(filtered)} stations within {radius} mi", "info")
+
+    def _ham_show_all_stations(self):
+        self._ham_filtered_stations = None
+        self._ham_refresh_tree()
+        self._ham_draw_map()
+        self._ham_log_packet("Showing all stations", "info")
+
+    def _ham_apply_station_source(self):
+        source = self._ham_station_source.get()
+        if source == "base":
+            bs = self._ham_get_base_station()
+            if bs:
+                self._ham_pan_offset = [0.0, 0.0]
+                self._ham_map_center = (bs["lat"], bs["lon"])
+                self._ham_filter_by_radius()
+                self._ham_log_packet("Stations filtered near base station", "info")
+            else:
+                self._ham_log_packet("No base station set", "alert")
+        else:
+            try:
+                lat = float(self._ham_search_lat_var.get().strip())
+                lon = float(self._ham_search_lon_var.get().strip())
+            except ValueError:
+                self._ham_log_packet("Enter search coordinates first", "alert")
+                return
+            self._ham_pan_offset = [0.0, 0.0]
+            self._ham_map_center = (lat, lon)
+            self._ham_filter_by_radius()
+            self._ham_log_packet(
+                f"Stations filtered near search ({lat:.4f}, {lon:.4f})", "info")
+
+    def _ham_start_bridge(self):
+        if self._ham_bridge_proc and self._ham_bridge_proc.poll() is None:
+            self._ham_log_packet("Bridge already running", tag="info")
+            return
+        mode = self._ham_mode_var.get()
+        host = self._ham_host_var.get()
+        port = self._ham_port_var.get()
+        callsign = self._ham_callsign_var.get()
+
+        bridge_path = self.APRS_BRIDGE
+        if not os.path.isfile(bridge_path):
+            self._ham_log_packet(f"aprs_bridge.py not found at {bridge_path}", tag="alert")
+            return
+
+        if mode == "simulate":
+            cmd = [sys.executable, bridge_path, "--simulate",
+                   "--callsign", callsign]
+        else:
+            cmd = [sys.executable, bridge_path,
+                   "--host", host, "--port", port,
+                   "--mode", mode, "--callsign", callsign]
+
+        try:
+            self._ham_bridge_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1)
+            self._ham_bridge_status.config(text="\u25cf Running", fg=TH["green"])
+            self._ham_poll_active = True
+            self._ham_log_packet(f"Bridge started ({mode} mode)", tag="ok")
+            threading.Thread(target=self._ham_read_bridge_output, daemon=True).start()
+        except Exception as ex:
+            self._ham_log_packet(f"Failed to start bridge: {ex}", tag="alert")
+
+    def _ham_stop_bridge(self):
+        self._ham_poll_active = False
+        if self._ham_bridge_proc and self._ham_bridge_proc.poll() is None:
+            self._ham_bridge_proc.terminate()
+            self._ham_bridge_proc = None
+            self._ham_bridge_status.config(text="\u25cf Offline", fg=TH["red"])
+            self._ham_log_packet("Bridge stopped", tag="info")
+        else:
+            self._ham_log_packet("Bridge not running", tag="info")
+
+    def _ham_read_bridge_output(self):
+        proc = self._ham_bridge_proc
+        if not proc:
+            return
+        try:
+            for line in proc.stdout:
+                if not self._ham_poll_active:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    pkt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if "error" in pkt:
+                    self.after(0, self._ham_log_packet, f"ERROR: {pkt['error']}", "alert")
+                    continue
+                if "info" in pkt:
+                    self.after(0, self._ham_log_packet, pkt["info"], "info")
+                    continue
+
+                cs = pkt.get("callsign")
+                if not cs:
+                    continue
+
+                raw = pkt.get("raw", "")
+                if raw:
+                    self.after(0, self._ham_log_packet, raw, "packet")
+
+                self._ham_stations[cs] = {
+                    "lat": pkt.get("lat", 0),
+                    "lon": pkt.get("lon", 0),
+                    "comment": pkt.get("comment", ""),
+                    "symbol": pkt.get("symbol", ""),
+                    "path": pkt.get("path", ""),
+                    "last_seen": time.time(),
+                }
+                self.after(0, self._ham_record_signal)
+                self.after(0, self._ham_refresh_tree)
+                self.after(0, self._ham_draw_map)
+        except Exception:
+            pass
+        finally:
+            self.after(0, lambda: self._ham_bridge_status.config(
+                text="\u25cf Offline", fg=TH["red"]))
+
+    # ── HAM Tile Map embed ──
+
+    def _ham_toggle_embed(self):
+        if not _HAS_MAP_EMBED:
+            return
+        if getattr(self, "_ham_embed_active", False):
+            self._ham_map_embedder.deactivate()
+            self._ham_embed_active = False
+            try:
+                self._ham_embed_btn._text = "EMBED MAP"
+                self._ham_embed_btn._draw(self._ham_embed_btn._bg)
+            except Exception:
+                pass
+            self._ham_draw_map()
+            self._ham_log_packet("Tile map disabled", "info")
+        else:
+            self._ham_map_embedder.activate()
+            self._ham_embed_active = True
+            try:
+                self._ham_embed_btn._text = "DETACH MAP"
+                self._ham_embed_btn._draw(self._ham_embed_btn._bg)
+            except Exception:
+                pass
+            self._ham_draw_map()
+            self._ham_log_packet("Offline tile map enabled", "ok")
+
+    # ── HAM pan / zoom ──
+
+    def _ham_pan_start(self, event):
+        self._ham_pan_drag = {"active": True, "sx": event.x, "sy": event.y,
+                               "ox": self._ham_pan_offset[0],
+                               "oy": self._ham_pan_offset[1]}
+
+    def _ham_pan_move(self, event):
+        pd = self._ham_pan_drag
+        if pd.get("active"):
+            self._ham_pan_offset[0] = pd["ox"] + (event.x - pd["sx"])
+            self._ham_pan_offset[1] = pd["oy"] + (event.y - pd["sy"])
+            self._ham_draw_map()
+
+    def _ham_pan_end(self, event):
+        self._ham_pan_drag["active"] = False
+
+    def _ham_zoom_event(self, event):
+        if event.num == 4 or (hasattr(event, "delta") and event.delta > 0):
+            self._ham_map_zoom = min(self._ham_map_zoom + 0.25, 4.0)
+        elif event.num == 5 or (hasattr(event, "delta") and event.delta < 0):
+            self._ham_map_zoom = max(self._ham_map_zoom - 0.25, -2.0)
+        self._ham_draw_map()
+
+    def _ham_zoom_step(self, direction):
+        if direction > 0:
+            self._ham_map_zoom = min(self._ham_map_zoom + 0.5, 4.0)
+        else:
+            self._ham_map_zoom = max(self._ham_map_zoom - 0.5, -2.0)
+        self._ham_draw_map()
+
+    def _ham_center_gps(self):
+        ref_lat, ref_lon = self._get_device_gps_reference()
+        self._ham_pan_offset = [0.0, 0.0]
+        self._ham_map_zoom = 0.0
+        self._ham_map_center = (ref_lat, ref_lon)
+        self._ham_bs_lat_var.set(f"{ref_lat:.6f}")
+        self._ham_bs_lon_var.set(f"{ref_lon:.6f}")
+        self._ham_draw_map()
+        self._ham_log_packet(f"Centered on device GPS ({ref_lat:.4f}, {ref_lon:.4f})", "ok")
+
+    def _ham_toggle_tile_mode(self):
+        if not _HAS_MAP_EMBED:
+            return
+        if self._ham_tile_mode == "street":
+            self._ham_tile_mode = "satellite"
+            self._ham_map_embedder.set_tile_mode("satellite")
+            try:
+                self._ham_tile_btn._text = "STREET"
+                self._ham_tile_btn._draw(self._ham_tile_btn._bg)
+            except Exception:
+                pass
+            self._ham_log_packet("Switched to satellite view", "ok")
+        else:
+            self._ham_tile_mode = "street"
+            self._ham_map_embedder.set_tile_mode("street")
+            try:
+                self._ham_tile_btn._text = "SATELLITE"
+                self._ham_tile_btn._draw(self._ham_tile_btn._bg)
+            except Exception:
+                pass
+            self._ham_log_packet("Switched to street view", "ok")
+
+    # ==================== AVATAR TAB ====================
+    _AVATAR_PORT = 8095
+    _AVATAR_VIEWER_DIR = os.path.dirname(os.path.realpath(__file__))
+    _AVATAR_VRM_DIR = os.path.expanduser("~/.openclaw/avatars")
+
+    def build_avatar(self):
+        f = self.tabs["avatar"]
+        self._avatar_server_running = False
+        self._avatar_http_proc = None
+
+        os.makedirs(self._AVATAR_VRM_DIR, exist_ok=True)
+
+        # Header
+        header = tk.Frame(f, bg=TH["bg"])
+        header.pack(fill="x", padx=12, pady=(10, 0))
+        tk.Label(header, text="AVATAR \u2014 TALKING HEAD",
+                 font=TH["font_title"], fg=TH["btn"], bg=TH["bg"]).pack(side="left")
+        self._avatar_status = tk.Label(header, text="", font=TH["font_sm"],
+                                       fg=TH["fg_dim"], bg=TH["bg"])
+        self._avatar_status.pack(side="right")
+
+        desc = tk.Label(f, text="Load a .vrm model and watch it lip-sync to Whim's voice output",
+                        bg=TH["bg"], fg=TH["fg2"], font=TH["font_sm"])
+        desc.pack(anchor="w", padx=12, pady=(4, 8))
+
+        # Controls
+        ctrl_card = tk.Frame(f, bg=TH["card"], highlightthickness=1,
+                             highlightbackground=TH["border"])
+        ctrl_card.pack(fill="x", padx=12, pady=(0, 6))
+
+        ctrl_row = tk.Frame(ctrl_card, bg=TH["card"])
+        ctrl_row.pack(fill="x", padx=12, pady=10)
+
+        RoundedButton(ctrl_row, text="START SERVER",
+                      command=self._avatar_start_server).pack(side="left", padx=(0, 6))
+        RoundedButton(ctrl_row, text="STOP SERVER",
+                      command=self._avatar_stop_server).pack(side="left", padx=(0, 6))
+        RoundedButton(ctrl_row, text="OPEN VIEWER",
+                      command=self._avatar_open_viewer).pack(side="left", padx=(0, 6))
+        RoundedButton(ctrl_row, text="TEST ANIMATION",
+                      command=self._avatar_test).pack(side="left", padx=(0, 6))
+
+        tk.Frame(ctrl_row, width=20, bg=TH["card"]).pack(side="left")
+
+        tk.Label(ctrl_row, text="VRM:", font=TH["font_sm"],
+                 fg=TH["fg2"], bg=TH["card"]).pack(side="left")
+        self._avatar_vrm_var = tk.StringVar(value="(none loaded)")
+        tk.Label(ctrl_row, textvariable=self._avatar_vrm_var, font=TH["font_mono"],
+                 fg=TH["fg"], bg=TH["card"]).pack(side="left", padx=(4, 8))
+        RoundedButton(ctrl_row, text="LOAD VRM",
+                      command=self._avatar_load_vrm).pack(side="left")
+
+        # Port / URL info
+        info_card = tk.Frame(f, bg=TH["card"], highlightthickness=1,
+                             highlightbackground=TH["border"])
+        info_card.pack(fill="x", padx=12, pady=(0, 6))
+
+        info_row = tk.Frame(info_card, bg=TH["card"])
+        info_row.pack(fill="x", padx=12, pady=8)
+        tk.Label(info_row, text="WebSocket:", font=TH["font_sm"],
+                 fg=TH["fg2"], bg=TH["card"]).pack(side="left")
+        self._avatar_ws_lbl = tk.Label(info_row,
+                                       text=f"ws://localhost:{self._AVATAR_PORT}",
+                                       font=TH["font_mono"], fg=TH["green"], bg=TH["card"])
+        self._avatar_ws_lbl.pack(side="left", padx=(4, 16))
+        tk.Label(info_row, text="Viewer:", font=TH["font_sm"],
+                 fg=TH["fg2"], bg=TH["card"]).pack(side="left")
+        self._avatar_viewer_port = 8096
+        self._avatar_viewer_lbl = tk.Label(
+            info_row,
+            text=f"http://localhost:{self._avatar_viewer_port}/avatar_viewer.html",
+            font=TH["font_mono"], fg=TH["green"], bg=TH["card"])
+        self._avatar_viewer_lbl.pack(side="left", padx=(4, 0))
+
+        # Viseme monitor
+        vis_card = tk.Frame(f, bg=TH["card"], highlightthickness=1,
+                            highlightbackground=TH["border"])
+        vis_card.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+
+        tk.Label(vis_card, text="VISEME MONITOR", font=(_FONTS["ui"], 10, "bold"),
+                 fg=TH["btn"], bg=TH["card"]).pack(anchor="w", padx=12, pady=(10, 4))
+        tk.Frame(vis_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 6))
+
+        self._avatar_vis_canvas = tk.Canvas(vis_card, bg=TH["input"],
+                                            height=120, highlightthickness=0)
+        self._avatar_vis_canvas.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._avatar_vis_canvas.create_text(
+            300, 60, text="Start the avatar server to see viseme data",
+            fill=TH["fg_dim"], font=TH["font_sm"], anchor="center")
+
+        # Log
+        log_card = tk.Frame(f, bg=TH["card"], highlightthickness=1,
+                            highlightbackground=TH["border"])
+        log_card.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        tk.Label(log_card, text="LOG", font=(_FONTS["ui"], 10, "bold"),
+                 fg=TH["btn"], bg=TH["card"]).pack(anchor="w", padx=12, pady=(10, 4))
+        tk.Frame(log_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=10, pady=(0, 4))
+        log_inner = tk.Frame(log_card, bg=TH["card"])
+        log_inner.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._avatar_log = self._text_widget(log_inner, fg=TH["fg2"], state="disabled")
+        avatar_sb = self._scrollbar(log_inner, command=self._avatar_log.yview)
+        self._avatar_log.configure(yscrollcommand=avatar_sb.set)
+        self._avatar_log.pack(side="left", fill="both", expand=True)
+        avatar_sb.pack(side="right", fill="y")
+
+    def _avatar_log_msg(self, msg):
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._avatar_log.config(state="normal")
+        self._avatar_log.insert("end", f"[{ts}] {msg}\n")
+        self._avatar_log.see("end")
+        self._avatar_log.config(state="disabled")
+
+    def _avatar_start_server(self):
+        if self._avatar_server_running:
+            self._avatar_log_msg("Avatar server already running.")
+            return
+        try:
+            _avatar_start(port=self._AVATAR_PORT)
+            self._avatar_server_running = True
+            self._avatar_status.config(text="\u25cf Online", fg=TH["green"])
+            self._avatar_log_msg(f"Viseme WebSocket started on port {self._AVATAR_PORT}")
+        except Exception as e:
+            self._avatar_log_msg(f"Failed to start server: {e}")
+
+        # Start a simple HTTP server to serve the viewer HTML and VRM files
+        self._avatar_start_http()
+
+    def _avatar_start_http(self):
+        """Spin up a tiny HTTP server for the avatar viewer + VRM files."""
+        import subprocess as sp
+        if self._avatar_http_proc is not None:
+            return
+        viewer_dir = self._AVATAR_VIEWER_DIR
+        try:
+            self._avatar_http_proc = sp.Popen(
+                [sys.executable, "-m", "http.server",
+                 str(self._avatar_viewer_port), "--bind", "0.0.0.0",
+                 "--directory", viewer_dir],
+                stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            self._avatar_log_msg(
+                f"HTTP viewer on http://localhost:{self._avatar_viewer_port}/avatar_viewer.html")
+        except Exception as e:
+            self._avatar_log_msg(f"HTTP server failed: {e}")
+
+    def _avatar_stop_server(self):
+        self._avatar_server_running = False
+        self._avatar_status.config(text="\u25cf Offline", fg=TH["red"])
+        self._avatar_log_msg("Avatar server stopped.")
+        if self._avatar_http_proc:
+            try:
+                self._avatar_http_proc.terminate()
+            except Exception:
+                pass
+            self._avatar_http_proc = None
+
+    def _avatar_open_viewer(self):
+        import webbrowser
+        url = f"http://localhost:{self._avatar_viewer_port}/avatar_viewer.html?port={self._AVATAR_PORT}"
+        webbrowser.open(url)
+        self._avatar_log_msg(f"Opened viewer in browser: {url}")
+
+    def _avatar_test(self):
+        """Send a test animation through the viseme server."""
+        if not self._avatar_server_running:
+            self._avatar_log_msg("Start the server first.")
+            return
+        import asyncio as _aio
+        from avatar_server import _loop, _broadcast
+        if _loop is None:
+            self._avatar_log_msg("Server event loop not ready.")
+            return
+        import math as _m
+        frames = []
+        for i in range(90):
+            t = i / 90.0
+            v = abs(_m.sin(t * _m.pi * 6))
+            frames.append({
+                "A": round(v * 0.9, 3),
+                "I": round(v * 0.3, 3),
+                "U": round(v * 0.15, 3),
+                "E": round(v * 0.5, 3),
+                "O": round(v * 0.25, 3),
+            })
+
+        async def _run():
+            from avatar_server import _stream_visemes
+            await _stream_visemes(frames)
+
+        _aio.run_coroutine_threadsafe(_run(), _loop)
+        self._avatar_log_msg("Sent test animation (90 frames).")
+
+    def _avatar_load_vrm(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select VRM Model",
+            filetypes=[("VRM Models", "*.vrm"), ("All files", "*.*")],
+            initialdir=self._AVATAR_VRM_DIR)
+        if not path:
+            return
+        import shutil
+        dest = os.path.join(self._AVATAR_VIEWER_DIR, "avatar", "default.vrm")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(path, dest)
+        self._avatar_vrm_var.set(os.path.basename(path))
+        self._avatar_log_msg(f"Loaded VRM: {os.path.basename(path)} (restart viewer to apply)")
 
     # ==================== SYNC TAB ====================
     def build_sync(self):
@@ -12745,13 +19681,2280 @@ camFlipBtn.addEventListener('click',()=>{
         self._sync_engine.watch_mirror(host, callback=_on_mirror)
         self._sync_mirror_var.set(f"Watching {host}...")
 
-    def build_settings(self):
-        f = self.tabs["settings"]
+    # ==================== NODEFLOW TAB ====================
+
+    _NF_NODE_W = 180
+    _NF_NODE_H = 100
+    _NF_HANDLE_R = 5
+    _NF_NODE_COLORS = {
+        "brain":     {"bg": "#2a1f3d", "border": "#9b59b6", "title": "#bb86fc"},
+        "droid":     {"bg": "#1a2a1a", "border": "#27ae60", "title": "#2fa572"},
+        "openclaw":  {"bg": "#2a2010", "border": "#e8793a", "title": "#e8793a"},
+        "wisp":      {"bg": "#102a2a", "border": "#2980b9", "title": "#5dade2"},
+        "input":     {"bg": "#2a2420", "border": "#8a7a6a", "title": "#f5e6d3"},
+    }
+
+    def build_nodeflow(self):
+        f = self.tabs["nodeflow"]
+        self._nf_nodes = {}
+        self._nf_edges = []
+        self._nf_drag_data = {"node": None, "ox": 0, "oy": 0}
+        self._nf_selected_node = None
+        self._nf_poll_active = False
+        self._nf_pulse_phase = 0.0
+        self._nf_pulse_edges = set()
+        self._nf_zoom = 1.0
+        self._nf_pan = [0, 0]
+        self._nf_pan_drag = {"active": False, "sx": 0, "sy": 0, "px": 0, "py": 0}
+
+        wrap = tk.Frame(f, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # --- Header ---
+        header = tk.Frame(wrap, bg=TH["bg"])
+        header.pack(fill="x", pady=(0, 8))
+
+        tk.Label(header, text="NODEFLOW", font=TH["font_title"],
+                 fg="#e8793a", bg=TH["bg"]).pack(side="left")
+
+        self._nf_status_lbl = tk.Label(header, text="\u25cf Idle", font=TH["font_sm"],
+                                        fg=TH["fg_dim"], bg=TH["bg"])
+        self._nf_status_lbl.pack(side="right", padx=(0, 8))
+
+        btn_row = tk.Frame(header, bg=TH["bg"])
+        btn_row.pack(side="right")
+        self._btn(btn_row, "Refresh", self._nf_refresh_all).pack(side="left", padx=2)
+        self._btn(btn_row, "Auto-Poll", self._nf_toggle_poll).pack(side="left", padx=2)
+        self._btn(btn_row, "Reset View", self._nf_reset_view).pack(side="left", padx=2)
+
+        # --- Main pane: canvas (left) + detail panel (right) ---
+        pane = ttk.PanedWindow(wrap, orient="horizontal")
+        pane.pack(fill="both", expand=True)
+
+        # == Canvas ==
+        canvas_frame = tk.Frame(pane, bg=TH["bg"])
+        self._nf_canvas = tk.Canvas(canvas_frame, bg="#0c0a08", highlightthickness=0,
+                                     bd=0, cursor="crosshair")
+        self._nf_canvas.pack(fill="both", expand=True)
+        self._nf_canvas.bind("<ButtonPress-1>", self._nf_canvas_press)
+        self._nf_canvas.bind("<B1-Motion>", self._nf_canvas_drag)
+        self._nf_canvas.bind("<ButtonRelease-1>", self._nf_canvas_release)
+        self._nf_canvas.bind("<ButtonPress-2>", self._nf_pan_start)
+        self._nf_canvas.bind("<B2-Motion>", self._nf_pan_move)
+        self._nf_canvas.bind("<ButtonRelease-2>", self._nf_pan_end)
+        self._nf_canvas.bind("<ButtonPress-3>", self._nf_pan_start)
+        self._nf_canvas.bind("<B3-Motion>", self._nf_pan_move)
+        self._nf_canvas.bind("<ButtonRelease-3>", self._nf_pan_end)
+        self._nf_canvas.bind("<MouseWheel>", self._nf_zoom_event)
+        self._nf_canvas.bind("<Button-4>", self._nf_zoom_event)
+        self._nf_canvas.bind("<Button-5>", self._nf_zoom_event)
+
+        pane.add(canvas_frame, weight=3)
+
+        # == Detail / Log panel ==
+        detail_frame = tk.Frame(pane, bg=TH["bg"])
+
+        self._nf_detail_card = self._card(detail_frame, title="Node Inspector")
+        self._nf_detail_card.pack(fill="both", expand=True, pady=(0, 8))
+
+        self._nf_detail_text = self._text_widget(self._nf_detail_card, height=12, wrap="word")
+        self._nf_detail_text.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        log_card = self._card(detail_frame, title="Flow Log")
+        log_card.pack(fill="both", expand=True)
+
+        self._nf_log_text = self._text_widget(log_card, height=8, wrap="word")
+        self._nf_log_text.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self._nf_log_text.tag_configure("ts", foreground=TH["fg_dim"])
+        self._nf_log_text.tag_configure("info", foreground=TH["fg"])
+        self._nf_log_text.tag_configure("ok", foreground="#2fa572")
+        self._nf_log_text.tag_configure("warn", foreground="#e8793a")
+        self._nf_log_text.tag_configure("err", foreground="#c4382a")
+
+        pane.add(detail_frame, weight=1)
+
+        self._nf_seed_default_nodes()
+        self._nf_draw()
+        self._nf_log("NodeFlow initialized.")
+
+    # --- default node layout ---
+    def _nf_seed_default_nodes(self):
+        self._nf_nodes = {
+            "user_input": {
+                "type": "input", "label": "User Input",
+                "x": 60, "y": 220,
+                "meta": "Prompt / command entry point",
+                "handles_out": ["whim_brain"],
+            },
+            "whim_brain": {
+                "type": "brain", "label": "Whim Brain (LLM)",
+                "x": 320, "y": 180,
+                "meta": "Ollama model: reasoning, tool calls, token stream",
+                "handles_out": ["opus_droid", "openclaw"],
+            },
+            "opus_droid": {
+                "type": "droid", "label": "Opus Droid",
+                "x": 600, "y": 80,
+                "meta": "Code execution, syntax highlighting, active path",
+                "handles_out": ["wisp_gps"],
+            },
+            "openclaw": {
+                "type": "openclaw", "label": "OpenClaw Telemetry",
+                "x": 600, "y": 300,
+                "meta": "Hardware telemetry: RSSI, battery, heartbeat",
+                "handles_out": ["wisp_gps"],
+            },
+            "wisp_gps": {
+                "type": "wisp", "label": "Wisp / GPS",
+                "x": 880, "y": 200,
+                "meta": "GPS coordinates, geofence status, LoRa packets",
+                "handles_out": [],
+            },
+        }
+        self._nf_edges = []
+        for nid, node in self._nf_nodes.items():
+            for target in node.get("handles_out", []):
+                self._nf_edges.append((nid, target))
+
+    # --- drawing ---
+    def _nf_draw(self):
+        c = self._nf_canvas
+        c.delete("all")
+        z = self._nf_zoom
+        px, py = self._nf_pan
+        nw, nh = self._NF_NODE_W * z, self._NF_NODE_H * z
+        hr = self._NF_HANDLE_R * z
+
+        # draw grid
+        cw = c.winfo_width() or 800
+        ch = c.winfo_height() or 600
+        step = max(int(40 * z), 10)
+        gx0 = int(px % step)
+        gy0 = int(py % step)
+        for x in range(gx0, cw, step):
+            c.create_line(x, 0, x, ch, fill="#1a1816", width=1)
+        for y in range(gy0, ch, step):
+            c.create_line(0, y, cw, y, fill="#1a1816", width=1)
+
+        node_centers = {}
+        for nid, node in self._nf_nodes.items():
+            sx = node["x"] * z + px
+            sy = node["y"] * z + py
+            node_centers[nid] = (sx + nw / 2, sy + nh / 2)
+
+        # draw edges with data pulse
+        phase = self._nf_pulse_phase
+        for src, dst in self._nf_edges:
+            if src in node_centers and dst in node_centers:
+                x1, y1 = node_centers[src]
+                x2, y2 = node_centers[dst]
+                sx1, sy1 = x1 + nw / 2, y1
+                sx2, sy2 = x2 - nw / 2, y2
+                src_colors = self._NF_NODE_COLORS.get(
+                    self._nf_nodes[src]["type"], self._NF_NODE_COLORS["input"])
+                c.create_line(sx1, sy1, sx2, sy2,
+                              fill=src_colors["border"], width=max(2 * z, 1),
+                              smooth=True, dash=(6, 4))
+                if (src, dst) in self._nf_pulse_edges or self._nf_poll_active:
+                    t = phase % 1.0
+                    px_dot = sx1 + (sx2 - sx1) * t
+                    py_dot = sy1 + (sy2 - sy1) * t
+                    pr = max(4 * z, 3)
+                    c.create_oval(px_dot - pr, py_dot - pr,
+                                  px_dot + pr, py_dot + pr,
+                                  fill="#00ff00", outline="")
+
+        # draw nodes
+        for nid, node in self._nf_nodes.items():
+            colors = self._NF_NODE_COLORS.get(node["type"], self._NF_NODE_COLORS["input"])
+            sx = node["x"] * z + px
+            sy = node["y"] * z + py
+
+            sel_extra = 2 if nid == self._nf_selected_node else 0
+            c.create_rectangle(sx - sel_extra, sy - sel_extra,
+                               sx + nw + sel_extra, sy + nh + sel_extra,
+                               fill=colors["bg"], outline=colors["border"],
+                               width=max(2 * z, 1) + sel_extra, tags=("node", nid))
+
+            title_h = 24 * z
+            c.create_rectangle(sx, sy, sx + nw, sy + title_h,
+                               fill=colors["border"], outline="", tags=("node", nid))
+            c.create_text(sx + nw / 2, sy + title_h / 2,
+                          text=node["label"], fill="#0c0a08",
+                          font=(_FONTS["ui"], max(int(9 * z), 7), "bold"),
+                          tags=("node", nid))
+
+            meta = node.get("meta", "")
+            if meta:
+                c.create_text(sx + 8 * z, sy + title_h + 8 * z,
+                              text=meta[:40], fill=colors["title"],
+                              font=(_FONTS["mono"], max(int(8 * z), 6)),
+                              anchor="nw", width=nw - 16 * z,
+                              tags=("node", nid))
+
+            # status dot
+            dot_r = 4 * z
+            c.create_oval(sx + nw - 14 * z, sy + nh - 14 * z,
+                          sx + nw - 14 * z + dot_r * 2,
+                          sy + nh - 14 * z + dot_r * 2,
+                          fill=node.get("status_color", "#8a7a6a"), outline="",
+                          tags=("node", nid))
+
+            # handles
+            if node.get("handles_out"):
+                c.create_oval(sx + nw - hr, sy + nh / 2 - hr,
+                              sx + nw + hr, sy + nh / 2 + hr,
+                              fill=colors["border"], outline="#0c0a08",
+                              tags=("handle_out", nid))
+            c.create_oval(sx - hr, sy + nh / 2 - hr,
+                          sx + hr, sy + nh / 2 + hr,
+                          fill=colors["border"], outline="#0c0a08",
+                          tags=("handle_in", nid))
+
+    # --- interaction ---
+    def _nf_hit_node(self, cx, cy):
+        z = self._nf_zoom
+        px, py = self._nf_pan
+        nw, nh = self._NF_NODE_W * z, self._NF_NODE_H * z
+        for nid, node in self._nf_nodes.items():
+            sx = node["x"] * z + px
+            sy = node["y"] * z + py
+            if sx <= cx <= sx + nw and sy <= cy <= sy + nh:
+                return nid
+        return None
+
+    def _nf_canvas_press(self, event):
+        nid = self._nf_hit_node(event.x, event.y)
+        self._nf_selected_node = nid
+        if nid:
+            node = self._nf_nodes[nid]
+            z = self._nf_zoom
+            px, py = self._nf_pan
+            self._nf_drag_data = {
+                "node": nid,
+                "ox": event.x - (node["x"] * z + px),
+                "oy": event.y - (node["y"] * z + py),
+            }
+            self._nf_show_detail(nid)
+        self._nf_draw()
+
+    def _nf_canvas_drag(self, event):
+        dd = self._nf_drag_data
+        if dd["node"] and dd["node"] in self._nf_nodes:
+            z = self._nf_zoom
+            px, py = self._nf_pan
+            self._nf_nodes[dd["node"]]["x"] = (event.x - dd["ox"] - px) / z
+            self._nf_nodes[dd["node"]]["y"] = (event.y - dd["oy"] - py) / z
+            self._nf_draw()
+
+    def _nf_canvas_release(self, event):
+        self._nf_drag_data = {"node": None, "ox": 0, "oy": 0}
+
+    def _nf_pan_start(self, event):
+        self._nf_pan_drag = {"active": True, "sx": event.x, "sy": event.y,
+                              "px": self._nf_pan[0], "py": self._nf_pan[1]}
+
+    def _nf_pan_move(self, event):
+        pd = self._nf_pan_drag
+        if pd["active"]:
+            self._nf_pan[0] = pd["px"] + (event.x - pd["sx"])
+            self._nf_pan[1] = pd["py"] + (event.y - pd["sy"])
+            self._nf_draw()
+
+    def _nf_pan_end(self, event):
+        self._nf_pan_drag["active"] = False
+
+    def _nf_zoom_event(self, event):
+        if event.num == 4 or (hasattr(event, "delta") and event.delta > 0):
+            self._nf_zoom = min(self._nf_zoom * 1.1, 3.0)
+        elif event.num == 5 or (hasattr(event, "delta") and event.delta < 0):
+            self._nf_zoom = max(self._nf_zoom / 1.1, 0.3)
+        self._nf_draw()
+
+    def _nf_reset_view(self):
+        self._nf_zoom = 1.0
+        self._nf_pan = [0, 0]
+        self._nf_draw()
+
+    # --- detail inspector ---
+    def _nf_show_detail(self, nid):
+        node = self._nf_nodes.get(nid)
+        if not node:
+            return
+        t = self._nf_detail_text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        colors = self._NF_NODE_COLORS.get(node["type"], self._NF_NODE_COLORS["input"])
+        t.tag_configure("title", foreground=colors["title"], font=TH["font_title"])
+        t.tag_configure("key", foreground=TH["fg_dim"], font=TH["font_sm"])
+        t.tag_configure("val", foreground=TH["fg"], font=TH["font_mono"])
+
+        t.insert("end", f"{node['label']}\n", "title")
+        t.insert("end", f"Type: ", "key")
+        t.insert("end", f"{node['type']}\n", "val")
+        t.insert("end", f"Position: ", "key")
+        t.insert("end", f"({int(node['x'])}, {int(node['y'])})\n", "val")
+        t.insert("end", f"Description: ", "key")
+        t.insert("end", f"{node.get('meta', '-')}\n", "val")
+
+        connections = [e[1] for e in self._nf_edges if e[0] == nid]
+        incoming = [e[0] for e in self._nf_edges if e[1] == nid]
+        if connections:
+            t.insert("end", "Outputs: ", "key")
+            t.insert("end", ", ".join(connections) + "\n", "val")
+        if incoming:
+            t.insert("end", "Inputs: ", "key")
+            t.insert("end", ", ".join(incoming) + "\n", "val")
+
+        status = node.get("status", "idle")
+        t.insert("end", f"Status: ", "key")
+        t.insert("end", f"{status}\n", "val")
+
+        telemetry = node.get("telemetry", {})
+        if telemetry:
+            t.insert("end", "\nTelemetry:\n", "key")
+            for k, v in telemetry.items():
+                t.insert("end", f"  {k}: ", "key")
+                t.insert("end", f"{v}\n", "val")
+        t.configure(state="disabled")
+
+    # --- live data ---
+    def _nf_log(self, msg, tag="info"):
+        import time
+        t = self._nf_log_text
+        t.configure(state="normal")
+        ts = time.strftime("%H:%M:%S")
+        t.insert("end", f"[{ts}] ", "ts")
+        t.insert("end", f"{msg}\n", tag)
+        t.see("end")
+        t.configure(state="disabled")
+
+    def _nf_toggle_poll(self):
+        self._nf_poll_active = not self._nf_poll_active
+        if self._nf_poll_active:
+            self._nf_status_lbl.config(text="\u25cf Polling", fg="#2fa572")
+            self._nf_log("Auto-poll started.", "ok")
+            self._nf_poll_tick()
+            self._nf_pulse_tick()
+        else:
+            self._nf_status_lbl.config(text="\u25cf Idle", fg=TH["fg_dim"])
+            self._nf_log("Auto-poll stopped.", "warn")
+
+    def _nf_pulse_tick(self):
+        if not self._nf_poll_active:
+            return
+        self._nf_pulse_phase = (self._nf_pulse_phase + 0.05) % 1.0
+        self._nf_draw()
+        self.after(50, self._nf_pulse_tick)
+
+    def _nf_poll_tick(self):
+        if not self._nf_poll_active:
+            return
+        self._nf_refresh_all()
+        self.after(5000, self._nf_poll_tick)
+
+    def _nf_refresh_all(self):
+        self._nf_fetch_ollama_status()
+        self._nf_draw()
+
+    def _nf_fetch_ollama_status(self):
+        import urllib.request
+        url = getattr(self, "_whimai_ollama_url", "http://localhost:11434")
+        def _fetch():
+            try:
+                req = urllib.request.Request(f"{url}/api/tags")
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                models = [m["name"] for m in data.get("models", [])]
+                self.after(0, lambda: self._nf_update_brain(models))
+            except Exception as exc:
+                self.after(0, lambda: self._nf_update_brain(None, str(exc)))
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _nf_update_brain(self, models, error=None):
+        brain = self._nf_nodes.get("whim_brain")
+        if not brain:
+            return
+        if error:
+            brain["status"] = "error"
+            brain["status_color"] = "#c4382a"
+            brain["telemetry"] = {"error": error}
+            self._nf_log(f"Ollama: {error}", "err")
+        elif models is not None:
+            brain["status"] = "online"
+            brain["status_color"] = "#2fa572"
+            brain["telemetry"] = {"models": ", ".join(models[:5]),
+                                   "count": len(models)}
+            self._nf_log(f"Ollama online: {len(models)} models", "ok")
+        if self._nf_selected_node == "whim_brain":
+            self._nf_show_detail("whim_brain")
+        self._nf_draw()
+
+    # ====================== EMAIL (Himalaya) TAB ======================
+
+    # ==================== OPUS — NPU ACCELERATOR TAB ====================
+
+    _OPUS_NPU_SLOTS = [
+        {"id": 0, "role": "Wake + VAD", "desc": "Always-on wake word detection + voice activity"},
+        {"id": 1, "role": "Whisper Encoder", "desc": "Whisper large-v3 INT8 ASR encoder"},
+        {"id": 2, "role": "Whisper Decoder", "desc": "Streaming ASR token decoder + confidence"},
+        {"id": 3, "role": "Context Auditor", "desc": "Phi-3-mini dubbed reasoning router (0.5B)"},
+        {"id": 4, "role": "XTTS Encoder", "desc": "Voice embeddings cached in SRAM"},
+        {"id": 5, "role": "XTTS Decoder", "desc": "Streaming phoneme synthesis (<200ms TTFA)"},
+        {"id": 6, "role": "YOLO / Perch", "desc": "YOLOv8n clip tagging for camera feeds"},
+        {"id": 7, "role": "Spare / LoRa ML", "desc": "Hot-swap spare or collar signal classifier"},
+    ]
+    _OPUS_POLL_MS = 5000
+
+    def build_opus(self):
+        f = self.tabs["opus"]
         wrap = tk.Frame(f, bg=TH["bg"])
         wrap.pack(fill="both", expand=True, padx=16, pady=12)
 
-        tk.Label(wrap, text="SETTINGS", bg=TH["bg"], fg="#2fa572",
-                 font=(_FONTS["ui"], 16, "bold")).pack(anchor="w", pady=(0, 12))
+        hdr = tk.Frame(wrap, bg=TH["bg"])
+        hdr.pack(fill="x", pady=(0, 4))
+        tk.Label(hdr, text="OPUS", bg=TH["bg"], fg=TH["green"],
+                 font=(_FONTS["ui"], 16, "bold")).pack(side="left")
+        tk.Label(hdr, text="  NPU Accelerator Array", bg=TH["bg"],
+                 fg=TH["fg2"], font=TH["font_sm"]).pack(side="left", pady=(4, 0))
+
+        tk.Label(wrap, text="ToughArmor MB873MP-B V2  \u2022  8\u00d7 M.2 NVMe  \u2022  Hailo-8 Target: 208 TOPS",
+                 bg=TH["bg"], fg=TH["fg_dim"], font=TH["font_sm"]).pack(anchor="w", pady=(0, 12))
+
+        cols = tk.Frame(wrap, bg=TH["bg"])
+        cols.pack(fill="both", expand=True)
+        cols.columnconfigure(0, weight=2)
+        cols.columnconfigure(1, weight=1)
+        cols.rowconfigure(0, weight=1)
+
+        left = tk.Frame(cols, bg=TH["bg"])
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        right = tk.Frame(cols, bg=TH["bg"])
+        right.grid(row=0, column=1, sticky="nsew")
+
+        # -- Left: NPU slot grid --
+        slot_card = tk.Frame(left, bg=TH["card"], highlightthickness=1,
+                             highlightbackground=TH["border_hi"])
+        slot_card.pack(fill="both", expand=True)
+        tk.Label(slot_card, text="NPU SLOTS", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Frame(slot_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=12, pady=(0, 8))
+
+        self._opus_slot_widgets = []
+        grid = tk.Frame(slot_card, bg=TH["card"])
+        grid.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        for i in range(4):
+            grid.columnconfigure(i, weight=1)
+        for i in range(2):
+            grid.rowconfigure(i, weight=1)
+
+        for slot in self._OPUS_NPU_SLOTS:
+            idx = slot["id"]
+            row, col = divmod(idx, 4)
+            cell = tk.Frame(grid, bg=TH["input"], highlightthickness=1,
+                            highlightbackground=TH["border"], relief="flat")
+            cell.grid(row=row, column=col, sticky="nsew", padx=3, pady=3)
+
+            top_row = tk.Frame(cell, bg=TH["input"])
+            top_row.pack(fill="x", padx=8, pady=(8, 2))
+
+            dot = tk.Canvas(top_row, width=12, height=12, bg=TH["input"],
+                            highlightthickness=0)
+            dot.pack(side="left")
+            dot_id = dot.create_oval(2, 2, 10, 10, fill="#555555", outline="#3a3a3a")
+
+            tk.Label(top_row, text=f"SLOT {idx}", bg=TH["input"], fg=TH["fg"],
+                     font=(_FONTS["mono"], 9, "bold")).pack(side="left", padx=(6, 0))
+
+            tk.Label(cell, text=slot["role"], bg=TH["input"], fg=TH["green"],
+                     font=(_FONTS["mono"], 8, "bold")).pack(anchor="w", padx=8)
+            tk.Label(cell, text=slot["desc"], bg=TH["input"], fg=TH["fg_dim"],
+                     font=(_FONTS["ui"], 7)).pack(anchor="w", padx=8, pady=(0, 2))
+
+            status_lbl = tk.Label(cell, text="NOT DETECTED", bg=TH["input"],
+                                  fg="#d94040", font=(_FONTS["mono"], 7, "bold"))
+            status_lbl.pack(anchor="w", padx=8, pady=(0, 8))
+
+            self._opus_slot_widgets.append({
+                "cell": cell, "dot": dot, "dot_id": dot_id,
+                "status_lbl": status_lbl, "slot": slot,
+            })
+
+        # -- Right: Summary + stats --
+        sum_card = tk.Frame(right, bg=TH["card"], highlightthickness=1,
+                            highlightbackground=TH["border_hi"])
+        sum_card.pack(fill="x")
+        tk.Label(sum_card, text="ARRAY STATUS", bg=TH["card"], fg=TH["green"],
+                 font=(_FONTS["ui"], 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Frame(sum_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=12, pady=(0, 8))
+
+        self._opus_total_var = tk.StringVar(value="0 / 8 nodes online")
+        tk.Label(sum_card, textvariable=self._opus_total_var, bg=TH["card"],
+                 fg=TH["fg"], font=(_FONTS["mono"], 11, "bold")).pack(anchor="w", padx=12)
+
+        self._opus_tops_var = tk.StringVar(value="0 TOPS available")
+        tk.Label(sum_card, textvariable=self._opus_tops_var, bg=TH["card"],
+                 fg=TH["fg2"], font=TH["font_mono"]).pack(anchor="w", padx=12, pady=(4, 0))
+
+        self._opus_power_var = tk.StringVar(value="Power: 0 W (est)")
+        tk.Label(sum_card, textvariable=self._opus_power_var, bg=TH["card"],
+                 fg=TH["fg_dim"], font=TH["font_sm"]).pack(anchor="w", padx=12, pady=(2, 0))
+
+        btn_row = tk.Frame(sum_card, bg=TH["card"])
+        btn_row.pack(anchor="w", padx=12, pady=(12, 12))
+        self._btn(btn_row, "SCAN", command=self._opus_scan_now).pack(side="left", padx=(0, 6))
+        self._btn(btn_row, "REFRESH", command=self._opus_refresh).pack(side="left")
+
+        # -- Pipeline status card --
+        pipe_card = tk.Frame(right, bg=TH["card"], highlightthickness=1,
+                             highlightbackground=TH["border_hi"])
+        pipe_card.pack(fill="x", pady=(8, 0))
+        tk.Label(pipe_card, text="VOICE PIPELINE", bg=TH["card"], fg="#e0a030",
+                 font=(_FONTS["ui"], 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Frame(pipe_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=12, pady=(0, 6))
+
+        self._opus_pipe_var = tk.StringVar(value="Offline \u2014 no NPUs detected")
+        tk.Label(pipe_card, textvariable=self._opus_pipe_var, bg=TH["card"],
+                 fg=TH["fg"], font=TH["font_mono"]).pack(anchor="w", padx=12)
+
+        self._opus_llm_skip_var = tk.StringVar(value="LLM skipped: 0 times today")
+        tk.Label(pipe_card, textvariable=self._opus_llm_skip_var, bg=TH["card"],
+                 fg=TH["fg_dim"], font=TH["font_sm"]).pack(anchor="w", padx=12, pady=(4, 12))
+
+        # -- BLE link card --
+        ble_card = tk.Frame(right, bg=TH["card"], highlightthickness=1,
+                            highlightbackground=TH["border_hi"])
+        ble_card.pack(fill="x", pady=(8, 0))
+        tk.Label(ble_card, text="WHIMLINK BLE", bg=TH["card"], fg="#14507a",
+                 font=(_FONTS["ui"], 10, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Frame(ble_card, bg=TH["border_hi"], height=1).pack(fill="x", padx=12, pady=(0, 6))
+
+        self._opus_ble_var = tk.StringVar(value="No BLE bridge active")
+        tk.Label(ble_card, textvariable=self._opus_ble_var, bg=TH["card"],
+                 fg=TH["fg"], font=TH["font_mono"]).pack(anchor="w", padx=12)
+
+        ble_spec = tk.Label(ble_card, text=(
+            "GATT 0xFFF0: WhimLink\n"
+            "  0xFFF1 NOTIFY   N:kind|lat,lon|label|eta\n"
+            "  0xFFF2 PUSHPIN  P:name|lat,lon|context\n"
+            "  0xFFF3 HEARTBEAT H:heading,speed,deep"
+        ), bg=TH["card"], fg=TH["fg_dim"], font=(_FONTS["mono"], 7),
+            justify="left")
+        ble_spec.pack(anchor="w", padx=12, pady=(4, 12))
+
+        # -- Log panel --
+        log_card = tk.Frame(right, bg=TH["card"], highlightthickness=1,
+                            highlightbackground=TH["border_hi"])
+        log_card.pack(fill="both", expand=True, pady=(8, 0))
+        tk.Label(log_card, text="EVENT LOG", bg=TH["card"], fg=TH["fg2"],
+                 font=(_FONTS["ui"], 9, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
+        self._opus_log = self._text_widget(log_card, height=8, state="disabled",
+                                           font=(_FONTS["mono"], 8))
+        self._opus_log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        self._opus_log_append("Opus tab initialized. Scan for Hailo-8 NPUs.")
+        self.after(1000, self._opus_scan_now)
+        self._opus_poll_loop()
+
+    def _opus_log_append(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._opus_log.config(state="normal")
+        self._opus_log.insert("end", f"[{ts}] {msg}\n")
+        self._opus_log.see("end")
+        self._opus_log.config(state="disabled")
+
+    def _opus_detect_hailo_devices(self):
+        devices = []
+        for i in range(8):
+            path = f"/dev/hailo{i}"
+            if os.path.exists(path):
+                devices.append({"slot": i, "path": path, "type": "hailo-8"})
+        if not devices:
+            try:
+                result = subprocess.run(
+                    ["lspci"], capture_output=True, text=True, timeout=5)
+                for line in result.stdout.splitlines():
+                    if "hailo" in line.lower() or "1e60" in line.lower():
+                        devices.append({"slot": len(devices), "path": "pcie",
+                                        "type": "hailo-8", "pci": line.strip()})
+            except Exception:
+                pass
+        if not devices:
+            try:
+                result = subprocess.run(
+                    ["lsusb"], capture_output=True, text=True, timeout=5)
+                for line in result.stdout.splitlines():
+                    if "hailo" in line.lower():
+                        devices.append({"slot": len(devices), "path": "usb",
+                                        "type": "hailo-8", "usb": line.strip()})
+            except Exception:
+                pass
+        return devices
+
+    def _opus_scan_now(self):
+        def _scan():
+            devs = self._opus_detect_hailo_devices()
+            self.after(0, lambda: self._opus_update_ui(devs))
+        threading.Thread(target=_scan, daemon=True).start()
+
+    def _opus_refresh(self):
+        self._opus_log_append("Manual refresh triggered.")
+        self._opus_scan_now()
+
+    def _opus_update_ui(self, devices):
+        online_slots = {d["slot"] for d in devices}
+        count = len(online_slots)
+        tops = count * 26
+        power = count * 2.5
+
+        for w in self._opus_slot_widgets:
+            idx = w["slot"]["id"]
+            if idx in online_slots:
+                w["dot"].itemconfig(w["dot_id"], fill="#2fa572", outline="#2fa572")
+                w["status_lbl"].config(text="CONNECTED", fg="#2fa572")
+                w["cell"].config(highlightbackground=TH["green"])
+            else:
+                w["dot"].itemconfig(w["dot_id"], fill="#555555", outline="#3a3a3a")
+                w["status_lbl"].config(text="NOT DETECTED", fg="#d94040")
+                w["cell"].config(highlightbackground=TH["border"])
+
+        self._opus_total_var.set(f"{count} / 8 nodes online")
+        self._opus_tops_var.set(f"{tops} TOPS available")
+        self._opus_power_var.set(f"Power: {power:.1f} W (est)")
+
+        if count >= 6:
+            self._opus_pipe_var.set(f"Voice pipeline ready \u2014 {count} NPUs active")
+        elif count >= 3:
+            self._opus_pipe_var.set(f"Partial pipeline \u2014 {count}/6 voice slots")
+        else:
+            self._opus_pipe_var.set("Offline \u2014 no NPUs detected" if count == 0
+                                    else f"Degraded \u2014 {count} NPU(s) only")
+
+        if devices:
+            self._opus_log_append(f"Scan: {count} Hailo-8 NPU(s) detected ({tops} TOPS)")
+        else:
+            self._opus_log_append("Scan: No Hailo-8 NPUs found. Check ToughArmor + OCuLink.")
+
+    def _opus_poll_loop(self):
+        if self._active_tab_key == "opus":
+            self._opus_scan_now()
+        self.after(self._OPUS_POLL_MS, self._opus_poll_loop)
+
+    # ==================== EMAIL ====================
+
+    _HIMALAYA_BIN = shutil.which("himalaya") or "himalaya"
+
+    def build_email(self):
+        f = self.tabs["email"]
+        root = tk.Frame(f, bg=TH["bg"])
+        root.pack(fill="both", expand=True, padx=8, pady=8)
+
+        header = tk.Frame(root, bg=TH["card"], height=42)
+        header.pack(fill="x", pady=(0, 6))
+        tk.Label(header, text="Email \u2014 Himalaya / Gmail",
+                 bg=TH["card"], fg="#2fa572",
+                 font=(_FONTS["ui"], 13, "bold")).pack(side="left", padx=12, pady=8)
+        self._email_status = tk.StringVar(value="Ready")
+        tk.Label(header, textvariable=self._email_status, bg=TH["card"],
+                 fg=TH["green"], font=(_FONTS["mono"], 9)).pack(side="right", padx=12, pady=8)
+
+        toolbar = tk.Frame(root, bg=TH["card"], height=36)
+        toolbar.pack(fill="x", pady=(0, 6))
+        self._btn(toolbar, "Refresh", self._email_refresh).pack(side="left", padx=4, pady=4)
+        self._btn(toolbar, "Compose", self._email_compose).pack(side="left", padx=4, pady=4)
+        self._btn(toolbar, "Reply", self._email_reply).pack(side="left", padx=4, pady=4)
+        self._btn(toolbar, "Delete", self._email_delete).pack(side="left", padx=4, pady=4)
+
+        tk.Frame(toolbar, bg=TH["border_hi"], width=2).pack(
+            side="left", fill="y", padx=8, pady=6)
+
+        tk.Label(toolbar, text="Folder:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left", padx=(4, 2), pady=4)
+        self._email_folder_var = tk.StringVar(value="INBOX")
+        folder_combo = ttk.Combobox(toolbar, textvariable=self._email_folder_var,
+                                    values=["INBOX", "[Gmail]/Sent Mail",
+                                            "[Gmail]/Drafts", "[Gmail]/Trash",
+                                            "[Gmail]/Starred", "[Gmail]/All Mail"],
+                                    width=22, state="readonly")
+        folder_combo.pack(side="left", padx=2, pady=4)
+        folder_combo.bind("<<ComboboxSelected>>", lambda e: self._email_refresh())
+
+        tk.Frame(toolbar, bg=TH["border_hi"], width=2).pack(
+            side="left", fill="y", padx=8, pady=6)
+
+        tk.Label(toolbar, text="Search:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left", padx=(4, 2), pady=4)
+        self._email_search_var = tk.StringVar()
+        search_entry = self._entry(toolbar, self._email_search_var, width=24)
+        search_entry.pack(side="left", padx=2, pady=4)
+        search_entry.bind("<Return>", lambda e: self._email_refresh())
+        self._btn(toolbar, "Search", self._email_refresh).pack(side="left", padx=4, pady=4)
+
+        pane = ttk.PanedWindow(root, orient="horizontal")
+        pane.pack(fill="both", expand=True)
+
+        left = tk.Frame(pane, bg=TH["bg"])
+        pane.add(left, weight=1)
+
+        cols = ("id", "flags", "from", "subject", "date")
+        self._email_tree = ttk.Treeview(left, columns=cols, show="headings",
+                                        selectmode="browse", height=20)
+        self._email_tree.heading("id", text="ID")
+        self._email_tree.heading("flags", text="")
+        self._email_tree.heading("from", text="From")
+        self._email_tree.heading("subject", text="Subject")
+        self._email_tree.heading("date", text="Date")
+        self._email_tree.column("id", width=50, minwidth=40)
+        self._email_tree.column("flags", width=30, minwidth=30)
+        self._email_tree.column("from", width=160, minwidth=100)
+        self._email_tree.column("subject", width=320, minwidth=150)
+        self._email_tree.column("date", width=150, minwidth=100)
+        self._email_tree.pack(fill="both", expand=True, side="left")
+
+        scrollbar = ttk.Scrollbar(left, orient="vertical",
+                                  command=self._email_tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._email_tree.configure(yscrollcommand=scrollbar.set)
+        self._email_tree.bind("<<TreeviewSelect>>", self._email_on_select)
+
+        right = tk.Frame(pane, bg=TH["bg"])
+        pane.add(right, weight=2)
+
+        meta_frame = tk.Frame(right, bg=TH["card"])
+        meta_frame.pack(fill="x", pady=(0, 4))
+        self._email_meta_from = tk.StringVar()
+        self._email_meta_to = tk.StringVar()
+        self._email_meta_subject = tk.StringVar()
+        self._email_meta_date = tk.StringVar()
+        for label_text, var in [("From:", self._email_meta_from),
+                                ("To:", self._email_meta_to),
+                                ("Subject:", self._email_meta_subject),
+                                ("Date:", self._email_meta_date)]:
+            row = tk.Frame(meta_frame, bg=TH["card"])
+            row.pack(fill="x", padx=8, pady=1)
+            tk.Label(row, text=label_text, bg=TH["card"], fg=TH["fg2"],
+                     font=(_FONTS["ui"], 9, "bold"), width=8, anchor="e").pack(side="left")
+            tk.Label(row, textvariable=var, bg=TH["card"], fg=TH["fg"],
+                     font=TH["font_sm"], anchor="w").pack(side="left", fill="x", expand=True)
+
+        self._email_body = self._text_widget(right, wrap="word", state="disabled")
+        self._email_body.pack(fill="both", expand=True)
+
+        self._email_envelopes = []
+        self.after(500, self._email_refresh)
+
+    def _email_run_cmd(self, args, timeout=15):
+        try:
+            r = subprocess.run(
+                [self._HIMALAYA_BIN] + args,
+                capture_output=True, text=True, timeout=timeout)
+            if r.returncode != 0:
+                return None, r.stderr.strip()
+            return r.stdout, None
+        except subprocess.TimeoutExpired:
+            return None, "Himalaya command timed out"
+        except Exception as e:
+            return None, str(e)
+
+    def _email_refresh(self):
+        self._email_status.set("Loading...")
+        threading.Thread(target=self._email_refresh_worker, daemon=True).start()
+
+    def _email_refresh_worker(self):
+        folder = self._email_folder_var.get()
+        search = self._email_search_var.get().strip()
+        args = ["envelope", "list", "-o", "json", "--page-size", "50",
+                "--folder", folder]
+        if search:
+            args.extend(["from", search])
+        out, err = self._email_run_cmd(args, timeout=20)
+        if err:
+            self.after(0, lambda: self._email_status.set(f"Error: {err[:60]}"))
+            return
+        try:
+            data = json.loads(out)
+        except (json.JSONDecodeError, TypeError):
+            self.after(0, lambda: self._email_status.set("Parse error"))
+            return
+        self._email_envelopes = data
+        self.after(0, self._email_populate_tree)
+
+    def _email_populate_tree(self):
+        tree = self._email_tree
+        tree.delete(*tree.get_children())
+        for env in self._email_envelopes:
+            eid = env.get("id", "")
+            flags_raw = env.get("flags", [])
+            flag_str = ""
+            if isinstance(flags_raw, list):
+                if "Seen" not in [f.get("value", f) if isinstance(f, dict) else f
+                                  for f in flags_raw]:
+                    flag_str = "*"
+            senders = env.get("from", {})
+            if isinstance(senders, list) and senders:
+                s = senders[0]
+                from_str = s.get("name") or s.get("addr", "")
+            elif isinstance(senders, dict):
+                from_str = senders.get("name") or senders.get("addr", "")
+            else:
+                from_str = str(senders)
+            subject = env.get("subject", "(no subject)")
+            date = env.get("date", "")
+            tree.insert("", "end", values=(eid, flag_str, from_str, subject, date))
+        count = len(self._email_envelopes)
+        self._email_status.set(f"{count} message{'s' if count != 1 else ''}")
+
+    def _email_on_select(self, event=None):
+        sel = self._email_tree.selection()
+        if not sel:
+            return
+        vals = self._email_tree.item(sel[0], "values")
+        if not vals:
+            return
+        eid = vals[0]
+        self._email_status.set("Reading...")
+        threading.Thread(target=self._email_read_worker, args=(eid,), daemon=True).start()
+
+    def _email_read_worker(self, eid):
+        folder = self._email_folder_var.get()
+        out, err = self._email_run_cmd(
+            ["message", "read", "-o", "plain", "--folder", folder, str(eid)], timeout=20)
+        if err:
+            self.after(0, lambda: self._email_status.set(f"Read error: {err[:60]}"))
+            return
+        env = next((e for e in self._email_envelopes
+                     if str(e.get("id", "")) == str(eid)), {})
+        senders = env.get("from", {})
+        if isinstance(senders, list) and senders:
+            s = senders[0]
+            from_str = f"{s.get('name', '')} <{s.get('addr', '')}>"
+        elif isinstance(senders, dict):
+            from_str = f"{senders.get('name', '')} <{senders.get('addr', '')}>"
+        else:
+            from_str = str(senders)
+        to_raw = env.get("to", {})
+        if isinstance(to_raw, list) and to_raw:
+            t = to_raw[0]
+            to_str = f"{t.get('name', '')} <{t.get('addr', '')}>"
+        elif isinstance(to_raw, dict):
+            to_str = f"{to_raw.get('name', '')} <{to_raw.get('addr', '')}>"
+        else:
+            to_str = str(to_raw)
+        subject = env.get("subject", "")
+        date = env.get("date", "")
+        body = out or ""
+        self.after(0, lambda: self._email_show_message(from_str, to_str, subject, date, body))
+
+    def _email_show_message(self, from_str, to_str, subject, date, body):
+        self._email_meta_from.set(from_str)
+        self._email_meta_to.set(to_str)
+        self._email_meta_subject.set(subject)
+        self._email_meta_date.set(date)
+        self._email_body.config(state="normal")
+        self._email_body.delete("1.0", "end")
+        self._email_body.insert("1.0", body)
+        self._email_body.config(state="disabled")
+        self._email_status.set("Ready")
+
+    # ── Email AI helpers (for /email commands and tool calling) ──
+
+    def _email_ai_list(self, count=5):
+        self._whimai_append("[Fetching inbox...]\n", "ai")
+        def _work():
+            count_clamped = min(max(count, 1), 50)
+            out, err = self._email_run_cmd(
+                ["envelope", "list", "-o", "json", "--page-size", str(count_clamped),
+                 "--folder", "INBOX"], timeout=20)
+            if err:
+                self.after(0, lambda: self._whimai_append(f"[Email error: {err}]\n", "ai"))
+                return
+            try:
+                envelopes = json.loads(out)
+            except (json.JSONDecodeError, TypeError):
+                self.after(0, lambda: self._whimai_append("[Email: parse error]\n", "ai"))
+                return
+            lines = []
+            for env in envelopes:
+                eid = env.get("id", "?")
+                senders = env.get("from", {})
+                if isinstance(senders, list) and senders:
+                    s = senders[0]
+                    from_str = s.get("name") or s.get("addr", "?")
+                elif isinstance(senders, dict):
+                    from_str = senders.get("name") or senders.get("addr", "?")
+                else:
+                    from_str = str(senders)
+                subject = env.get("subject", "(no subject)")
+                date = env.get("date", "")
+                flags = env.get("flags", [])
+                unread = ""
+                if isinstance(flags, list):
+                    seen_vals = [f.get("value", f) if isinstance(f, dict) else f for f in flags]
+                    if "Seen" not in seen_vals:
+                        unread = " [NEW]"
+                lines.append(f"  [{eid}]{unread} {from_str} — {subject}  ({date})")
+            header = f"INBOX ({len(envelopes)} messages):\n"
+            body = "\n".join(lines) if lines else "  (empty)"
+            result = header + body + "\n"
+            self.after(0, lambda r=result: self._whimai_append(r, "ai"))
+            self._whimai_chat_history.append({"role": "assistant", "content": result})
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _email_ai_read(self, message_id):
+        self._whimai_append(f"[Reading email {message_id}...]\n", "ai")
+        def _work():
+            out, err = self._email_run_cmd(
+                ["message", "read", "-o", "plain", "--folder", "INBOX", str(message_id)],
+                timeout=20)
+            if err:
+                self.after(0, lambda: self._whimai_append(f"[Email error: {err}]\n", "ai"))
+                return
+            result = f"--- Email {message_id} ---\n{out}\n--- End ---\n"
+            self.after(0, lambda r=result: self._whimai_append(r, "ai"))
+            self._whimai_chat_history.append({"role": "assistant", "content": result})
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _email_ai_search(self, query):
+        self._whimai_append(f"[Searching emails for '{query}'...]\n", "ai")
+        def _work():
+            out, err = self._email_run_cmd(
+                ["envelope", "list", "-o", "json", "--page-size", "10",
+                 "--folder", "INBOX", "from", query], timeout=20)
+            if err:
+                self.after(0, lambda: self._whimai_append(f"[Email error: {err}]\n", "ai"))
+                return
+            try:
+                envelopes = json.loads(out)
+            except (json.JSONDecodeError, TypeError):
+                self.after(0, lambda: self._whimai_append("[Email: parse error]\n", "ai"))
+                return
+            if not envelopes:
+                self.after(0, lambda: self._whimai_append(
+                    f"No emails matching '{query}'.\n", "ai"))
+                return
+            lines = []
+            for env in envelopes:
+                eid = env.get("id", "?")
+                senders = env.get("from", {})
+                if isinstance(senders, list) and senders:
+                    s = senders[0]
+                    from_str = s.get("name") or s.get("addr", "?")
+                elif isinstance(senders, dict):
+                    from_str = senders.get("name") or senders.get("addr", "?")
+                else:
+                    from_str = str(senders)
+                subject = env.get("subject", "(no subject)")
+                date = env.get("date", "")
+                lines.append(f"  [{eid}] {from_str} — {subject}  ({date})")
+            result = f"Search results for '{query}' ({len(envelopes)}):\n" + "\n".join(lines) + "\n"
+            self.after(0, lambda r=result: self._whimai_append(r, "ai"))
+            self._whimai_chat_history.append({"role": "assistant", "content": result})
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _execute_tool_call(self, tool_name, arguments):
+        """Dispatch an Ollama tool call to the appropriate executor."""
+        if tool_name == "email_himalaya":
+            return self._tool_exec_email(arguments)
+        return {"error": f"Unknown tool: {tool_name}"}
+
+    def _tool_exec_email(self, args):
+        """Execute email_himalaya tool call. Returns dict with result."""
+        action = args.get("action", "list")
+        folder = args.get("folder", "INBOX")
+        if action == "list":
+            count = min(max(args.get("count", 5), 1), 20)
+            out, err = self._email_run_cmd(
+                ["envelope", "list", "-o", "json", "--page-size", str(count),
+                 "--folder", folder], timeout=20)
+            if err:
+                return {"error": err}
+            try:
+                envelopes = json.loads(out)
+            except (json.JSONDecodeError, TypeError):
+                return {"error": "Failed to parse email list"}
+            summaries = []
+            for env in envelopes:
+                eid = env.get("id", "?")
+                senders = env.get("from", {})
+                if isinstance(senders, list) and senders:
+                    s = senders[0]
+                    from_str = s.get("name") or s.get("addr", "?")
+                elif isinstance(senders, dict):
+                    from_str = senders.get("name") or senders.get("addr", "?")
+                else:
+                    from_str = str(senders)
+                summaries.append({
+                    "id": eid,
+                    "from": from_str,
+                    "subject": env.get("subject", ""),
+                    "date": env.get("date", ""),
+                })
+            return {"emails": summaries, "count": len(summaries), "folder": folder}
+        elif action == "read":
+            mid = args.get("message_id", "")
+            if not mid:
+                return {"error": "message_id is required for read action"}
+            out, err = self._email_run_cmd(
+                ["message", "read", "-o", "plain", "--folder", folder, str(mid)],
+                timeout=20)
+            if err:
+                return {"error": err}
+            return {"message_id": mid, "body": out, "folder": folder}
+        elif action == "search":
+            query = args.get("query", "")
+            if not query:
+                return {"error": "query is required for search action"}
+            out, err = self._email_run_cmd(
+                ["envelope", "list", "-o", "json", "--page-size", "10",
+                 "--folder", folder, "from", query], timeout=20)
+            if err:
+                return {"error": err}
+            try:
+                envelopes = json.loads(out)
+            except (json.JSONDecodeError, TypeError):
+                return {"error": "Failed to parse search results"}
+            summaries = []
+            for env in envelopes:
+                eid = env.get("id", "?")
+                senders = env.get("from", {})
+                if isinstance(senders, list) and senders:
+                    s = senders[0]
+                    from_str = s.get("name") or s.get("addr", "?")
+                elif isinstance(senders, dict):
+                    from_str = senders.get("name") or senders.get("addr", "?")
+                else:
+                    from_str = str(senders)
+                summaries.append({
+                    "id": eid, "from": from_str,
+                    "subject": env.get("subject", ""),
+                    "date": env.get("date", ""),
+                })
+            return {"results": summaries, "query": query, "count": len(summaries)}
+        return {"error": f"Unknown action: {action}"}
+
+    _TOOL_CAPABLE_MODELS = {
+        "llama3.1", "llama3.2", "llama3.3", "llama4",
+        "qwen2.5", "qwen3", "mistral", "command-r",
+        "firefunction", "nexusraven",
+    }
+
+    def _model_supports_tools(self):
+        """Check if the active model supports Ollama native tool calling."""
+        model = self._whimai_model.lower().split(":")[0]
+        return any(model.startswith(prefix) for prefix in self._TOOL_CAPABLE_MODELS)
+
+    def _build_ollama_tools(self):
+        """Build Ollama-compatible tool definitions from enabled tools in current preset."""
+        if not self._model_supports_tools():
+            return []
+        preset = self._whimai_active_preset
+        enabled_ids = self._tool_registry.get_tool_ids_for_preset(preset)
+        tools = []
+        if "email_himalaya" in enabled_ids:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "email_himalaya",
+                    "description": (
+                        "Access the user's real email inbox via Himalaya CLI. "
+                        "ALWAYS use this tool when asked about email — never guess or "
+                        "hallucinate email content."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["list", "read", "search"],
+                                "description": "list=recent inbox headers, read=full email by ID, search=find emails"
+                            },
+                            "message_id": {
+                                "type": "string",
+                                "description": "Email ID (required for read)"
+                            },
+                            "folder": {
+                                "type": "string",
+                                "description": "Email folder (default: INBOX)"
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "Search query (for search action)"
+                            },
+                            "count": {
+                                "type": "integer",
+                                "description": "Number of messages to list (default 5)"
+                            }
+                        },
+                        "required": ["action"]
+                    }
+                }
+            })
+        return tools
+
+    def _email_compose(self):
+        win = tk.Toplevel(self)
+        win.title("Compose Email")
+        win.geometry("600x500")
+        win.configure(bg=TH["bg"])
+
+        fields = tk.Frame(win, bg=TH["bg"])
+        fields.pack(fill="x", padx=8, pady=8)
+
+        to_var = tk.StringVar()
+        subject_var = tk.StringVar()
+        for label_text, var in [("To:", to_var), ("Subject:", subject_var)]:
+            row = tk.Frame(fields, bg=TH["bg"])
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=label_text, bg=TH["bg"], fg=TH["fg2"],
+                     font=(_FONTS["ui"], 9, "bold"), width=8, anchor="e").pack(side="left")
+            self._entry(row, var).pack(side="left", fill="x", expand=True, padx=4)
+
+        body_text = self._text_widget(win, wrap="word")
+        body_text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        btn_frame = tk.Frame(win, bg=TH["bg"])
+        btn_frame.pack(fill="x", padx=8, pady=(0, 8))
+
+        status = tk.StringVar(value="")
+        tk.Label(btn_frame, textvariable=status, bg=TH["bg"], fg=TH["green"],
+                 font=TH["font_sm"]).pack(side="left", padx=8)
+
+        def send():
+            to = to_var.get().strip()
+            subj = subject_var.get().strip()
+            body = body_text.get("1.0", "end").strip()
+            if not to:
+                status.set("Recipient required")
+                return
+            raw = f"From: Tommy Munro <mtj0454@gmail.com>\r\n"
+            raw += f"To: {to}\r\n"
+            raw += f"Subject: {subj}\r\n"
+            raw += f"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            raw += body
+            status.set("Sending...")
+            def _send():
+                try:
+                    r = subprocess.run(
+                        [self._HIMALAYA_BIN, "message", "send"],
+                        input=raw, capture_output=True, text=True, timeout=30)
+                    if r.returncode == 0:
+                        self.after(0, lambda: status.set("Sent!"))
+                        self.after(2000, win.destroy)
+                    else:
+                        self.after(0, lambda: status.set(f"Error: {r.stderr[:60]}"))
+                except Exception as e:
+                    self.after(0, lambda: status.set(str(e)[:60]))
+            threading.Thread(target=_send, daemon=True).start()
+
+        self._btn(btn_frame, "Send", send).pack(side="right", padx=4, pady=4)
+        self._btn(btn_frame, "Cancel", win.destroy).pack(side="right", padx=4, pady=4)
+
+    def _email_reply(self):
+        sel = self._email_tree.selection()
+        if not sel:
+            return
+        vals = self._email_tree.item(sel[0], "values")
+        if not vals:
+            return
+        eid = vals[0]
+        env = next((e for e in self._email_envelopes
+                     if str(e.get("id", "")) == str(eid)), {})
+        senders = env.get("from", {})
+        if isinstance(senders, list) and senders:
+            s = senders[0]
+            reply_to = s.get("addr", "")
+        elif isinstance(senders, dict):
+            reply_to = senders.get("addr", "")
+        else:
+            reply_to = ""
+        subject = env.get("subject", "")
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+        original_body = self._email_body.get("1.0", "end").strip()
+
+        win = tk.Toplevel(self)
+        win.title("Reply")
+        win.geometry("600x500")
+        win.configure(bg=TH["bg"])
+
+        fields = tk.Frame(win, bg=TH["bg"])
+        fields.pack(fill="x", padx=8, pady=8)
+        to_var = tk.StringVar(value=reply_to)
+        subject_var = tk.StringVar(value=subject)
+        for label_text, var in [("To:", to_var), ("Subject:", subject_var)]:
+            row = tk.Frame(fields, bg=TH["bg"])
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=label_text, bg=TH["bg"], fg=TH["fg2"],
+                     font=(_FONTS["ui"], 9, "bold"), width=8, anchor="e").pack(side="left")
+            self._entry(row, var).pack(side="left", fill="x", expand=True, padx=4)
+
+        body_text = self._text_widget(win, wrap="word")
+        body_text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        quoted = "\n".join(f"> {line}" for line in original_body.split("\n"))
+        body_text.insert("1.0", f"\n\n{quoted}")
+        body_text.mark_set("insert", "1.0")
+
+        btn_frame = tk.Frame(win, bg=TH["bg"])
+        btn_frame.pack(fill="x", padx=8, pady=(0, 8))
+        status = tk.StringVar(value="")
+        tk.Label(btn_frame, textvariable=status, bg=TH["bg"], fg=TH["green"],
+                 font=TH["font_sm"]).pack(side="left", padx=8)
+
+        def send():
+            to = to_var.get().strip()
+            subj = subject_var.get().strip()
+            body = body_text.get("1.0", "end").strip()
+            if not to:
+                status.set("Recipient required")
+                return
+            raw = f"From: Tommy Munro <mtj0454@gmail.com>\r\n"
+            raw += f"To: {to}\r\n"
+            raw += f"Subject: {subj}\r\n"
+            raw += f"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            raw += body
+            status.set("Sending...")
+            def _send():
+                try:
+                    r = subprocess.run(
+                        [self._HIMALAYA_BIN, "message", "send"],
+                        input=raw, capture_output=True, text=True, timeout=30)
+                    if r.returncode == 0:
+                        self.after(0, lambda: status.set("Sent!"))
+                        self.after(2000, win.destroy)
+                    else:
+                        self.after(0, lambda: status.set(f"Error: {r.stderr[:60]}"))
+                except Exception as e:
+                    self.after(0, lambda: status.set(str(e)[:60]))
+            threading.Thread(target=_send, daemon=True).start()
+
+        self._btn(btn_frame, "Send", send).pack(side="right", padx=4, pady=4)
+        self._btn(btn_frame, "Cancel", win.destroy).pack(side="right", padx=4, pady=4)
+
+    def _email_delete(self):
+        sel = self._email_tree.selection()
+        if not sel:
+            return
+        vals = self._email_tree.item(sel[0], "values")
+        if not vals:
+            return
+        eid = vals[0]
+        folder = self._email_folder_var.get()
+        self._email_status.set("Deleting...")
+        def _del():
+            out, err = self._email_run_cmd(
+                ["message", "delete", "--folder", folder, str(eid)], timeout=15)
+            if err:
+                self.after(0, lambda: self._email_status.set(f"Delete error: {err[:60]}"))
+            else:
+                self.after(0, self._email_refresh)
+        threading.Thread(target=_del, daemon=True).start()
+
+    # ==================== BRAIN TAB ====================
+    _GBRAIN_BUN = os.path.expanduser("~/.bun/bin/bun")
+    _GBRAIN_DIR = os.path.expanduser("~/gbrain")
+    _GBRAIN_CLI = os.path.join(_GBRAIN_DIR, "src", "cli.ts")
+
+    def _gbrain_exec(self, args, timeout=30):
+        """Run a gbrain CLI command and return (returncode, stdout, stderr)."""
+        import subprocess as _sp
+        try:
+            r = _sp.run(
+                [self._GBRAIN_BUN, "run", self._GBRAIN_CLI] + args,
+                capture_output=True, text=True, timeout=timeout,
+                cwd=self._GBRAIN_DIR)
+            return r.returncode, r.stdout.strip(), r.stderr.strip()
+        except Exception as ex:
+            return -1, "", str(ex)
+
+    def build_brain(self):
+        f = self.tabs["brain"]
+        outer = tk.Frame(f, bg=TH["bg"])
+        outer.pack(fill="both", expand=True, padx=16, pady=12)
+
+        # -- Header --
+        hdr = tk.Frame(outer, bg=TH["bg"])
+        hdr.pack(fill="x", pady=(0, 8))
+        tk.Label(hdr, text="BRAIN", bg=TH["bg"], fg="#2fa572",
+                 font=(_FONTS["ui"], 16, "bold")).pack(side="left")
+        tk.Label(hdr, text="GBrain Knowledge Engine  \u2014  persistent memory for Whim.ai",
+                 bg=TH["bg"], fg=TH["fg2"], font=(_FONTS["ui"], 9)).pack(side="left", padx=(12, 0))
+        tk.Label(hdr, text="Ctrl+Shift+G from any tab", bg=TH["bg"], fg=TH["fg_dim"],
+                 font=(_FONTS["mono"], 8)).pack(side="right")
+
+        # -- Mode selector (sub-notebook) --
+        brain_nb = ttk.Notebook(outer)
+        brain_nb.pack(fill="both", expand=True)
+
+        search_tab = tk.Frame(brain_nb, bg=TH["bg"])
+        timeline_tab = tk.Frame(brain_nb, bg=TH["bg"])
+        entities_tab = tk.Frame(brain_nb, bg=TH["bg"])
+        ops_tab = tk.Frame(brain_nb, bg=TH["bg"])
+        brain_nb.add(search_tab, text="  Search & Query  ")
+        brain_nb.add(timeline_tab, text="  Timeline  ")
+        brain_nb.add(entities_tab, text="  Entity Explorer  ")
+        brain_nb.add(ops_tab, text="  Operations  ")
+
+        self._build_brain_search_tab(search_tab)
+        self._build_brain_timeline_tab(timeline_tab)
+        self._build_brain_entities_tab(entities_tab)
+        self._build_brain_ops_tab(ops_tab)
+
+        # -- Bottom activity feed --
+        feed_card = self._card(outer, "RECENT BRAIN ACTIVITY", fg="#8a7a6a")
+        feed_card.pack(fill="x", pady=(8, 0))
+        feed_inner = tk.Frame(feed_card, bg=TH["card"])
+        feed_inner.pack(fill="x", padx=10, pady=(0, 6))
+        self._brain_feed_text = tk.Text(feed_inner, bg=TH["input"], fg=TH["fg"],
+                                        font=(_FONTS["mono"], 8), height=4,
+                                        relief="flat", bd=1, highlightthickness=0,
+                                        state="disabled", wrap="word")
+        self._brain_feed_text.pack(fill="x", pady=2)
+
+        # -- Status strip --
+        try:
+            from whim_dictionary import WHIM_DICTIONARY
+            term_count = len(WHIM_DICTIONARY)
+        except ImportError:
+            term_count = 0
+        strip = tk.Frame(outer, bg=TH["card"], bd=0,
+                         highlightthickness=1, highlightbackground=TH["border"])
+        strip.pack(fill="x", pady=(4, 0))
+        self._brain_strip_lbl = tk.Label(
+            strip, text=f"Dict: {term_count} terms  |  GBrain v0.28.9  |  PGLite (local)  |  Loading...",
+            bg=TH["card"], fg=TH["fg2"], font=(_FONTS["mono"], 8), padx=10, pady=3)
+        self._brain_strip_lbl.pack(anchor="w")
+
+        self._brain_load_settings()
+        self.after(600, self._brain_refresh_status)
+        self.after(800, self._brain_refresh_feed)
+
+    # ── Search & Query sub-tab ──────────────────────────────────────
+
+    def _build_brain_search_tab(self, parent):
+        wrap = tk.Frame(parent, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=4, pady=8)
+
+        # Smart search bar
+        search_frame = tk.Frame(wrap, bg=TH["card"], bd=0,
+                                highlightthickness=1, highlightbackground=TH["border"])
+        search_frame.pack(fill="x", pady=(0, 8))
+        search_inner = tk.Frame(search_frame, bg=TH["card"])
+        search_inner.pack(fill="x", padx=10, pady=8)
+
+        tk.Label(search_inner, text="\U0001f9e0", bg=TH["card"],
+                 font=(_FONTS["ui"], 14)).pack(side="left", padx=(0, 6))
+        self._brain_query_var = tk.StringVar()
+        q_entry = tk.Entry(search_inner, textvariable=self._brain_query_var,
+                           bg=TH["input"], fg=TH["fg"], insertbackground=TH["fg"],
+                           font=(_FONTS["ui"], 11), relief="flat", bd=1,
+                           highlightthickness=1, highlightcolor=TH["green"])
+        q_entry.pack(side="left", fill="x", expand=True, padx=4, ipady=4)
+        q_entry.bind("<Return>", lambda e: self._brain_smart_search())
+
+        self._btn(search_inner, "Ask Brain", self._brain_smart_search).pack(side="left", padx=4)
+        self._btn(search_inner, "\u2192 Whim.ai", self._brain_send_to_chat).pack(side="left", padx=2)
+
+        # Filter bar
+        filter_row = tk.Frame(wrap, bg=TH["bg"])
+        filter_row.pack(fill="x", pady=(0, 6))
+        tk.Label(filter_row, text="Filter:", bg=TH["bg"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._brain_filter_var = tk.StringVar(value="All")
+        for label in ["All", "Pages", "Entities", "Timeline", "Repos"]:
+            rb = tk.Radiobutton(filter_row, text=label, variable=self._brain_filter_var,
+                                value=label, bg=TH["bg"], fg=TH["fg"],
+                                selectcolor=TH["input"], activebackground=TH["bg"],
+                                activeforeground=TH["fg"], font=TH["font_sm"],
+                                highlightthickness=0, indicatoron=0, padx=8, pady=2,
+                                relief="flat", bd=1)
+            rb.pack(side="left", padx=2)
+
+        btn_row = tk.Frame(wrap, bg=TH["bg"])
+        btn_row.pack(fill="x", pady=(0, 6))
+        self._btn(btn_row, "Hybrid Query", self._brain_run_query).pack(side="left", padx=2)
+        self._btn(btn_row, "Keyword Search", self._brain_run_keyword_search).pack(side="left", padx=2)
+        self._btn(btn_row, "List Pages", self._brain_list_pages).pack(side="left", padx=2)
+        self._btn(btn_row, "Get Page", self._brain_get_page).pack(side="left", padx=2)
+        self._btn(btn_row, "Backlinks", self._brain_show_backlinks).pack(side="left", padx=2)
+
+        self._brain_action_lbl = tk.Label(btn_row, text="", bg=TH["bg"],
+                                          fg=TH["green"], font=(_FONTS["mono"], 9))
+        self._brain_action_lbl.pack(side="right", padx=8)
+
+        # Results
+        results_frame = tk.Frame(wrap, bg=TH["bg"])
+        results_frame.pack(fill="both", expand=True)
+
+        self._brain_results_text = tk.Text(results_frame, bg=TH["input"], fg=TH["fg"],
+                                           font=(_FONTS["mono"], 9),
+                                           relief="flat", bd=1, highlightthickness=0,
+                                           state="disabled", wrap="word")
+        results_scroll = self._scrollbar(results_frame, command=self._brain_results_text.yview)
+        self._brain_results_text.configure(yscrollcommand=results_scroll.set)
+        results_scroll.pack(side="right", fill="y")
+        self._brain_results_text.pack(fill="both", expand=True)
+
+    # ── Timeline sub-tab ────────────────────────────────────────────
+
+    def _build_brain_timeline_tab(self, parent):
+        wrap = tk.Frame(parent, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=4, pady=8)
+
+        ctl = tk.Frame(wrap, bg=TH["bg"])
+        ctl.pack(fill="x", pady=(0, 6))
+        tk.Label(ctl, text="Date range:", bg=TH["bg"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._brain_tl_from_var = tk.StringVar(value="")
+        self._entry(ctl, self._brain_tl_from_var, width=12).pack(side="left", padx=4)
+        tk.Label(ctl, text="to", bg=TH["bg"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._brain_tl_to_var = tk.StringVar(value="")
+        self._entry(ctl, self._brain_tl_to_var, width=12).pack(side="left", padx=4)
+        self._btn(ctl, "Load Timeline", self._brain_load_timeline).pack(side="left", padx=4)
+        self._btn(ctl, "Today", self._brain_timeline_today).pack(side="left", padx=2)
+        self._btn(ctl, "This Week", self._brain_timeline_week).pack(side="left", padx=2)
+        self._btn(ctl, "This Month", self._brain_timeline_month).pack(side="left", padx=2)
+        self._brain_tl_status = tk.Label(ctl, text="", bg=TH["bg"], fg=TH["yellow"],
+                                         font=(_FONTS["mono"], 9))
+        self._brain_tl_status.pack(side="right", padx=8)
+
+        self._brain_tl_text = tk.Text(wrap, bg=TH["input"], fg=TH["fg"],
+                                      font=(_FONTS["mono"], 9),
+                                      relief="flat", bd=1, highlightthickness=0,
+                                      state="disabled", wrap="word")
+        tl_scroll = self._scrollbar(wrap, command=self._brain_tl_text.yview)
+        self._brain_tl_text.configure(yscrollcommand=tl_scroll.set)
+        tl_scroll.pack(side="right", fill="y")
+        self._brain_tl_text.pack(fill="both", expand=True)
+
+    # ── Entity Explorer sub-tab ─────────────────────────────────────
+
+    def _build_brain_entities_tab(self, parent):
+        wrap = tk.Frame(parent, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=4, pady=8)
+
+        ctl = tk.Frame(wrap, bg=TH["bg"])
+        ctl.pack(fill="x", pady=(0, 6))
+        tk.Label(ctl, text="Type:", bg=TH["bg"], fg=TH["fg2"],
+                 font=TH["font_sm"]).pack(side="left")
+        self._brain_ent_type_var = tk.StringVar(value="people")
+        for t in ["people", "companies", "devices", "projects", "locations", "concepts"]:
+            rb = tk.Radiobutton(ctl, text=t.title(), variable=self._brain_ent_type_var,
+                                value=t, bg=TH["bg"], fg=TH["fg"],
+                                selectcolor=TH["input"], activebackground=TH["bg"],
+                                activeforeground=TH["fg"], font=TH["font_sm"],
+                                highlightthickness=0, indicatoron=0, padx=8, pady=2,
+                                relief="flat", bd=1)
+            rb.pack(side="left", padx=2)
+        self._btn(ctl, "Load", self._brain_load_entities).pack(side="left", padx=6)
+        self._brain_ent_status = tk.Label(ctl, text="", bg=TH["bg"], fg=TH["yellow"],
+                                          font=(_FONTS["mono"], 9))
+        self._brain_ent_status.pack(side="right", padx=8)
+
+        paned = tk.PanedWindow(wrap, orient="horizontal", bg=TH["bg"],
+                               sashwidth=4, sashrelief="flat")
+        paned.pack(fill="both", expand=True)
+
+        list_frame = tk.Frame(paned, bg=TH["bg"])
+        paned.add(list_frame, width=250)
+        self._brain_ent_listbox = tk.Listbox(list_frame, bg=TH["input"], fg=TH["fg"],
+                                             font=(_FONTS["mono"], 9),
+                                             selectbackground=TH["select_bg"],
+                                             highlightthickness=0, bd=1, relief="flat")
+        ent_scroll = self._scrollbar(list_frame, command=self._brain_ent_listbox.yview)
+        self._brain_ent_listbox.configure(yscrollcommand=ent_scroll.set)
+        ent_scroll.pack(side="right", fill="y")
+        self._brain_ent_listbox.pack(fill="both", expand=True)
+        self._brain_ent_listbox.bind("<<ListboxSelect>>", self._brain_on_entity_select)
+
+        detail_frame = tk.Frame(paned, bg=TH["bg"])
+        paned.add(detail_frame)
+        self._brain_ent_detail = tk.Text(detail_frame, bg=TH["input"], fg=TH["fg"],
+                                         font=(_FONTS["mono"], 9),
+                                         relief="flat", bd=1, highlightthickness=0,
+                                         state="disabled", wrap="word")
+        det_scroll = self._scrollbar(detail_frame, command=self._brain_ent_detail.yview)
+        self._brain_ent_detail.configure(yscrollcommand=det_scroll.set)
+        det_scroll.pack(side="right", fill="y")
+        self._brain_ent_detail.pack(fill="both", expand=True)
+
+        self._brain_ent_slugs = []
+
+    # ── Operations sub-tab ──────────────────────────────────────────
+
+    def _build_brain_ops_tab(self, parent):
+        wrap = tk.Frame(parent, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=4, pady=8)
+
+        cols = tk.Frame(wrap, bg=TH["bg"])
+        cols.pack(fill="both", expand=True)
+        cols.columnconfigure(0, weight=1)
+        cols.columnconfigure(1, weight=1)
+        cols.columnconfigure(2, weight=1)
+        cols.rowconfigure(0, weight=1)
+
+        # -- Col 1: Status & Health --
+        c1 = tk.Frame(cols, bg=TH["bg"])
+        c1.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        stat_card = self._card(c1, "BRAIN STATUS", fg="#8a7a6a")
+        stat_card.pack(fill="x")
+        stat_inner = tk.Frame(stat_card, bg=TH["card"])
+        stat_inner.pack(fill="x", padx=10, pady=(0, 10))
+
+        self._brain_status_text = tk.Text(stat_inner, bg=TH["input"], fg=TH["fg"],
+                                          font=(_FONTS["mono"], 9), height=10, width=36,
+                                          relief="flat", bd=1, highlightthickness=0,
+                                          state="disabled", wrap="word")
+        self._brain_status_text.pack(fill="x", pady=4)
+
+        stat_btn = tk.Frame(stat_inner, bg=TH["card"])
+        stat_btn.pack(fill="x", pady=4)
+        self._btn(stat_btn, "Refresh", self._brain_refresh_status).pack(side="left", padx=2)
+        self._btn(stat_btn, "Doctor", self._brain_run_doctor).pack(side="left", padx=2)
+        self._btn(stat_btn, "Sync", self._brain_run_sync).pack(side="left", padx=2)
+
+        # Dream Cycle card
+        dream_card = self._card(c1, "DREAM CYCLE", fg="#8a7a6a")
+        dream_card.pack(fill="x", pady=(8, 0))
+        dream_inner = tk.Frame(dream_card, bg=TH["card"])
+        dream_inner.pack(fill="x", padx=10, pady=(0, 10))
+
+        self._brain_dream_status_lbl = tk.Label(
+            dream_inner, text="Last run: unknown", bg=TH["card"], fg=TH["fg2"],
+            font=(_FONTS["mono"], 8))
+        self._brain_dream_status_lbl.pack(anchor="w", pady=2)
+
+        dream_btns = tk.Frame(dream_inner, bg=TH["card"])
+        dream_btns.pack(fill="x", pady=4)
+        self._btn(dream_btns, "Run Dream (Dry)", self._brain_dream_dry).pack(side="left", padx=2)
+        self._btn(dream_btns, "Run Dream", self._brain_dream_run).pack(side="left", padx=2)
+        self._btn(dream_btns, "Check Status", self._brain_dream_status).pack(side="left", padx=2)
+
+        self._brain_ops_lbl = tk.Label(dream_inner, text="", bg=TH["card"],
+                                       fg=TH["green"], font=(_FONTS["mono"], 9))
+        self._brain_ops_lbl.pack(anchor="w", pady=2)
+
+        # -- Col 2: Safety & Import --
+        c2 = tk.Frame(cols, bg=TH["bg"])
+        c2.grid(row=0, column=1, sticky="nsew", padx=6)
+
+        safety_card = self._card(c2, "SAFETY & PERMISSIONS", fg="#8a7a6a")
+        safety_card.pack(fill="x")
+        safety_inner = tk.Frame(safety_card, bg=TH["card"])
+        safety_inner.pack(fill="x", padx=10, pady=(0, 10))
+
+        self._brain_droid_write_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            safety_inner, text="Allow Droids to Write to Brain",
+            variable=self._brain_droid_write_var,
+            bg=TH["card"], fg="#e0a030", selectcolor=TH["input"],
+            activebackground=TH["card"], activeforeground="#e0a030",
+            font=TH["font_sm"], highlightthickness=0,
+            command=self._brain_droid_write_toggled).pack(anchor="w", pady=4)
+
+        self._brain_droid_write_warn = tk.Label(
+            safety_inner,
+            text="OFF \u2014 brain is read-only for droids and automated agents",
+            bg=TH["card"], fg=TH["fg2"], font=(_FONTS["mono"], 8),
+            wraplength=280, justify="left")
+        self._brain_droid_write_warn.pack(anchor="w", padx=(20, 0), pady=(0, 4))
+
+        self._brain_auto_enrich_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            safety_inner, text="Auto-enrich on new journal/voice entries",
+            variable=self._brain_auto_enrich_var,
+            bg=TH["card"], fg=TH["fg"], selectcolor=TH["input"],
+            activebackground=TH["card"], activeforeground=TH["fg"],
+            font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=2)
+
+        self._brain_auto_summary_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            safety_inner, text="Auto-generate daily summary pages",
+            variable=self._brain_auto_summary_var,
+            bg=TH["card"], fg=TH["fg"], selectcolor=TH["input"],
+            activebackground=TH["card"], activeforeground=TH["fg"],
+            font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=2)
+
+        self._brain_auto_sync_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            safety_inner, text="Auto-sync brain on startup",
+            variable=self._brain_auto_sync_var,
+            bg=TH["card"], fg=TH["fg"], selectcolor=TH["input"],
+            activebackground=TH["card"], activeforeground=TH["fg"],
+            font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=2)
+
+        tk.Frame(safety_inner, bg=TH["border"], height=1).pack(fill="x", pady=6)
+
+        self._brain_import_journal_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(safety_inner, text="Import ~/Journal into brain",
+                       variable=self._brain_import_journal_var,
+                       bg=TH["card"], fg=TH["fg"], selectcolor=TH["input"],
+                       activebackground=TH["card"], activeforeground=TH["fg"],
+                       font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=2)
+
+        self._brain_import_vaults_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(safety_inner, text="Import ~/vaults into brain",
+                       variable=self._brain_import_vaults_var,
+                       bg=TH["card"], fg=TH["fg"], selectcolor=TH["input"],
+                       activebackground=TH["card"], activeforeground=TH["fg"],
+                       font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=2)
+
+        imp_row = tk.Frame(safety_inner, bg=TH["card"])
+        imp_row.pack(fill="x", pady=4)
+        self._btn(imp_row, "Import Now", self._brain_run_import).pack(side="left", padx=2)
+        self._btn(imp_row, "Save Settings", self._brain_save_settings).pack(side="left", padx=2)
+
+        # -- Col 3: Export & Repos --
+        c3 = tk.Frame(cols, bg=TH["bg"])
+        c3.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+
+        export_card = self._card(c3, "EXPORT", fg="#8a7a6a")
+        export_card.pack(fill="x")
+        export_inner = tk.Frame(export_card, bg=TH["card"])
+        export_inner.pack(fill="x", padx=10, pady=(0, 10))
+
+        tk.Label(export_inner, text="Export all brain pages to a folder:",
+                 bg=TH["card"], fg=TH["fg2"], font=TH["font_sm"]).pack(anchor="w", pady=2)
+        exp_row = tk.Frame(export_inner, bg=TH["card"])
+        exp_row.pack(fill="x", pady=4)
+        self._brain_export_dir_var = tk.StringVar(value=os.path.expanduser("~/brain_export"))
+        self._entry(exp_row, self._brain_export_dir_var, width=28).pack(side="left", padx=(0, 4))
+        self._btn(exp_row, "Export Markdown", self._brain_export_md).pack(side="left", padx=2)
+        self._btn(exp_row, "Obsidian Export", self._brain_export_obsidian).pack(side="left", padx=2)
+        self._brain_export_lbl = tk.Label(export_inner, text="", bg=TH["card"],
+                                          fg=TH["green"], font=(_FONTS["mono"], 9))
+        self._brain_export_lbl.pack(anchor="w", pady=2)
+
+        repo_card = self._card(c3, "KNOWN REPOSITORIES", fg="#8a7a6a")
+        repo_card.pack(fill="x", pady=(8, 0))
+        repo_inner = tk.Frame(repo_card, bg=TH["card"])
+        repo_inner.pack(fill="x", padx=10, pady=(0, 10))
+        try:
+            from whim_dictionary import GITHUB_REPOS
+            repos = GITHUB_REPOS
+        except ImportError:
+            repos = {}
+        for name, info in repos.items():
+            r = tk.Frame(repo_inner, bg=TH["card"])
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=name, bg=TH["card"], fg="#2fa572",
+                     font=(_FONTS["mono"], 8), width=18, anchor="w").pack(side="left")
+            tk.Label(r, text=info.get("local_path", ""), bg=TH["card"], fg=TH["fg"],
+                     font=(_FONTS["mono"], 8), anchor="w").pack(side="left")
+
+    # ── Brain tab helpers ───────────────────────────────────────────
+
+    def _brain_quick_query(self):
+        """Ctrl+Shift+G — floating quick query modal from any tab."""
+        import tkinter.simpledialog as sd
+        query = sd.askstring("Ask Brain", "Natural language query:",
+                             parent=self)
+        if not query:
+            return
+        self._switch_tab("brain")
+        self._brain_query_var.set(query)
+        self._brain_smart_search()
+
+    def _brain_smart_search(self):
+        """Natural-language-aware search with filter routing."""
+        query = self._brain_query_var.get().strip()
+        if not query:
+            return
+        filt = self._brain_filter_var.get()
+        self._brain_action_lbl.config(text=f"Searching: {query[:50]}...", fg=TH["yellow"])
+        def _search():
+            if filt == "Timeline":
+                rc, out, err = self._gbrain_exec(["search", query])
+                lines = [l for l in out.splitlines() if "timeline" in l.lower()] if rc == 0 else []
+                result = "\n".join(lines) if lines else out if rc == 0 else f"Error: {err[:300]}"
+            elif filt == "Entities":
+                rc, out, err = self._gbrain_exec(["list", "--type", "person"])
+                rc2, out2, _ = self._gbrain_exec(["list", "--type", "company"])
+                combined = (out + "\n" + out2).strip()
+                q_low = query.lower()
+                matched = [l for l in combined.splitlines() if q_low in l.lower()]
+                result = "\n".join(matched) if matched else f"No entities matching '{query}'"
+            elif filt == "Repos":
+                try:
+                    from whim_dictionary import GITHUB_REPOS
+                    q_low = query.lower()
+                    lines = []
+                    for name, info in GITHUB_REPOS.items():
+                        if q_low in name.lower() or q_low in info.get("description", "").lower():
+                            lines.append(f"{name}: {info['local_path']}\n  {info.get('description', '')}")
+                    result = "\n".join(lines) if lines else f"No repos matching '{query}'"
+                except ImportError:
+                    result = "Dictionary not loaded"
+            elif filt == "Pages":
+                rc, out, err = self._gbrain_exec(["search", query])
+                result = out if rc == 0 else f"Error: {err[:300]}"
+            else:
+                rc, out, err = self._gbrain_exec(["query", query])
+                result = out if rc == 0 else f"Error: {err[:300]}"
+            self.after(0, lambda: self._brain_set_results(result))
+            self.after(0, lambda: self._brain_action_lbl.config(
+                text=f"Done ({filt})", fg=TH["green"]))
+            self.after(3000, lambda: self._brain_action_lbl.config(text=""))
+        threading.Thread(target=_search, daemon=True).start()
+
+    def _brain_run_query(self):
+        query = self._brain_query_var.get().strip()
+        if not query:
+            return
+        self._brain_action_lbl.config(text=f"Querying: {query[:40]}...", fg=TH["yellow"])
+        def _q():
+            rc, out, err = self._gbrain_exec(["query", query])
+            result = out if rc == 0 else f"Error: {err[:300]}"
+            self.after(0, lambda: self._brain_set_results(result))
+            self.after(0, lambda: self._brain_action_lbl.config(text="Query complete", fg=TH["green"]))
+            self.after(3000, lambda: self._brain_action_lbl.config(text=""))
+        threading.Thread(target=_q, daemon=True).start()
+
+    def _brain_run_keyword_search(self):
+        query = self._brain_query_var.get().strip()
+        if not query:
+            return
+        self._brain_action_lbl.config(text=f"Searching: {query[:40]}...", fg=TH["yellow"])
+        def _s():
+            rc, out, err = self._gbrain_exec(["search", query], timeout=15)
+            result = out if rc == 0 else f"Error: {err[:300]}"
+            self.after(0, lambda: self._brain_set_results(result))
+            self.after(0, lambda: self._brain_action_lbl.config(text="Search complete", fg=TH["green"]))
+            self.after(3000, lambda: self._brain_action_lbl.config(text=""))
+        threading.Thread(target=_s, daemon=True).start()
+
+    def _brain_list_pages(self):
+        self._brain_action_lbl.config(text="Listing pages...", fg=TH["yellow"])
+        def _l():
+            rc, out, err = self._gbrain_exec(["list"])
+            result = out if rc == 0 else f"Error: {err[:300]}"
+            self.after(0, lambda: self._brain_set_results(result))
+            self.after(0, lambda: self._brain_action_lbl.config(text="", fg=TH["green"]))
+        threading.Thread(target=_l, daemon=True).start()
+
+    def _brain_get_page(self):
+        import tkinter.simpledialog as sd
+        slug = sd.askstring("Get Brain Page", "Page slug (e.g. systems/whim-terminal-ecosystem):",
+                            parent=self)
+        if not slug:
+            return
+        self._brain_action_lbl.config(text=f"Loading: {slug[:40]}...", fg=TH["yellow"])
+        def _g():
+            rc, out, err = self._gbrain_exec(["get", slug])
+            result = out if rc == 0 else f"Error: {err[:300]}"
+            self.after(0, lambda: self._brain_set_results(result))
+            self.after(0, lambda: self._brain_action_lbl.config(text="", fg=TH["green"]))
+        threading.Thread(target=_g, daemon=True).start()
+
+    def _brain_show_backlinks(self):
+        import tkinter.simpledialog as sd
+        slug = sd.askstring("Backlinks", "Page slug:", parent=self)
+        if not slug:
+            return
+        self._brain_action_lbl.config(text=f"Backlinks: {slug[:30]}...", fg=TH["yellow"])
+        def _bl():
+            rc, out, err = self._gbrain_exec(["backlinks", slug])
+            result = out if rc == 0 else f"Error: {err[:300]}"
+            self.after(0, lambda: self._brain_set_results(result))
+            self.after(0, lambda: self._brain_action_lbl.config(text="", fg=TH["green"]))
+        threading.Thread(target=_bl, daemon=True).start()
+
+    def _brain_send_to_chat(self):
+        query = self._brain_query_var.get().strip()
+        results = self._brain_results_text.get("1.0", "end-1c").strip()
+        if not results:
+            self._brain_action_lbl.config(text="No results to send", fg=TH["yellow"])
+            self.after(2000, lambda: self._brain_action_lbl.config(text=""))
+            return
+        msg = f"[GBrain Results for: {query}]\n{results}" if query else f"[GBrain Results]\n{results}"
+        self._whimai_chat_history.append({"role": "assistant", "content": msg})
+        self._whimai_append(msg + "\n", "ai")
+        if query:
+            followup = (
+                f"I retrieved the above from GBrain for the query \"{query}\". "
+                "Analyze these results and tell me what you find relevant."
+            )
+            self._whimai_chat_history.append({"role": "user", "content": followup})
+            self._whimai_append(f"> {followup}\n", "user")
+            self._whimai_streaming = True
+            self.whimai_status_var.set("Thinking...")
+            threading.Thread(target=self._whimai_ollama_stream, daemon=True).start()
+        self._switch_tab("whimai")
+        self._brain_action_lbl.config(text="Sent to Whim.ai", fg=TH["green"])
+        self.after(3000, lambda: self._brain_action_lbl.config(text=""))
+
+    def _brain_set_results(self, text):
+        self._brain_results_text.config(state="normal")
+        self._brain_results_text.delete("1.0", "end")
+        self._brain_results_text.insert("1.0", text)
+        self._brain_results_text.config(state="disabled")
+
+    def _brain_set_widget(self, widget, text):
+        widget.config(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.config(state="disabled")
+
+    # ── Timeline helpers ────────────────────────────────────────────
+
+    def _brain_load_timeline(self):
+        from_d = self._brain_tl_from_var.get().strip()
+        to_d = self._brain_tl_to_var.get().strip()
+        self._brain_tl_status.config(text="Loading...", fg=TH["yellow"])
+        def _tl():
+            args = ["search", f"timeline from {from_d} to {to_d}"] if from_d else ["list"]
+            rc, out, err = self._gbrain_exec(args)
+            result = out if rc == 0 else f"Error: {err[:300]}"
+            self.after(0, lambda: self._brain_set_widget(self._brain_tl_text, result))
+            self.after(0, lambda: self._brain_tl_status.config(text="", fg=TH["green"]))
+        threading.Thread(target=_tl, daemon=True).start()
+
+    def _brain_timeline_today(self):
+        from datetime import date
+        d = date.today().isoformat()
+        self._brain_tl_from_var.set(d)
+        self._brain_tl_to_var.set(d)
+        self._brain_load_timeline()
+
+    def _brain_timeline_week(self):
+        from datetime import date, timedelta
+        end = date.today()
+        start = end - timedelta(days=7)
+        self._brain_tl_from_var.set(start.isoformat())
+        self._brain_tl_to_var.set(end.isoformat())
+        self._brain_load_timeline()
+
+    def _brain_timeline_month(self):
+        from datetime import date, timedelta
+        end = date.today()
+        start = end - timedelta(days=30)
+        self._brain_tl_from_var.set(start.isoformat())
+        self._brain_tl_to_var.set(end.isoformat())
+        self._brain_load_timeline()
+
+    # ── Entity Explorer helpers ─────────────────────────────────────
+
+    def _brain_load_entities(self):
+        etype = self._brain_ent_type_var.get()
+        self._brain_ent_status.config(text=f"Loading {etype}...", fg=TH["yellow"])
+        def _le():
+            rc, out, err = self._gbrain_exec(["list", "--type", etype])
+            if rc != 0:
+                rc, out, err = self._gbrain_exec(["search", etype])
+            slugs = []
+            for line in out.splitlines():
+                line = line.strip()
+                if line and not line.startswith("(") and not line.startswith("-"):
+                    slugs.append(line.split()[0] if " " in line else line)
+            self._brain_ent_slugs = slugs
+            def _update():
+                self._brain_ent_listbox.delete(0, "end")
+                for s in slugs:
+                    name = s.rsplit("/", 1)[-1].replace("-", " ").title()
+                    self._brain_ent_listbox.insert("end", f"  {name}")
+                self._brain_ent_status.config(
+                    text=f"{len(slugs)} {etype}" if slugs else f"No {etype} found",
+                    fg=TH["green"] if slugs else TH["fg2"])
+            self.after(0, _update)
+        threading.Thread(target=_le, daemon=True).start()
+
+    def _brain_on_entity_select(self, event):
+        sel = self._brain_ent_listbox.curselection()
+        if not sel or sel[0] >= len(self._brain_ent_slugs):
+            return
+        slug = self._brain_ent_slugs[sel[0]]
+        self._brain_ent_status.config(text=f"Loading {slug}...", fg=TH["yellow"])
+        def _load():
+            rc, page, err = self._gbrain_exec(["get", slug])
+            parts = [page if rc == 0 else f"Error loading: {err[:200]}"]
+            rc2, bl, _ = self._gbrain_exec(["backlinks", slug])
+            if rc2 == 0 and bl.strip():
+                parts.append(f"\n{'='*50}\nBACKLINKS\n{'='*50}\n{bl}")
+            result = "\n".join(parts)
+            self.after(0, lambda: self._brain_set_widget(self._brain_ent_detail, result))
+            self.after(0, lambda: self._brain_ent_status.config(text="", fg=TH["green"]))
+        threading.Thread(target=_load, daemon=True).start()
+
+    # ── Operations helpers ──────────────────────────────────────────
+
+    def _brain_droid_write_toggled(self):
+        if self._brain_droid_write_var.get():
+            import tkinter.messagebox as mb
+            ok = mb.askyesno(
+                "Enable Droid Brain Writes",
+                "This allows automated droids and agents to write pages, "
+                "links, and timeline entries to your brain.\n\n"
+                "Droids will be able to:\n"
+                "  \u2022 Create and update brain pages\n"
+                "  \u2022 Add entity links and backlinks\n"
+                "  \u2022 Write timeline entries\n"
+                "  \u2022 Run enrichment pipelines\n\n"
+                "Are you sure you want to enable this?",
+                parent=self)
+            if not ok:
+                self._brain_droid_write_var.set(False)
+                return
+            self._brain_droid_write_warn.config(
+                text="ON \u2014 droids CAN write to brain (pages, links, timeline)",
+                fg="#e0a030")
+        else:
+            self._brain_droid_write_warn.config(
+                text="OFF \u2014 brain is read-only for droids and automated agents",
+                fg=TH["fg2"])
+
+    def _brain_refresh_status(self):
+        def _check():
+            lines = []
+            if os.path.isfile(self._GBRAIN_CLI) and os.path.isfile(self._GBRAIN_BUN):
+                lines.append("[OK]  GBrain installed at ~/gbrain")
+            else:
+                lines.append("[MISS] GBrain not found")
+                self.after(0, lambda: self._brain_set_status("\n".join(lines)))
+                return
+            if os.path.isdir(os.path.expanduser("~/.gbrain")):
+                lines.append("[OK]  Brain data at ~/.gbrain")
+            else:
+                lines.append("[MISS] No brain database")
+            rc, out, err = self._gbrain_exec(["stats"], timeout=15)
+            if rc == 0:
+                for line in out.splitlines():
+                    lines.append("      " + line.strip())
+            else:
+                lines.append("[WARN] gbrain stats returned error")
+            droid_mode = "ENABLED" if self._brain_droid_write_var.get() else "DISABLED"
+            lines.append("")
+            lines.append(f"Droid writes: {droid_mode}")
+            auto_enrich = "ON" if getattr(self, "_brain_auto_enrich_var", None) and self._brain_auto_enrich_var.get() else "OFF"
+            auto_summary = "ON" if getattr(self, "_brain_auto_summary_var", None) and self._brain_auto_summary_var.get() else "OFF"
+            lines.append(f"Auto-enrich: {auto_enrich}  |  Auto-summary: {auto_summary}")
+            status_text = "\n".join(lines)
+            self.after(0, lambda: self._brain_set_status(status_text))
+            page_line = next((l for l in out.splitlines() if "Pages:" in l), "") if rc == 0 else ""
+            strip_text = f"Dict: {len(getattr(self, '_whim_dict', {}))}+ terms  |  GBrain v0.28.9  |  PGLite  |  {page_line.strip()}"
+            self.after(0, lambda: self._brain_strip_lbl.config(text=strip_text))
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _brain_set_status(self, text):
+        self._brain_status_text.config(state="normal")
+        self._brain_status_text.delete("1.0", "end")
+        self._brain_status_text.insert("1.0", text)
+        self._brain_status_text.config(state="disabled")
+
+    def _brain_run_doctor(self):
+        lbl = getattr(self, "_brain_ops_lbl", getattr(self, "_brain_action_lbl", None))
+        if lbl:
+            lbl.config(text="Running doctor...", fg=TH["yellow"])
+        def _doc():
+            rc, out, err = self._gbrain_exec(["doctor", "--fast"])
+            result = out if rc == 0 else f"Error: {err[:300]}"
+            self.after(0, lambda: self._brain_set_results(result))
+            if lbl:
+                self.after(0, lambda: lbl.config(text="Doctor complete", fg=TH["green"]))
+                self.after(3000, lambda: lbl.config(text=""))
+        threading.Thread(target=_doc, daemon=True).start()
+
+    def _brain_run_sync(self):
+        lbl = getattr(self, "_brain_ops_lbl", getattr(self, "_brain_action_lbl", None))
+        if lbl:
+            lbl.config(text="Syncing...", fg=TH["yellow"])
+        def _sync():
+            rc, out, err = self._gbrain_exec(["sync"], timeout=120)
+            msg = out[:400] if rc == 0 else f"Sync error: {err[:300]}"
+            color = TH["green"] if rc == 0 else "#ff4444"
+            if lbl:
+                self.after(0, lambda: lbl.config(text=msg[:80], fg=color))
+                self.after(5000, lambda: lbl.config(text=""))
+            self.after(0, self._brain_refresh_status)
+        threading.Thread(target=_sync, daemon=True).start()
+
+    def _brain_run_import(self):
+        dirs = []
+        if self._brain_import_journal_var.get():
+            dirs.append(os.path.expanduser("~/Journal"))
+        if self._brain_import_vaults_var.get():
+            dirs.append(os.path.expanduser("~/vaults"))
+        if not dirs:
+            lbl = getattr(self, "_brain_ops_lbl", getattr(self, "_brain_action_lbl", None))
+            if lbl:
+                lbl.config(text="Select import source first", fg=TH["yellow"])
+                self.after(3000, lambda: lbl.config(text=""))
+            return
+        lbl = getattr(self, "_brain_ops_lbl", getattr(self, "_brain_action_lbl", None))
+        if lbl:
+            lbl.config(text=f"Importing {len(dirs)} source(s)...", fg=TH["yellow"])
+        def _imp():
+            results = []
+            for d in dirs:
+                if not os.path.isdir(d):
+                    results.append(f"[SKIP] {d} not found")
+                    continue
+                rc, out, err = self._gbrain_exec(["import", d], timeout=300)
+                results.append(f"[OK]  {d}" if rc == 0 else f"[ERR] {d}: {err[:100]}")
+            msg = "\n".join(results)
+            if lbl:
+                self.after(0, lambda: lbl.config(
+                    text=msg[:80], fg=TH["green"] if "[ERR]" not in msg else "#ff4444"))
+                self.after(5000, lambda: lbl.config(text=""))
+            self.after(0, self._brain_refresh_status)
+        threading.Thread(target=_imp, daemon=True).start()
+
+    # ── Dream Cycle helpers ─────────────────────────────────────────
+
+    def _brain_dream_dry(self):
+        self._brain_ops_lbl.config(text="Dream dry-run...", fg=TH["yellow"])
+        def _d():
+            rc, out, err = self._gbrain_exec(["dream", "--dry-run"], timeout=60)
+            result = out if rc == 0 else f"Error: {err[:300]}"
+            self.after(0, lambda: self._brain_set_results(result))
+            self.after(0, lambda: self._brain_ops_lbl.config(text="Dry run complete", fg=TH["green"]))
+            self.after(3000, lambda: self._brain_ops_lbl.config(text=""))
+        threading.Thread(target=_d, daemon=True).start()
+
+    def _brain_dream_run(self):
+        import tkinter.messagebox as mb
+        ok = mb.askyesno("Run Dream Cycle",
+                         "This runs the full 8-phase dream cycle:\n"
+                         "lint > backlinks > sync > synthesize > extract > patterns > embed > orphans\n\n"
+                         "This may take several minutes. Continue?",
+                         parent=self)
+        if not ok:
+            return
+        self._brain_ops_lbl.config(text="Dream cycle running...", fg=TH["yellow"])
+        def _d():
+            rc, out, err = self._gbrain_exec(["dream"], timeout=600)
+            result = out if rc == 0 else f"Error: {err[:300]}"
+            self.after(0, lambda: self._brain_set_results(result))
+            self.after(0, lambda: self._brain_ops_lbl.config(text="Dream cycle complete", fg=TH["green"]))
+            self.after(5000, lambda: self._brain_ops_lbl.config(text=""))
+            self.after(0, self._brain_refresh_status)
+            self.after(0, self._brain_refresh_feed)
+        threading.Thread(target=_d, daemon=True).start()
+
+    def _brain_dream_status(self):
+        self._brain_ops_lbl.config(text="Checking dream status...", fg=TH["yellow"])
+        def _ds():
+            rc, out, err = self._gbrain_exec(["dream", "--dry-run"], timeout=15)
+            result = out if rc == 0 else f"Error: {err[:200]}"
+            self.after(0, lambda: self._brain_dream_status_lbl.config(
+                text=result[:120] if rc == 0 else "Could not check"))
+            self.after(0, lambda: self._brain_ops_lbl.config(text="", fg=TH["green"]))
+        threading.Thread(target=_ds, daemon=True).start()
+
+    # ── Export helpers ──────────────────────────────────────────────
+
+    def _brain_export_md(self):
+        out_dir = self._brain_export_dir_var.get().strip()
+        if not out_dir:
+            return
+        self._brain_export_lbl.config(text="Exporting...", fg=TH["yellow"])
+        def _exp():
+            rc, out, err = self._gbrain_exec(["export", "--dir", out_dir], timeout=120)
+            msg = out[:200] if rc == 0 else f"Error: {err[:200]}"
+            color = TH["green"] if rc == 0 else "#ff4444"
+            self.after(0, lambda: self._brain_export_lbl.config(text=msg[:80], fg=color))
+            self.after(5000, lambda: self._brain_export_lbl.config(text=""))
+        threading.Thread(target=_exp, daemon=True).start()
+
+    def _brain_export_obsidian(self):
+        out_dir = self._brain_export_dir_var.get().strip()
+        if not out_dir:
+            return
+        out_dir = out_dir.rstrip("/") + "_obsidian"
+        self._brain_export_lbl.config(text="Exporting (Obsidian)...", fg=TH["yellow"])
+        def _exp():
+            rc, out, err = self._gbrain_exec(["export", "--dir", out_dir], timeout=120)
+            if rc == 0:
+                # Convert wikilinks [[slug]] to Obsidian format
+                import glob as _glob
+                count = 0
+                for md_file in _glob.glob(os.path.join(out_dir, "**", "*.md"), recursive=True):
+                    try:
+                        with open(md_file, "r") as fh:
+                            content = fh.read()
+                        # Replace slug-style links with Obsidian wikilinks
+                        import re
+                        new_content = re.sub(
+                            r'\[\[([a-z0-9_/-]+)\]\]',
+                            lambda m: f'[[{m.group(1).rsplit("/", 1)[-1]}]]',
+                            content)
+                        if new_content != content:
+                            with open(md_file, "w") as fh:
+                                fh.write(new_content)
+                            count += 1
+                    except Exception:
+                        pass
+                msg = f"Exported to {out_dir} ({count} files adjusted for Obsidian)"
+            else:
+                msg = f"Error: {err[:200]}"
+            color = TH["green"] if rc == 0 else "#ff4444"
+            self.after(0, lambda: self._brain_export_lbl.config(text=msg[:80], fg=color))
+            self.after(5000, lambda: self._brain_export_lbl.config(text=""))
+        threading.Thread(target=_exp, daemon=True).start()
+
+    # ── Activity Feed ───────────────────────────────────────────────
+
+    def _brain_refresh_feed(self):
+        def _feed():
+            rc, out, err = self._gbrain_exec(["list"], timeout=10)
+            if rc == 0 and out.strip():
+                lines = out.strip().splitlines()[-8:]
+                result = "Recent pages:\n" + "\n".join(f"  {l.strip()}" for l in lines)
+            elif rc == 0:
+                result = "Brain is empty. Import content or create pages to see activity."
+            else:
+                result = f"Feed unavailable: {err[:100]}"
+            self.after(0, lambda: self._brain_set_widget(self._brain_feed_text, result))
+        threading.Thread(target=_feed, daemon=True).start()
+
+    # ── Auto-enrichment trigger (Phase 3) ───────────────────────────
+
+    def _brain_check_auto_enrich(self):
+        """Called periodically to check for new journal/voice files and auto-import."""
+        if not getattr(self, "_brain_auto_enrich_var", None):
+            return
+        if not self._brain_auto_enrich_var.get():
+            return
+        if not self._brain_droid_write_var.get():
+            return
+        def _enrich():
+            journal_dir = os.path.expanduser("~/Journal")
+            if not os.path.isdir(journal_dir):
+                return
+            marker_file = os.path.expanduser("~/.gbrain/.last_auto_enrich")
+            import time
+            last_ts = 0
+            if os.path.isfile(marker_file):
+                try:
+                    last_ts = float(open(marker_file).read().strip())
+                except Exception:
+                    pass
+            new_files = []
+            for entry in os.scandir(journal_dir):
+                if entry.is_file() and entry.stat().st_mtime > last_ts:
+                    new_files.append(entry.path)
+            if new_files:
+                self._gbrain_exec(["import", journal_dir], timeout=300)
+                with open(marker_file, "w") as fh:
+                    fh.write(str(time.time()))
+                self.after(0, self._brain_refresh_feed)
+        threading.Thread(target=_enrich, daemon=True).start()
+        self.after(300000, self._brain_check_auto_enrich)  # re-check every 5 minutes
+
+    # ── Auto-summary (Phase 3) ──────────────────────────────────────
+
+    def _brain_generate_daily_summary(self):
+        """Generate a daily summary page if auto-summary is enabled and droid writes allowed."""
+        if not getattr(self, "_brain_auto_summary_var", None):
+            return
+        if not self._brain_auto_summary_var.get():
+            return
+        if not self._brain_droid_write_var.get():
+            return
+        from datetime import date
+        today = date.today().isoformat()
+        slug = f"summaries/daily-{today}"
+        def _gen():
+            # Check if already exists
+            rc, out, _ = self._gbrain_exec(["get", slug], timeout=10)
+            if rc == 0 and out.strip():
+                return  # already generated today
+            rc, stats, _ = self._gbrain_exec(["stats"], timeout=10)
+            rc2, recent, _ = self._gbrain_exec(["list"], timeout=10)
+            recent_pages = "\n".join(recent.strip().splitlines()[-10:]) if rc2 == 0 else "(none)"
+            page_content = (
+                f"---\n"
+                f"title: \"Daily Summary — {today}\"\n"
+                f"type: summary\n"
+                f"tags: [daily, summary, auto-generated]\n"
+                f"---\n\n"
+                f"# Daily Summary — {today}\n\n"
+                f"Auto-generated by Whim Terminal Brain.\n\n"
+                f"## Brain Stats\n```\n{stats}\n```\n\n"
+                f"## Recent Pages\n```\n{recent_pages}\n```\n"
+            )
+            import subprocess as _sp
+            try:
+                proc = _sp.Popen(
+                    [self._GBRAIN_BUN, "run", self._GBRAIN_CLI, "put", slug],
+                    stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE,
+                    text=True, cwd=self._GBRAIN_DIR)
+                proc.communicate(input=page_content, timeout=30)
+            except Exception:
+                pass
+            self.after(0, self._brain_refresh_feed)
+        threading.Thread(target=_gen, daemon=True).start()
+
+    # ── Save / Load ─────────────────────────────────────────────────
+
+    def _brain_save_settings(self):
+        cfg = self._load_settings()
+        gb = cfg.get("gbrain", {})
+        gb["auto_sync"] = self._brain_auto_sync_var.get()
+        gb["import_journal"] = self._brain_import_journal_var.get()
+        gb["import_vaults"] = self._brain_import_vaults_var.get()
+        gb["droid_write"] = self._brain_droid_write_var.get()
+        gb["auto_enrich"] = self._brain_auto_enrich_var.get()
+        gb["auto_summary"] = self._brain_auto_summary_var.get()
+        gb["enabled"] = True
+        gb.setdefault("install_dir", os.path.expanduser("~/gbrain"))
+        gb.setdefault("brain_dir", os.path.expanduser("~/.gbrain"))
+        cfg["gbrain"] = gb
+        os.makedirs(os.path.dirname(WHIM_SETTINGS_FILE), exist_ok=True)
+        with open(WHIM_SETTINGS_FILE, "w") as fh:
+            json.dump(cfg, fh, indent=2)
+        lbl = getattr(self, "_brain_ops_lbl", getattr(self, "_brain_action_lbl", None))
+        if lbl:
+            lbl.config(text="Brain settings saved", fg=TH["green"])
+            self.after(3000, lambda: lbl.config(text=""))
+        # Start auto-enrichment timer if enabled
+        if self._brain_auto_enrich_var.get() and self._brain_droid_write_var.get():
+            self.after(5000, self._brain_check_auto_enrich)
+        # Generate daily summary if enabled
+        if self._brain_auto_summary_var.get() and self._brain_droid_write_var.get():
+            self.after(3000, self._brain_generate_daily_summary)
+
+    def _brain_load_settings(self):
+        cfg = self._load_settings().get("gbrain", {})
+        if hasattr(self, "_brain_droid_write_var"):
+            self._brain_droid_write_var.set(cfg.get("droid_write", False))
+            self._brain_droid_write_toggled()
+        if hasattr(self, "_brain_auto_sync_var"):
+            self._brain_auto_sync_var.set(cfg.get("auto_sync", False))
+        if hasattr(self, "_brain_auto_enrich_var"):
+            self._brain_auto_enrich_var.set(cfg.get("auto_enrich", False))
+        if hasattr(self, "_brain_auto_summary_var"):
+            self._brain_auto_summary_var.set(cfg.get("auto_summary", False))
+        if hasattr(self, "_brain_import_journal_var"):
+            self._brain_import_journal_var.set(cfg.get("import_journal", False))
+        if hasattr(self, "_brain_import_vaults_var"):
+            self._brain_import_vaults_var.set(cfg.get("import_vaults", False))
+
+    def build_settings(self):
+        f = self.tabs["settings"]
+        outer = tk.Frame(f, bg=TH["bg"])
+        outer.pack(fill="both", expand=True, padx=16, pady=12)
+
+        tk.Label(outer, text="SETTINGS", bg=TH["bg"], fg="#2fa572",
+                 font=(_FONTS["ui"], 16, "bold")).pack(anchor="w", pady=(0, 8))
+
+        settings_nb = ttk.Notebook(outer)
+        settings_nb.pack(fill="both", expand=True)
+
+        general_tab = tk.Frame(settings_nb, bg=TH["bg"])
+        toolstore_tab = tk.Frame(settings_nb, bg=TH["bg"])
+        email_tab = tk.Frame(settings_nb, bg=TH["bg"])
+        userguide_tab = tk.Frame(settings_nb, bg=TH["bg"])
+        gbrain_tab = tk.Frame(settings_nb, bg=TH["bg"])
+        settings_nb.add(general_tab, text="  General  ")
+        settings_nb.add(toolstore_tab, text="  Tool Store  ")
+        settings_nb.add(email_tab, text="  Email  ")
+        settings_nb.add(gbrain_tab, text="  GBrain  ")
+        settings_nb.add(userguide_tab, text="  User Guide  ")
+
+        wrap = tk.Frame(general_tab, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=4, pady=8)
 
         cols = tk.Frame(wrap, bg=TH["bg"])
         cols.pack(fill="both", expand=True)
@@ -12790,6 +21993,20 @@ camFlipBtn.addEventListener('click',()=>{
                  font=TH["font_sm"], width=14, anchor="w").pack(side="left")
         self._settings_st_key_var = tk.StringVar(value="")
         self._entry(r, self._settings_st_key_var, width=30, show="\u2022").pack(side="left", padx=4)
+
+        r = tk.Frame(api_inner, bg=TH["card"])
+        r.pack(fill="x", pady=4)
+        tk.Label(r, text="Anthropic Key:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"], width=14, anchor="w").pack(side="left")
+        self._settings_anthropic_key_var = tk.StringVar(value="")
+        self._entry(r, self._settings_anthropic_key_var, width=30, show="\u2022").pack(side="left", padx=4)
+
+        r = tk.Frame(api_inner, bg=TH["card"])
+        r.pack(fill="x", pady=4)
+        tk.Label(r, text="DeepSeek Key:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"], width=14, anchor="w").pack(side="left")
+        self._settings_deepseek_key_var = tk.StringVar(value="")
+        self._entry(r, self._settings_deepseek_key_var, width=30, show="\u2022").pack(side="left", padx=4)
 
         r = tk.Frame(api_inner, bg=TH["card"])
         r.pack(fill="x", pady=4)
@@ -12875,6 +22092,16 @@ camFlipBtn.addEventListener('click',()=>{
                         activebackground=TH["card"], activeforeground=TH["fg"],
                         font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=4)
 
+        tk.Frame(pref_inner, bg=TH["border"], height=1).pack(fill="x", pady=4)
+
+        self._settings_sovereign_mode = tk.BooleanVar(value=False)
+        sov_cb = tk.Checkbutton(pref_inner, text="Sovereign Mode (Local Only — no cloud fallback)",
+                        variable=self._settings_sovereign_mode,
+                        bg=TH["card"], fg="#e0a030", selectcolor=TH["input"],
+                        activebackground=TH["card"], activeforeground="#e0a030",
+                        font=TH["font_sm"], highlightthickness=0)
+        sov_cb.pack(anchor="w", pady=4)
+
         r = tk.Frame(pref_inner, bg=TH["card"])
         r.pack(fill="x", pady=8)
         tk.Label(r, text="Theme:", bg=TH["card"], fg=TH["fg2"],
@@ -12922,13 +22149,103 @@ camFlipBtn.addEventListener('click',()=>{
 
         self._settings_dev_widgets = []
 
-        # ---- Save button row ----
+        # ---- Save button row (General tab) ----
         save_row = tk.Frame(wrap, bg=TH["bg"])
         save_row.pack(fill="x", pady=(12, 0))
         self._btn(save_row, "Save Settings", self._settings_save_all).pack(side="left", padx=4)
         self._settings_save_lbl = tk.Label(save_row, text="", bg=TH["bg"],
                                             fg=TH["green"], font=(_FONTS["mono"], 9))
         self._settings_save_lbl.pack(side="left", padx=8)
+
+        # ======== Tool Store sub-tab (scrollable) ========
+        ts_wrap = tk.Frame(toolstore_tab, bg=TH["bg"])
+        ts_wrap.pack(fill="both", expand=True, padx=4, pady=8)
+
+        ts_top = tk.Frame(ts_wrap, bg=TH["card"], bd=0,
+                          highlightthickness=1, highlightbackground=TH["border_hi"])
+        ts_top.pack(fill="x", pady=(0, 4))
+
+        tk.Label(ts_top, text="TOOL STORE (OpenTailor)", bg=TH["card"], fg="#8a7a6a",
+                 font=(_FONTS["ui"], 11, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+
+        tailor_desc = tk.Label(
+            ts_top, text="Select capability bundles for each preset. "
+            "Critical tools require manual approval.",
+            bg=TH["card"], fg=TH["fg2"], font=(_FONTS["ui"], 9),
+            anchor="w", wraplength=600, justify="left")
+        tailor_desc.pack(fill="x", padx=10, pady=(0, 6))
+
+        tailor_preset_row = tk.Frame(ts_top, bg=TH["card"])
+        tailor_preset_row.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(tailor_preset_row, text="Configure for preset:",
+                 bg=TH["card"], fg=TH["fg2"], font=TH["font_sm"]).pack(side="left")
+        self._tailor_preset_var = tk.StringVar(value=self._whimai_active_preset)
+        tailor_preset_cb = ttk.Combobox(
+            tailor_preset_row, textvariable=self._tailor_preset_var,
+            values=list(self._whimai_presets.keys()), width=16, state="readonly")
+        tailor_preset_cb.pack(side="left", padx=4)
+        tailor_preset_cb.bind("<<ComboboxSelected>>",
+                              lambda e: self._opentailor_refresh_bundles())
+
+        ts_scroll_frame = tk.Frame(ts_wrap, bg=TH["card"])
+        ts_scroll_frame.pack(fill="both", expand=True, pady=(0, 4))
+
+        self._ts_canvas = tk.Canvas(ts_scroll_frame, bg=TH["card"],
+                                    highlightthickness=0, bd=0)
+        ts_scrollbar = tk.Scrollbar(ts_scroll_frame, orient="vertical",
+                                    command=self._ts_canvas.yview)
+        self._ts_canvas.configure(yscrollcommand=ts_scrollbar.set)
+        ts_scrollbar.pack(side="right", fill="y")
+        self._ts_canvas.pack(side="left", fill="both", expand=True)
+
+        self._tailor_bundle_frame = tk.Frame(self._ts_canvas, bg=TH["card"])
+        self._ts_canvas_win = self._ts_canvas.create_window(
+            (0, 0), window=self._tailor_bundle_frame, anchor="nw")
+
+        def _ts_on_frame_cfg(e):
+            self._ts_canvas.configure(scrollregion=self._ts_canvas.bbox("all"))
+        def _ts_on_canvas_cfg(e):
+            self._ts_canvas.itemconfig(self._ts_canvas_win, width=e.width)
+        self._tailor_bundle_frame.bind("<Configure>", _ts_on_frame_cfg)
+        self._ts_canvas.bind("<Configure>", _ts_on_canvas_cfg)
+
+        def _ts_scroll_up(e):
+            self._ts_canvas.yview_scroll(-3, "units")
+        def _ts_scroll_down(e):
+            self._ts_canvas.yview_scroll(3, "units")
+        def _ts_enter_scroll(e):
+            self._ts_canvas.bind_all("<Button-4>", _ts_scroll_up)
+            self._ts_canvas.bind_all("<Button-5>", _ts_scroll_down)
+        def _ts_leave_scroll(e):
+            self._ts_canvas.unbind_all("<Button-4>")
+            self._ts_canvas.unbind_all("<Button-5>")
+        ts_scroll_frame.bind("<Enter>", _ts_enter_scroll)
+        ts_scroll_frame.bind("<Leave>", _ts_leave_scroll)
+
+        self._tailor_tool_vars = {}
+        self._opentailor_build_bundle_grid()
+
+        ts_bottom = tk.Frame(ts_wrap, bg=TH["bg"])
+        ts_bottom.pack(fill="x", pady=(4, 0))
+        self._btn(ts_bottom, "Apply to Preset",
+                  self._opentailor_apply_selections).pack(side="left", padx=2)
+        self._btn(ts_bottom, "Apply to OpenClaw",
+                  self._opentailor_apply_openclaw).pack(side="left", padx=2)
+        self._btn(ts_bottom, "Save Settings",
+                  self._settings_save_all).pack(side="left", padx=2)
+        self._tailor_status_lbl = tk.Label(
+            ts_bottom, text="", bg=TH["bg"], fg=TH["green"],
+            font=(_FONTS["mono"], 9))
+        self._tailor_status_lbl.pack(side="left", padx=8)
+
+        # ======== Email sub-tab ========
+        self._build_email_settings(email_tab)
+
+        # ======== GBrain sub-tab ========
+        self._build_gbrain_settings(gbrain_tab)
+
+        # ======== User Guide sub-tab ========
+        self._build_user_guide(userguide_tab)
 
         self._settings_load_all()
         self.after(500, self._settings_refresh_models)
@@ -13159,22 +22476,307 @@ camFlipBtn.addEventListener('click',()=>{
                     text=f"Push error: {ex}", fg="#ff4444"))
         threading.Thread(target=_push, daemon=True).start()
 
+    def _build_gbrain_settings(self, parent):
+        wrap = tk.Frame(parent, bg=TH["bg"])
+        wrap.pack(fill="both", expand=True, padx=4, pady=8)
+
+        cols = tk.Frame(wrap, bg=TH["bg"])
+        cols.pack(fill="both", expand=True)
+        cols.columnconfigure(0, weight=1)
+        cols.columnconfigure(1, weight=1)
+        cols.rowconfigure(0, weight=1)
+
+        # ---- Column 1: GBrain Configuration ----
+        c1 = tk.Frame(cols, bg=TH["bg"])
+        c1.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        cfg_card = self._card(c1, "GBRAIN CONFIGURATION", fg="#8a7a6a")
+        cfg_card.pack(fill="x")
+        cfg_inner = tk.Frame(cfg_card, bg=TH["card"])
+        cfg_inner.pack(fill="x", padx=10, pady=(0, 10))
+
+        self._gbrain_enabled_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(cfg_inner, text="Enable GBrain Integration",
+                       variable=self._gbrain_enabled_var,
+                       bg=TH["card"], fg="#2fa572", selectcolor=TH["input"],
+                       activebackground=TH["card"], activeforeground="#2fa572",
+                       font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=4)
+
+        r = tk.Frame(cfg_inner, bg=TH["card"])
+        r.pack(fill="x", pady=4)
+        tk.Label(r, text="Install Dir:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"], width=14, anchor="w").pack(side="left")
+        self._gbrain_install_dir_var = tk.StringVar(
+            value=os.path.expanduser("~/gbrain"))
+        self._entry(r, self._gbrain_install_dir_var, width=36).pack(side="left", padx=4)
+
+        r = tk.Frame(cfg_inner, bg=TH["card"])
+        r.pack(fill="x", pady=4)
+        tk.Label(r, text="Brain Dir:", bg=TH["card"], fg=TH["fg2"],
+                 font=TH["font_sm"], width=14, anchor="w").pack(side="left")
+        self._gbrain_brain_dir_var = tk.StringVar(
+            value=os.path.expanduser("~/.gbrain"))
+        self._entry(r, self._gbrain_brain_dir_var, width=36).pack(side="left", padx=4)
+
+        tk.Frame(cfg_inner, bg=TH["border"], height=1).pack(fill="x", pady=6)
+
+        self._gbrain_auto_sync_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(cfg_inner, text="Auto-sync brain on startup",
+                       variable=self._gbrain_auto_sync_var,
+                       bg=TH["card"], fg=TH["fg"], selectcolor=TH["input"],
+                       activebackground=TH["card"], activeforeground=TH["fg"],
+                       font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=2)
+
+        self._gbrain_mcp_serve_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(cfg_inner, text="Start GBrain MCP server on launch",
+                       variable=self._gbrain_mcp_serve_var,
+                       bg=TH["card"], fg=TH["fg"], selectcolor=TH["input"],
+                       activebackground=TH["card"], activeforeground=TH["fg"],
+                       font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=2)
+
+        self._gbrain_import_journal_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(cfg_inner, text="Import ~/Journal into brain",
+                       variable=self._gbrain_import_journal_var,
+                       bg=TH["card"], fg=TH["fg"], selectcolor=TH["input"],
+                       activebackground=TH["card"], activeforeground=TH["fg"],
+                       font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=2)
+
+        self._gbrain_import_vaults_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(cfg_inner, text="Import ~/vaults into brain",
+                       variable=self._gbrain_import_vaults_var,
+                       bg=TH["card"], fg=TH["fg"], selectcolor=TH["input"],
+                       activebackground=TH["card"], activeforeground=TH["fg"],
+                       font=TH["font_sm"], highlightthickness=0).pack(anchor="w", pady=2)
+
+        tk.Frame(cfg_inner, bg=TH["border"], height=1).pack(fill="x", pady=6)
+
+        btn_row = tk.Frame(cfg_inner, bg=TH["card"])
+        btn_row.pack(fill="x", pady=4)
+        self._btn(btn_row, "Check Status", self._gbrain_check_status).pack(side="left", padx=2)
+        self._btn(btn_row, "Run Sync", self._gbrain_run_sync).pack(side="left", padx=2)
+        self._btn(btn_row, "Run Query", self._gbrain_run_query_dialog).pack(side="left", padx=2)
+        self._btn(btn_row, "Import Now", self._gbrain_run_import).pack(side="left", padx=2)
+
+        self._gbrain_status_lbl = tk.Label(cfg_inner, text="", bg=TH["card"],
+                                           fg=TH["yellow"], font=(_FONTS["mono"], 9),
+                                           wraplength=400, justify="left")
+        self._gbrain_status_lbl.pack(anchor="w", pady=4)
+
+        # ---- Column 2: Brain Info & Repos ----
+        c2 = tk.Frame(cols, bg=TH["bg"])
+        c2.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        info_card = self._card(c2, "BRAIN STATUS", fg="#8a7a6a")
+        info_card.pack(fill="x")
+        info_inner = tk.Frame(info_card, bg=TH["card"])
+        info_inner.pack(fill="x", padx=10, pady=(0, 10))
+
+        self._gbrain_info_text = tk.Text(info_inner, bg=TH["input"], fg=TH["fg"],
+                                         font=(_FONTS["mono"], 9), height=6, width=40,
+                                         relief="flat", bd=1, highlightthickness=0,
+                                         state="disabled")
+        self._gbrain_info_text.pack(fill="x", pady=4)
+
+        repo_card = self._card(c2, "KNOWN REPOSITORIES", fg="#8a7a6a")
+        repo_card.pack(fill="x", pady=(8, 0))
+        repo_inner = tk.Frame(repo_card, bg=TH["card"])
+        repo_inner.pack(fill="x", padx=10, pady=(0, 10))
+
+        try:
+            from whim_dictionary import GITHUB_REPOS
+            repos = GITHUB_REPOS
+        except ImportError:
+            repos = {}
+
+        if repos:
+            for name, info in repos.items():
+                r = tk.Frame(repo_inner, bg=TH["card"])
+                r.pack(fill="x", pady=1)
+                tk.Label(r, text=name, bg=TH["card"], fg="#2fa572",
+                         font=(_FONTS["mono"], 8), width=18, anchor="w").pack(side="left")
+                tk.Label(r, text=info.get("local_path", ""), bg=TH["card"], fg=TH["fg"],
+                         font=(_FONTS["mono"], 8), anchor="w").pack(side="left")
+        else:
+            tk.Label(repo_inner, text="(dictionary not loaded)", bg=TH["card"],
+                     fg=TH["fg2"], font=TH["font_sm"]).pack(anchor="w")
+
+        dict_card = self._card(c2, "WHIM DICTIONARY", fg="#8a7a6a")
+        dict_card.pack(fill="x", pady=(8, 0))
+        dict_inner = tk.Frame(dict_card, bg=TH["card"])
+        dict_inner.pack(fill="x", padx=10, pady=(0, 10))
+
+        try:
+            from whim_dictionary import WHIM_DICTIONARY
+            term_count = len(WHIM_DICTIONARY)
+        except ImportError:
+            term_count = 0
+
+        tk.Label(dict_inner, text=f"{term_count} terms loaded",
+                 bg=TH["card"], fg=TH["green"] if term_count else TH["fg2"],
+                 font=(_FONTS["mono"], 9)).pack(anchor="w", pady=2)
+        tk.Label(dict_inner,
+                 text="Dictionary provides Whim.ai with ecosystem terminology,\n"
+                      "GitHub repo locations, and GBrain integration context.",
+                 bg=TH["card"], fg=TH["fg2"], font=(_FONTS["ui"], 8),
+                 justify="left").pack(anchor="w", pady=2)
+
+    def _gbrain_check_status(self):
+        self._gbrain_status_lbl.config(text="Checking...", fg=TH["yellow"])
+        def _check():
+            import subprocess as _sp
+            results = []
+            install_dir = self._gbrain_install_dir_var.get().strip()
+            brain_dir = self._gbrain_brain_dir_var.get().strip()
+            bun = os.path.expanduser("~/.bun/bin/bun")
+            cli = os.path.join(install_dir, "src", "cli.ts")
+            if os.path.isdir(install_dir) and os.path.isfile(cli):
+                results.append("[OK]  GBrain installed")
+            else:
+                results.append("[MISS] GBrain not found at " + install_dir)
+            if os.path.isdir(brain_dir):
+                results.append("[OK]  Brain data at " + brain_dir)
+            else:
+                results.append("[MISS] No brain at " + brain_dir)
+            if os.path.isfile(bun):
+                results.append("[OK]  Bun runtime found")
+            else:
+                results.append("[MISS] Bun not installed")
+            try:
+                r = _sp.run([bun, "run", cli, "stats"],
+                            capture_output=True, text=True, timeout=15,
+                            cwd=install_dir)
+                if r.returncode == 0:
+                    for line in r.stdout.strip().splitlines()[:5]:
+                        results.append("      " + line.strip())
+                else:
+                    results.append("[WARN] gbrain stats failed")
+            except Exception as ex:
+                results.append(f"[ERR]  {ex}")
+            status_text = "\n".join(results)
+            info_text = status_text
+            self.after(0, lambda: self._gbrain_status_lbl.config(
+                text=status_text, fg=TH["green"]))
+            def _update_info():
+                self._gbrain_info_text.config(state="normal")
+                self._gbrain_info_text.delete("1.0", "end")
+                self._gbrain_info_text.insert("1.0", info_text)
+                self._gbrain_info_text.config(state="disabled")
+            self.after(0, _update_info)
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _gbrain_run_sync(self):
+        self._gbrain_status_lbl.config(text="Syncing...", fg=TH["yellow"])
+        def _sync():
+            import subprocess as _sp
+            install_dir = self._gbrain_install_dir_var.get().strip()
+            bun = os.path.expanduser("~/.bun/bin/bun")
+            cli = os.path.join(install_dir, "src", "cli.ts")
+            try:
+                r = _sp.run([bun, "run", cli, "sync"],
+                            capture_output=True, text=True, timeout=120,
+                            cwd=install_dir)
+                msg = r.stdout.strip()[:200] if r.returncode == 0 else f"Sync failed: {r.stderr.strip()[:200]}"
+                color = TH["green"] if r.returncode == 0 else "#ff4444"
+            except Exception as ex:
+                msg = f"Error: {ex}"
+                color = "#ff4444"
+            self.after(0, lambda: self._gbrain_status_lbl.config(text=msg, fg=color))
+        threading.Thread(target=_sync, daemon=True).start()
+
+    def _gbrain_run_query_dialog(self):
+        import tkinter.simpledialog as sd
+        query = sd.askstring("GBrain Query", "Enter query:", parent=self)
+        if not query:
+            return
+        self._gbrain_status_lbl.config(text=f"Querying: {query[:50]}...", fg=TH["yellow"])
+        def _query():
+            import subprocess as _sp
+            install_dir = self._gbrain_install_dir_var.get().strip()
+            bun = os.path.expanduser("~/.bun/bin/bun")
+            cli = os.path.join(install_dir, "src", "cli.ts")
+            try:
+                r = _sp.run([bun, "run", cli, "query", query],
+                            capture_output=True, text=True, timeout=30,
+                            cwd=install_dir)
+                msg = r.stdout.strip()[:500] if r.returncode == 0 else f"Query failed: {r.stderr.strip()[:200]}"
+                color = TH["green"] if r.returncode == 0 else "#ff4444"
+            except Exception as ex:
+                msg = f"Error: {ex}"
+                color = "#ff4444"
+            self.after(0, lambda: self._gbrain_status_lbl.config(text=msg, fg=color))
+            if r.returncode == 0:
+                chat_msg = f"[GBrain Query: {query}]\n{msg}"
+                self._whimai_chat_history.append({"role": "assistant", "content": chat_msg})
+                self.after(0, lambda: self._whimai_append(chat_msg + "\n", "ai"))
+        threading.Thread(target=_query, daemon=True).start()
+
+    def _gbrain_run_import(self):
+        dirs = []
+        if self._gbrain_import_journal_var.get():
+            dirs.append(os.path.expanduser("~/Journal"))
+        if self._gbrain_import_vaults_var.get():
+            dirs.append(os.path.expanduser("~/vaults"))
+        if not dirs:
+            self._gbrain_status_lbl.config(
+                text="Select at least one import source above", fg=TH["yellow"])
+            return
+        self._gbrain_status_lbl.config(text=f"Importing {len(dirs)} source(s)...", fg=TH["yellow"])
+        def _imp():
+            import subprocess as _sp
+            install_dir = self._gbrain_install_dir_var.get().strip()
+            bun = os.path.expanduser("~/.bun/bin/bun")
+            cli = os.path.join(install_dir, "src", "cli.ts")
+            results = []
+            for d in dirs:
+                if not os.path.isdir(d):
+                    results.append(f"[SKIP] {d} not found")
+                    continue
+                try:
+                    r = _sp.run([bun, "run", cli, "import", d],
+                                capture_output=True, text=True, timeout=300,
+                                cwd=install_dir)
+                    if r.returncode == 0:
+                        results.append(f"[OK]  {d}")
+                    else:
+                        results.append(f"[ERR] {d}: {r.stderr.strip()[:100]}")
+                except Exception as ex:
+                    results.append(f"[ERR] {d}: {ex}")
+            msg = "\n".join(results)
+            self.after(0, lambda: self._gbrain_status_lbl.config(
+                text=msg, fg=TH["green"] if "[ERR]" not in msg else "#ff4444"))
+        threading.Thread(target=_imp, daemon=True).start()
+
     def _settings_save_all(self):
         cfg = self._load_settings()
         cfg["model"] = self._global_model_var.get()
         cfg["ollama_url"] = self._settings_ollama_url_var.get().strip()
         cfg["openai_key"] = self._settings_openai_key_var.get()
+        cfg["anthropic_key"] = self._settings_anthropic_key_var.get()
+        cfg["deepseek_key"] = self._settings_deepseek_key_var.get()
         cfg["smartthings_key"] = self._settings_st_key_var.get()
         cfg["notion_token"] = self._settings_notion_var.get()
+        cfg["sovereign_mode"] = self._settings_sovereign_mode.get()
         cfg["autostart_ingest"] = self._settings_autostart_ingest.get()
         cfg["auto_connect"] = self._settings_auto_connect.get()
         cfg["auto_tunnel_check"] = self._settings_auto_tunnel_check.get()
         cfg["theme"] = self._settings_theme_var.get()
+        cfg["gbrain"] = {
+            "enabled": getattr(self, "_gbrain_enabled_var", type("", (), {"get": lambda s: False})()).get(),
+            "install_dir": getattr(self, "_gbrain_install_dir_var", type("", (), {"get": lambda s: ""})()).get(),
+            "brain_dir": getattr(self, "_gbrain_brain_dir_var", type("", (), {"get": lambda s: ""})()).get(),
+            "auto_sync": getattr(self, "_gbrain_auto_sync_var", type("", (), {"get": lambda s: False})()).get(),
+            "mcp_serve": getattr(self, "_gbrain_mcp_serve_var", type("", (), {"get": lambda s: False})()).get(),
+            "import_journal": getattr(self, "_gbrain_import_journal_var", type("", (), {"get": lambda s: False})()).get(),
+            "import_vaults": getattr(self, "_gbrain_import_vaults_var", type("", (), {"get": lambda s: False})()).get(),
+            "droid_write": getattr(self, "_brain_droid_write_var", type("", (), {"get": lambda s: False})()).get(),
+        }
         os.makedirs(os.path.dirname(WHIM_SETTINGS_FILE), exist_ok=True)
         with open(WHIM_SETTINGS_FILE, "w") as fh:
             json.dump(cfg, fh, indent=2)
         self._whimai_ollama_url = cfg["ollama_url"]
-        self._settings_save_lbl.config(text="Settings saved")
+        self._apply_theme(cfg["theme"])
+        self._tool_registry.save_selections()
+        self._settings_save_lbl.config(text="Settings saved (+ tool selections)")
         self.after(3000, lambda: self._settings_save_lbl.config(text=""))
 
     def _settings_load_all(self):
@@ -13183,18 +22785,37 @@ camFlipBtn.addEventListener('click',()=>{
             self._settings_ollama_url_var.set(cfg["ollama_url"])
         if cfg.get("openai_key"):
             self._settings_openai_key_var.set(cfg["openai_key"])
+        if cfg.get("anthropic_key"):
+            self._settings_anthropic_key_var.set(cfg["anthropic_key"])
+        if cfg.get("deepseek_key"):
+            self._settings_deepseek_key_var.set(cfg["deepseek_key"])
         if cfg.get("smartthings_key"):
             self._settings_st_key_var.set(cfg["smartthings_key"])
         if cfg.get("notion_token"):
             self._settings_notion_var.set(cfg["notion_token"])
+        if "sovereign_mode" in cfg:
+            self._settings_sovereign_mode.set(cfg["sovereign_mode"])
         if "autostart_ingest" in cfg:
             self._settings_autostart_ingest.set(cfg["autostart_ingest"])
         if "auto_connect" in cfg:
             self._settings_auto_connect.set(cfg["auto_connect"])
+            if cfg["auto_connect"]:
+                self.after(500, self.on_connect)
         if "auto_tunnel_check" in cfg:
             self._settings_auto_tunnel_check.set(cfg["auto_tunnel_check"])
         if cfg.get("theme"):
             self._settings_theme_var.set(cfg["theme"])
+        gb = cfg.get("gbrain", {})
+        if gb and hasattr(self, "_gbrain_enabled_var"):
+            self._gbrain_enabled_var.set(gb.get("enabled", False))
+            if gb.get("install_dir"):
+                self._gbrain_install_dir_var.set(gb["install_dir"])
+            if gb.get("brain_dir"):
+                self._gbrain_brain_dir_var.set(gb["brain_dir"])
+            self._gbrain_auto_sync_var.set(gb.get("auto_sync", False))
+            self._gbrain_mcp_serve_var.set(gb.get("mcp_serve", False))
+            self._gbrain_import_journal_var.set(gb.get("import_journal", False))
+            self._gbrain_import_vaults_var.set(gb.get("import_vaults", False))
 
     def on_connect(self):
         scopes = ["operator.read", "operator.write"]

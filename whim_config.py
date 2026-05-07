@@ -34,6 +34,9 @@ _DEFAULTS = {
     "tailscale_ip": "",
     "devices": [
         {"name": "localhost", "ip": "127.0.0.1", "label": "PC", "adb_model": None},
+        {"name": "lenovo-tb311fu", "ip": "__VPS__", "label": "Lenovo Tablet", "adb_model": "TB311FU"},
+        {"name": "galaxy-s9", "ip": "__VPS__", "label": "Galaxy S9", "adb_model": "SM_G965U"},
+        {"name": "galaxy-s22", "ip": "__VPS__", "label": "Galaxy S22", "adb_model": "SM_S901U"},
     ],
     "default_models": [
         "llama3.1:8b-16k",

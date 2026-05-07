@@ -131,8 +131,11 @@ TABS = {
         ("Tailscale Status",   "tailscale status"),
         ("Tailscale Up",       "sudo tailscale up"),
         ("Tailscale Down",     "sudo tailscale down"),
-        ("VPS Tunnel Check",   "curl -s --max-time 3 http://YOUR_VPS_IP:8089/health"),
-        ("Open Whim (Browser)","xdg-open http://YOUR_TAILSCALE_IP:8089"),
+        ("VPS Tunnel Check",   "curl -s --max-time 3 http://104.207.140.242:8089/health"),
+        ("Open Whim (Browser)","xdg-open http://100.69.17.20:8089"),
+        ("Node Manager",       "python3 ~/vaults/WHIM/app/model_manager.py &"),
+        ("Ghost Overlay",      "python3 ~/vaults/WHIM/app/ghost_overlay.py &"),
+        ("Launch Whim.V AVD",  "python3 ~/vaults/WHIM/app/launch_whimv_dash.py &"),
     ],
 }
 
@@ -211,6 +214,9 @@ ICON_MAP = {
     "Tailscale Down":      "\u2B07",
     "VPS Tunnel Check":    "\U0001F310",
     "Open Whim (Browser)": "\U0001F5A5",
+    "Node Manager":        "\U0001F4E6",
+    "Ghost Overlay":       "\U0001F47B",
+    "Launch Whim.V AVD":   "\U0001F697",
 }
 
 PNG_ICON_MAP = {
@@ -578,7 +584,7 @@ class ControlPanel(tk.Tk):
 
             tunnel_ok = False
             try:
-                req = _ur.Request("http://YOUR_VPS_IP:8089/health")
+                req = _ur.Request("http://104.207.140.242:8089/health")
                 with _ur.urlopen(req, timeout=4) as resp:
                     tunnel_ok = resp.status == 200
             except Exception:
@@ -594,7 +600,7 @@ class ControlPanel(tk.Tk):
                 lines = []
                 lines.append(f"Mode: {conn_mode.upper()}")
                 lines.append(f"VPS: {'OK' if tunnel_ok else 'DOWN'}  |  "
-                             f"Tailscale: {'ACTIVE' if ts_running else 'OFF'}  |  "
+                             f"Tailscale: {'ACTIVE (100.69.17.20)' if ts_running else 'OFF'}  |  "
                              f"Server: {'OK' if server_ok else 'DOWN'}  |  "
                              f"Ollama: {'OK' if ollama_ok else 'DOWN'}")
                 self._whim_info_var.set("\n".join(lines))

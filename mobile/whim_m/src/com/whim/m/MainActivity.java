@@ -19,6 +19,7 @@ import android.webkit.PermissionRequest;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
+import android.webkit.GeolocationPermissions;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
@@ -104,6 +105,7 @@ public class MainActivity extends Activity {
         ws.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         ws.setUseWideViewPort(true);
         ws.setLoadWithOverviewMode(true);
+        ws.setGeolocationEnabled(true);
 
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -114,6 +116,12 @@ public class MainActivity extends Activity {
                         request.grant(request.getResources());
                     }
                 });
+            }
+
+            @Override
+            public void onGeolocationPermissionsShowPrompt(String origin,
+                    GeolocationPermissions.Callback callback) {
+                callback.invoke(origin, true, false);
             }
 
             @Override
@@ -169,7 +177,8 @@ public class MainActivity extends Activity {
 
         setContentView(root);
 
-        String[] neededPerms = {"android.permission.RECORD_AUDIO", "android.permission.CAMERA"};
+        String[] neededPerms = {"android.permission.RECORD_AUDIO", "android.permission.CAMERA",
+            "android.permission.ACCESS_FINE_LOCATION", "android.permission.ACCESS_COARSE_LOCATION"};
         java.util.ArrayList<String> missing = new java.util.ArrayList<>();
         for (String p : neededPerms) {
             if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) missing.add(p);

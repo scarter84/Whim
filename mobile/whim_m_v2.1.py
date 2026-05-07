@@ -31,7 +31,20 @@ TTS_OUTPUT_DIR = os.path.expanduser("~/xtts_tts_cache")
 CMD_REPORT_LOG = os.path.expanduser("~/vaults/WHIM/mobile/cmd_reports.jsonl")
 LOCATION_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "device_locations.json")
 DEFAULT_PORT = 8089
-WHIM_M_VERSION = "3.3.0"
+WHIM_M_VERSION = "3.4.0"
+AVATAR_VISEME_PORT = 8095
+
+def _notify_avatar_server(wav_path):
+    """Send a viseme-stream request to the avatar WebSocket server."""
+    try:
+        import websockets.sync.client as _wsc
+        with _wsc.connect(f"ws://127.0.0.1:{AVATAR_VISEME_PORT}", close_timeout=2) as ws:
+            ws.send(json.dumps({"action": "analyze", "path": wav_path}))
+    except Exception:
+        pass
+
+SECURITY_STATUS_FILE = os.path.expanduser("~/.openclaw/security_status.json")
+_last_security_alert_ts = None
 
 # Hybrid connection: VPS tunnel (default) + Tailscale (fallback)
 TAILSCALE_IP = "YOUR_TAILSCALE_PC_IP"
@@ -110,7 +123,7 @@ MANIFEST = json.dumps({
 })
 
 SW_JS = """
-var CACHE_VERSION = 'whim-v3.3';
+var CACHE_VERSION = 'whim-v3.4';
 self.addEventListener('install', function(e) {
   self.skipWaiting();
 });
@@ -312,6 +325,7 @@ body.kb-open .tab-bar{display:none}
   <span><span class="health-dot" id="dotMic"></span>mic</span>
   <span><span class="health-dot" id="dotOllama"></span>ollama</span>
   <span><span class="health-dot" id="dotTS"></span>TS</span>
+  <span><span class="health-dot" id="dotSec"></span>SEC</span>
 </div>
 <div class="ww-bar" id="wwBar">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" id="wwBarIcon">
@@ -340,7 +354,7 @@ body.kb-open .tab-bar{display:none}
   </div>
   <div class="progress" id="progress"><div class="progress-bar" id="progressBar"></div></div>
   <div class="status" id="recStatus"></div>
-  <div class="flist" id="filesList" style="flex-shrink:0;min-height:0;padding-bottom:16px"></div>
+  <div class="flist" id="filesList" style="flex-shrink:0;min-height:0;max-height:35vh;overflow-y:auto;padding-bottom:16px"></div>
   <div id="audioPlayerWrap" style="width:100%;max-width:var(--max-w);margin-top:8px;display:none">
     <audio id="audioPlayer" controls style="width:100%;border-radius:8px"></audio>
   </div>
@@ -438,6 +452,24 @@ body.kb-open .tab-bar{display:none}
   </div>
 </div>
 
+<!-- ========== TAB: AVATAR ========== -->
+<div class="tab-content" id="tabAvatar">
+  <h1 style="margin-top:16px">Avatar</h1>
+  <p class="sub">talking head lip-sync</p>
+  <div id="avatarContainer" style="width:100%;max-width:var(--max-w);flex:1;display:flex;flex-direction:column;align-items:center">
+    <div id="avatarStatus" style="color:#2fa572;font-size:12px;font-family:'Courier New',monospace;margin-bottom:8px">connecting to viseme server...</div>
+    <canvas id="avatarCanvas" width="360" height="400" style="width:100%;max-width:360px;background:#141210;border:1px solid #3a3a3a;border-radius:10px;margin-bottom:12px"></canvas>
+    <div id="avatarVisemes" style="display:flex;gap:8px;justify-content:center;margin-bottom:12px">
+      <div style="text-align:center"><div id="avBarA" style="width:24px;height:2px;background:#e8793a;border-radius:3px;margin:0 auto 4px;transition:height 0.05s"></div><span style="color:#8a7a6a;font-size:10px">A</span></div>
+      <div style="text-align:center"><div id="avBarI" style="width:24px;height:2px;background:#e8793a;border-radius:3px;margin:0 auto 4px;transition:height 0.05s"></div><span style="color:#8a7a6a;font-size:10px">I</span></div>
+      <div style="text-align:center"><div id="avBarU" style="width:24px;height:2px;background:#e8793a;border-radius:3px;margin:0 auto 4px;transition:height 0.05s"></div><span style="color:#8a7a6a;font-size:10px">U</span></div>
+      <div style="text-align:center"><div id="avBarE" style="width:24px;height:2px;background:#e8793a;border-radius:3px;margin:0 auto 4px;transition:height 0.05s"></div><span style="color:#8a7a6a;font-size:10px">E</span></div>
+      <div style="text-align:center"><div id="avBarO" style="width:24px;height:2px;background:#e8793a;border-radius:3px;margin:0 auto 4px;transition:height 0.05s"></div><span style="color:#8a7a6a;font-size:10px">O</span></div>
+    </div>
+    <p style="color:#555;font-size:12px;text-align:center;max-width:280px">The avatar animates when Whim speaks. Load a .vrm model from the desktop AVATAR tab or drag one into the full viewer.</p>
+  </div>
+</div>
+
 <!-- ========== TAB BAR ========== -->
 <div class="tab-bar">
   <button class="tab-btn" data-tab="tabRecorder">
@@ -451,6 +483,10 @@ body.kb-open .tab-bar{display:none}
   <button class="tab-btn active" data-tab="tabAIChat">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
     CHAT<span class="tab-light" id="lightChat"></span>
+  </button>
+  <button class="tab-btn" data-tab="tabAvatar">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/></svg>
+    AVATAR
   </button>
   <button class="tab-btn" data-tab="tabWakeWord">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
@@ -548,12 +584,15 @@ tabBtns.forEach(btn=>{btn.addEventListener('click',()=>{
   if(btn.dataset.tab==='tabRecorder'){setTimeout(()=>{resizeCanvas();drawIdle()},50)}
   if(btn.dataset.tab==='tabLibrary'){loadLibrary()}
   if(btn.dataset.tab==='tabWakeWord'){loadActiveVoice();wwStartMic()}
-  if(btn.dataset.tab==='tabAIChat'){}
+  if(btn.dataset.tab==='tabAIChat'){activateWakeWord()}
+  else{if(wwActive&&wwRecognition){try{wwRecognition.stop()}catch(e){};wwActive=false;_wwStarting=false;
+    if(_wwRestartTimer){clearTimeout(_wwRestartTimer);_wwRestartTimer=null}
+    wwBarState('','Wake word paused');wwCircle.className='ww-status-circle';wwIcon.setAttribute('stroke','#666')}}
   if(btn.dataset.tab==='tabDeviceChat'&&deviceName){startDCPoll()}
 })});
 
 // ========== HEALTH ==========
-const dotTunnel=document.getElementById('dotTunnel'),dotServer=document.getElementById('dotServer'),dotMic=document.getElementById('dotMic'),dotOllama=document.getElementById('dotOllama'),dotTS=document.getElementById('dotTS');
+const dotTunnel=document.getElementById('dotTunnel'),dotServer=document.getElementById('dotServer'),dotMic=document.getElementById('dotMic'),dotOllama=document.getElementById('dotOllama'),dotTS=document.getElementById('dotTS'),dotSec=document.getElementById('dotSec');
 let _micConfirmedOk=false;
 function setMicOk(){_micConfirmedOk=true;dotMic.className='health-dot ok'}
 async function checkHealth(){
@@ -578,6 +617,30 @@ function updateTabLights(serverOk){
   const cls=serverOk?'tab-light on':'tab-light';
   lightRec.className=cls;lightLib.className=cls;lightChat.className=cls;lightWake.className=cls}
 checkHealth();setInterval(checkHealth,15000);
+
+// ========== SECURITY STATUS ==========
+let _lastSecAlert='';
+async function checkSecurity(){
+  try{
+    const r=await fetch('/security/status',{signal:AbortSignal.timeout(5000)});
+    if(!r.ok){dotSec.className='health-dot warn';return}
+    const d=await r.json();
+    const sev=d.overall_severity||'ok';
+    dotSec.className='health-dot '+(sev==='ok'?'ok':sev==='warning'?'warn':'fail');
+    if((sev==='critical'||sev==='warning')&&d.timestamp&&d.timestamp!==_lastSecAlert){
+      _lastSecAlert=d.timestamp;
+      const total=d.total_upgradable||0;
+      const crit=(d.critical_updates||[]).length;
+      const kUpd=d.kernel&&d.kernel.update_available?'  Kernel update available.':'';
+      const txt='[SECURITY '+sev.toUpperCase()+'] '+total+' packages upgradable ('+crit+' critical).'+kUpd+' Run: sudo apt update && sudo apt upgrade -y';
+      if(typeof deviceName!=='undefined'&&deviceName){
+        fetch('/device/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({sender:'WHIM-SEC',text:txt,type:'text'})}).catch(()=>{});
+      }
+    }
+  }catch(e){dotSec.className='health-dot warn'}
+}
+checkSecurity();setInterval(checkSecurity,60000);
 
 // ========== RECORDER ==========
 const recBtn=document.getElementById('recBtn'),exportBtn=document.getElementById('exportBtn'),
@@ -782,12 +845,14 @@ function startSpeechInput(){
   setTimeout(()=>{try{cmd.start()}catch(e){activateWakeWord()}},500);
 }
 
-// Auto-start: try on every user interaction until successful
-function _wwTryStart(){activateWakeWord()}
-document.addEventListener('click',_wwTryStart);
-document.addEventListener('touchend',_wwTryStart);
-// Also try after page load in case mic is already permitted (installed PWA)
-setTimeout(()=>{activateWakeWord()},2000);
+// Wake word only activates when Whim.ai chat tab is open
+function _wwTryStartIfChatActive(){
+  var activeTab=document.querySelector('.tab-content.active');
+  if(activeTab&&activeTab.id==='tabAIChat'){activateWakeWord()}
+}
+document.addEventListener('click',_wwTryStartIfChatActive);
+document.addEventListener('touchend',_wwTryStartIfChatActive);
+setTimeout(()=>{_wwTryStartIfChatActive()},2000);
 
 // ========== WAKE WORD WAVEFORM ==========
 const wwCanvas=document.getElementById('wwWaveCanvas'),wwCtx=wwCanvas.getContext('2d'),
@@ -1128,6 +1193,117 @@ function triggerTailscaleUpdate(){
 
 if(typeof WhimBridge!=='undefined'&&WhimBridge.onReady){try{WhimBridge.onReady()}catch(e){}}
 
+// ========== AVATAR — 2D FACE + VISEME WEBSOCKET ==========
+(function(){
+  var avCanvas=document.getElementById('avatarCanvas');
+  if(!avCanvas)return;
+  var avCtx=avCanvas.getContext('2d');
+  var avStatus=document.getElementById('avatarStatus');
+  var avBars={A:document.getElementById('avBarA'),I:document.getElementById('avBarI'),
+    U:document.getElementById('avBarU'),E:document.getElementById('avBarE'),
+    O:document.getElementById('avBarO')};
+  var vis={A:0,I:0,U:0,E:0,O:0};
+  var target={A:0,I:0,U:0,E:0,O:0};
+  var blinkTimer=3,blinkVal=0;
+  var idleT=0;
+
+  function lerp(a,b,t){return a+(b-a)*Math.min(1,t)}
+
+  function drawFace(){
+    var w=avCanvas.width,h=avCanvas.height;
+    avCtx.clearRect(0,0,w,h);
+    var cx=w/2,cy=h*0.42;
+    // Head
+    avCtx.beginPath();
+    avCtx.ellipse(cx,cy,80,100,0,0,Math.PI*2);
+    avCtx.fillStyle='#2a2420';avCtx.fill();
+    avCtx.strokeStyle='#e8793a';avCtx.lineWidth=2;avCtx.stroke();
+    // Eyes
+    var eyeY=cy-20,eyeSpread=30;
+    var eyeOpen=blinkVal>0.5?0.5:6;
+    avCtx.fillStyle='#f5e6d3';
+    avCtx.beginPath();avCtx.ellipse(cx-eyeSpread,eyeY,8,eyeOpen,0,0,Math.PI*2);avCtx.fill();
+    avCtx.beginPath();avCtx.ellipse(cx+eyeSpread,eyeY,8,eyeOpen,0,0,Math.PI*2);avCtx.fill();
+    // Pupils
+    if(eyeOpen>2){
+      avCtx.fillStyle='#141210';
+      avCtx.beginPath();avCtx.arc(cx-eyeSpread+Math.sin(idleT*0.5)*2,eyeY,3,0,Math.PI*2);avCtx.fill();
+      avCtx.beginPath();avCtx.arc(cx+eyeSpread+Math.sin(idleT*0.5)*2,eyeY,3,0,Math.PI*2);avCtx.fill();
+    }
+    // Mouth — shape driven by visemes
+    var mouthY=cy+35;
+    var openA=vis.A*25;  // vertical open
+    var wideI=vis.I*15;  // horizontal stretch
+    var pursU=vis.U*10;  // pucker
+    var mouthW=20+wideI-pursU*0.5;
+    var mouthH=3+openA;
+    avCtx.beginPath();
+    avCtx.ellipse(cx,mouthY,Math.max(5,mouthW),Math.max(2,mouthH),0,0,Math.PI*2);
+    avCtx.fillStyle='#c4382a';avCtx.fill();
+    avCtx.strokeStyle='#8a7a6a';avCtx.lineWidth=1;avCtx.stroke();
+    // Inner mouth for open states
+    if(mouthH>8){
+      avCtx.beginPath();
+      avCtx.ellipse(cx,mouthY+2,Math.max(3,mouthW*0.6),Math.max(1,mouthH*0.5),0,0,Math.PI*2);
+      avCtx.fillStyle='#1e1e1e';avCtx.fill();
+    }
+    // Label
+    avCtx.fillStyle='#8a7a6a';avCtx.font='10px Courier New';avCtx.textAlign='center';
+    avCtx.fillText('WHIM AVATAR',cx,h-12);
+  }
+
+  function updateAvatar(){
+    var dt=1/30;
+    idleT+=dt;
+    blinkTimer-=dt;
+    if(blinkTimer<=0){blinkTimer=2.5+Math.random()*4;blinkVal=1;}
+    if(blinkVal>0)blinkVal=Math.max(0,blinkVal-dt*8);
+    for(var k in vis)vis[k]=lerp(vis[k],target[k],dt*12);
+    // Update bars
+    for(var k in avBars){
+      if(avBars[k])avBars[k].style.height=Math.max(2,Math.round((vis[k]||0)*40))+'px';
+    }
+    drawFace();
+    requestAnimationFrame(updateAvatar);
+  }
+  requestAnimationFrame(updateAvatar);
+
+  // WebSocket to viseme server
+  var avWs=null,avReconnect=null;
+  var AVATAR_WS_PORT='8095';
+  var AVATAR_WS_HOST=window.location.hostname||'localhost';
+  function connectAvatarWS(){
+    if(avWs&&avWs.readyState<=1)return;
+    try{avWs=new WebSocket('ws://'+AVATAR_WS_HOST+':'+AVATAR_WS_PORT)}catch(e){schedAv();return}
+    avWs.onopen=function(){
+      if(avStatus)avStatus.textContent='connected to viseme server';
+      avStatus.style.color='#2fa572';
+      if(avReconnect){clearTimeout(avReconnect);avReconnect=null;}
+    };
+    avWs.onmessage=function(evt){
+      try{
+        var msg=JSON.parse(evt.data);
+        if(msg.type==='viseme'){
+          var v=msg.values;
+          for(var k in target){target[k]=v[k]||0;}
+        }else if(msg.type==='start'){
+          if(avStatus)avStatus.textContent='speaking...';
+        }else if(msg.type==='end'){
+          for(var k in target)target[k]=0;
+          if(avStatus)avStatus.textContent='idle';
+        }
+      }catch(e){}
+    };
+    avWs.onclose=function(){
+      if(avStatus){avStatus.textContent='disconnected — retrying...';avStatus.style.color='#d94040';}
+      schedAv();
+    };
+    avWs.onerror=function(){};
+  }
+  function schedAv(){if(!avReconnect)avReconnect=setTimeout(function(){avReconnect=null;connectAvatarWS();},3000);}
+  connectAvatarWS();
+})();
+
 // ========== KEYBOARD-AWARE INPUT ==========
 (function(){
   var vv=window.visualViewport;
@@ -1248,10 +1424,18 @@ class RecorderHandler(BaseHTTPRequestHandler):
                 pass
             ts_ok = _tailscale_running_local()
             conn_cfg = _load_connection_mode()
+            sec_sev = "unknown"
+            if os.path.isfile(SECURITY_STATUS_FILE):
+                try:
+                    with open(SECURITY_STATUS_FILE, "r") as _sf:
+                        sec_sev = json.load(_sf).get("overall_severity", "unknown")
+                except Exception:
+                    pass
             self._json_response(200, {"status": "ok", "version": WHIM_M_VERSION, "ollama": ollama_ok,
                                       "tailscale": ts_ok,
                                       "connection_mode": conn_cfg.get("mode", "tunnel"),
                                       "tailscale_ip": TAILSCALE_IP if ts_ok else None,
+                                      "security": sec_sev,
                                       "tail": "WHIM_M_TAIL_OK"})
         elif self.path == "/tail_verify":
             ts = datetime.now().strftime("%H:%M:%S")
@@ -1289,6 +1473,8 @@ class RecorderHandler(BaseHTTPRequestHandler):
             self._handle_file_search()
         elif self.path == "/connection_mode":
             self._serve_connection_mode()
+        elif self.path == "/security/status":
+            self._serve_security_status()
         elif self.path == "/update/check":
             self._serve_update_check()
         elif self.path.startswith("/update/download/"):
@@ -1823,6 +2009,9 @@ class RecorderHandler(BaseHTTPRequestHandler):
                 self._json_response(500, {"error": proc.stderr.strip()[:500]})
                 return
 
+            threading.Thread(target=_notify_avatar_server,
+                             args=(out_path,), daemon=True).start()
+
             self._json_response(200, {
                 "status": "ok",
                 "audio_url": f"/tts_audio/{out_fname}",
@@ -2090,6 +2279,40 @@ class RecorderHandler(BaseHTTPRequestHandler):
             })
         except Exception as e:
             self._json_response(500, {"error": str(e)})
+
+    def _serve_security_status(self):
+        global _last_security_alert_ts
+        if os.path.isfile(SECURITY_STATUS_FILE):
+            try:
+                with open(SECURITY_STATUS_FILE, "r") as f:
+                    data = json.load(f)
+                report_ts = data.get("timestamp", "")
+                if data.get("overall_severity") in ("critical", "warning"):
+                    if report_ts != _last_security_alert_ts:
+                        _last_security_alert_ts = report_ts
+                        total = data.get("total_upgradable", 0)
+                        crit = len(data.get("critical_updates", []))
+                        kern = " Kernel update available." if data.get("kernel", {}).get("update_available") else ""
+                        sev = data["overall_severity"].upper()
+                        msg = f"[SECURITY {sev}] {total} packages upgradable ({crit} critical).{kern} Run: sudo apt update && sudo apt upgrade -y"
+                        with _device_chat_lock:
+                            msg_id = len(_device_chat_messages) + 1
+                            _device_chat_messages.append({
+                                "id": msg_id,
+                                "sender": "WHIM-SEC",
+                                "text": msg,
+                                "type": "text",
+                                "file_url": "",
+                                "time": datetime.now().strftime("%H:%M:%S"),
+                            })
+                self._json_response(200, data)
+            except Exception as e:
+                self._json_response(500, {"error": str(e)})
+        else:
+            self._json_response(200, {
+                "overall_severity": "unknown",
+                "message": "No security scan has run yet. Run: python3 scripts/whim_security_monitor.py"
+            })
 
     def _find_latest_apk(self, variant="phone"):
         apk_dir = os.path.dirname(os.path.abspath(__file__))
